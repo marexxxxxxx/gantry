@@ -33,6 +33,7 @@ und diese Dokumentation.
 | `bench_with_penalty.py` | Wrapper: `bench_serving` mit Penalty-Payload via `--extra-request-body` | **NEU** |
 | `PLAN-server-default-penalty.md` | Design/Anchors des Server-Default-Penalty-Patches | **NEU** |
 | `patches/server-default-penalty.patch` | Patch (server_args, tokenizer_manager, neues Sampling-Modul): `OTP=1` injiziert den Penalty serverseitig | **NEU** |
+| `examples/penalty_example.py` | Beispiel-Client für einen `OTP=1`-Server: Default-Injektion, Override λ=0 / λ=4, Kombi mit Budget | **NEU** |
 | `README.md` | diese Datei | **NEU** |
 
 ---
@@ -194,6 +195,12 @@ MODEL=./Qwen3.8-27B-Escha-W2 OTP=1 bash runtime/sglang/serve.sh
   ablehnt).
 - Deaktiviert = Default: ohne `OTP=1` verhält sich der Server bit-identisch zum
   ungepatchten Stand.
+
+Laufendes Beispiel (alle vier Varianten gegen einen `OTP=1`-Server):
+
+```bash
+.venv/bin/python runtime/sglang/examples/penalty_example.py [BASE_URL]
+```
 
 ### 3. Requests senden
 
