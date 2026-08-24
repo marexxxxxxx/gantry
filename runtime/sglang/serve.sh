@@ -116,8 +116,20 @@ ATTN_BACKEND=${ATTN_BACKEND:-}  # full-attention backend override. Empty = sglan
 TOOL_PARSER=${TOOL_PARSER:-qwen3_coder}   # matches this template's <function=..>/<parameter=..> XML.
 REASONING_PARSER=${REASONING_PARSER:-qwen3}
 ENABLE_CLP=${ENABLE_CLP:-1}   # 1 = --enable-custom-logit-processor (DEFAULT). Needed for the
-                           #     per-request thinking budget (see thinking_budget.py); it is how
-                           #     every published benchmark number for this model was produced.
+                            #     per-request thinking budget (see thinking_budget.py); it is how
+                            #     every published benchmark number for this model was produced.
+OTP=${OTP:-0}               # 1 = --default-overthinking-penalty: the server injects the
+                            #     overthinking penalty payload (arXiv 2606.00206; see
+                            #     overthinking_penalty.py) into EVERY request that does not set
+                            #     its own custom_logit_processor. Requires ENABLE_CLP=1 (the
+                            #     default). Per-request custom_params still win: a client can
+                            #     send {"penalty_lambda": 0} to turn it off for one request,
+                            #     or {"thinking_budget": N} to also bound the CoT length.
+PENALTY_LAMBDA=${PENALTY_LAMBDA:-2.0}  # default penalty strength baked into the injected
+                            #     payload (paper sweep 0.5-4.0). Only used when OTP=1.
+PENALTY_ALWAYS=${PENALTY_ALWAYS:-0}    # 1 = penalize at EVERY decoding step instead of only
+                            #     inside <think>...</think> (paper-faithful but touches final
+                            #     answers/code too). Default 0 = think-only.
 TRUNCATE=${TRUNCATE:-1}    # 1 = --allow-auto-truncate (DEFAULT). A prompt longer than CTXLEN is
                            #     truncated instead of HARD-REJECTED. Without it an over-long prompt
                            #     returns an error that reads like a model failure.
@@ -304,6 +316,16 @@ RADIX_ARGS=()
 ATTN_ARGS=(); [[ -n "$ATTN_BACKEND" ]] && ATTN_ARGS+=(--attention-backend "$ATTN_BACKEND")
 AUTH_ARGS=(); [[ -n "$API_KEY" ]] && AUTH_ARGS+=(--api-key "$API_KEY")
 CLP_ARGS=(); [[ "$ENABLE_CLP" == "1" ]] && CLP_ARGS+=(--enable-custom-logit-processor)
+OTP_ARGS=()
+if [[ "$OTP" == "1" ]]; then
+  if [[ "$ENABLE_CLP" != "1" ]]; then
+    echo "[serve] ERROR: OTP=1 requires ENABLE_CLP=1 (the injected payload is a custom logit" >&2
+    echo "[serve]        processor and would be rejected on every request without it)." >&2
+    exit 1
+  fi
+  OTP_ARGS+=(--default-overthinking-penalty --penalty-lambda "$PENALTY_LAMBDA")
+  [[ "$PENALTY_ALWAYS" == "1" ]] && OTP_ARGS+=(--penalty-always)
+fi
 METRICS_ARGS=(); [[ "${ENABLE_METRICS:-1}" == "1" ]] && METRICS_ARGS+=(--enable-metrics)   # Prometheus /metrics: gen throughput (tok/s), queue depth, token usage
 TRUNC_ARGS=(); [[ "$TRUNCATE" == "1" ]] && TRUNC_ARGS+=(--allow-auto-truncate)
 JSON_ARGS=(); [[ "$JSON_WS" == "1" ]] && JSON_ARGS+=(--constrained-json-disable-any-whitespace)
@@ -356,7 +378,7 @@ PY
   TEMPLATE_ARGS+=(--chat-template "$NOTHINK")   # no reasoning parser when thinking is pre-closed
 fi
 
-echo "[serve] MODEL=$MODEL NAME=$SERVED_NAME $HOST:$PORT MEM=$MEM CTX=$CTXLEN GRAPHS=$GRAPHS THINK=$THINK RADIX=$RADIX INT8=$INT8 KVDTYPE=$KVDTYPE HICACHE=$HICACHE${ATTN_BACKEND:+ ATTN=$ATTN_BACKEND}"
+echo "[serve] MODEL=$MODEL NAME=$SERVED_NAME $HOST:$PORT MEM=$MEM CTX=$CTXLEN GRAPHS=$GRAPHS THINK=$THINK RADIX=$RADIX INT8=$INT8 KVDTYPE=$KVDTYPE HICACHE=$HICACHE${ATTN_BACKEND:+ ATTN=$ATTN_BACKEND}${OTP:+ OTP=1(lam=$PENALTY_LAMBDA$([ "$PENALTY_ALWAYS" == "1" ] && echo ,always))}"
 echo "[serve] tool-call-parser=$TOOL_PARSER  ptxas=$TRITON_PTXAS_PATH"
 
 exec "$PYBIN" -m sglang.launch_server \
@@ -379,6 +401,7 @@ exec "$PYBIN" -m sglang.launch_server \
   "${ATTN_ARGS[@]}" \
   "${AUTH_ARGS[@]}" \
   "${CLP_ARGS[@]}" \
+  "${OTP_ARGS[@]}" \
   "${METRICS_ARGS[@]}" \
   "${TRUNC_ARGS[@]}" \
   "${GRAPH_ARGS[@]}" \

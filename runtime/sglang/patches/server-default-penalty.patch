@@ -1,0 +1,270 @@
+--- a/sglang/srt/server_args.py
++++ b/sglang/srt/server_args.py
+@@ -639,6 +639,9 @@
+     enable_draft_weights_cpu_backup: bool = False
+     allow_auto_truncate: bool = False
+     enable_custom_logit_processor: bool = False
++    default_overthinking_penalty: bool = False
++    penalty_lambda: float = 2.0
++    penalty_think_only: bool = True
+     flashinfer_mla_disable_ragged: bool = False
+     disable_shared_experts_fusion: bool = False
+     disable_chunked_prefix_cache: bool = False
+@@ -5085,6 +5088,31 @@
+             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
+         )
+         parser.add_argument(
++            "--default-overthinking-penalty",
++            action="store_true",
++            help="Apply the overthinking penalty (arXiv 2606.00206) by default to every request that does not set a custom_logit_processor itself. Requires --enable-custom-logit-processor.",
++        )
++        parser.add_argument(
++            "--penalty-lambda",
++            type=float,
++            default=2.0,
++            help="Default penalty strength lambda for the default overthinking penalty.",
++        )
++        think_only_group = parser.add_mutually_exclusive_group()
++        think_only_group.add_argument(
++            "--penalty-think-only",
++            dest="penalty_think_only",
++            action="store_true",
++            default=True,
++            help="Default overthinking penalty only applies inside <think> blocks (default).",
++        )
++        think_only_group.add_argument(
++            "--penalty-always",
++            dest="penalty_think_only",
++            action="store_false",
++            help="Default overthinking penalty applies to all generated tokens, not just inside <think> blocks.",
++        )
++        parser.add_argument(
+             "--flashinfer-mla-disable-ragged",
+             action="store_true",
+             help="Not using ragged prefill wrapper when running flashinfer mla",
+--- a/sglang/srt/managers/tokenizer_manager.py
++++ b/sglang/srt/managers/tokenizer_manager.py
+@@ -306,6 +306,39 @@
+         else:
+             self.async_dynamic_batch_tokenizer = None
+ 
++        # Optional server-default overthinking penalty (arXiv 2606.00206).
++        self._default_penalty_payload: Optional[str] = None
++        if (
++            getattr(self.server_args, "default_overthinking_penalty", False)
++            and self.server_args.enable_custom_logit_processor
++            and float(self.server_args.penalty_lambda) != 0.0
++            and not self.server_args.skip_tokenizer_init
++        ):
++            try:
++                from sglang.srt.sampling.overthinking_penalty_default import (
++                    build_overthinking_penalty_payload,
++                )
++
++                self._default_penalty_payload = (
++                    build_overthinking_penalty_payload(
++                        self.tokenizer,
++                        default_lambda=float(self.server_args.penalty_lambda),
++                        default_think_only=bool(
++                            self.server_args.penalty_think_only
++                        ),
++                    )
++                )
++                logger.info(
++                    "default overthinking penalty active "
++                    "(lambda=%s, think_only=%s)",
++                    self.server_args.penalty_lambda,
++                    self.server_args.penalty_think_only,
++                )
++            except Exception as e:
++                logger.warning(
++                    "default overthinking penalty disabled: %s", e
++                )
++
+     def init_ipc_channels(self, port_args: PortArgs):
+         context = zmq.asyncio.Context(2)
+         self.recv_from_detokenizer = get_zmq_socket(
+@@ -857,6 +890,25 @@
+                     "The server is not configured to return the hidden states. "
+                     "Please set `--enable-return-hidden-states` to enable this feature."
+                 )
++            # Server-default overthinking penalty injection (arXiv 2606.00206):
++            # requests without their own processor receive the payload built
++            # at startup; request-level custom_params keep precedence (only
++            # missing/None entries are filled in).
++            if (
++                self._default_penalty_payload is not None
++                and obj.custom_logit_processor is None
++            ):
++                obj.custom_logit_processor = self._default_penalty_payload
++                sp = obj.sampling_params
++                if sp is None:
++                    obj.sampling_params = {"custom_params": {}}
++                elif isinstance(sp, dict):
++                    if sp.get("custom_params", None) is None:
++                        sp["custom_params"] = {}
++                elif isinstance(sp, list):
++                    for p in sp:
++                        if p.get("custom_params", None) is None:
++                            p["custom_params"] = {}
+             if (
+                 obj.custom_logit_processor
+                 and not self.server_args.enable_custom_logit_processor
+--- a/sglang/srt/sampling/overthinking_penalty_default.py
++++ b/sglang/srt/sampling/overthinking_penalty_default.py
+@@ -0,0 +1,155 @@
++# Copyright 2026-2026 SGLang Project
++# Licensed under Apache License, Version 2.0
++"""Server-side default overthinking penalty (arXiv 2606.00206).
++
++Builds the dill-serialized ``custom_logit_processor`` payload that is injected
++into every request lacking its own processor when the server runs with
++``--default-overthinking-penalty``. Logic mirrors runtime/sglang/
++overthinking_penalty.py in the deployment repo; this module only differs by
++taking an already-loaded tokenizer instead of a model directory.
++
++The payload COMBINES the overthinking penalty with the stock thinking-budget
++semantics of the fork's Qwen38ThinkingBudgetLogitProcessor so one request can
++use both levers (SGLang allows a single custom_logit_processor per request).
++
++Per-request precedence: request custom_params > server CLI defaults baked into
++the payload at startup.
++"""
++
++from __future__ import annotations
++
++from typing import Optional
++
++logger = __import__("logging").getLogger(__name__)
++
++_THINK_OPEN = "<think>"
++_THINK_CLOSE = "</think>"
++
++# The paper's 50 overthinking markers (Appendix C, Table 8); all leading-space
++# variants. " recheck" splits into 2 tokens on the ~248k vocab and cannot be
++# penalized as a single logit entry.
++MARKERS = [
++    " perhaps", " maybe", " wait", " Wait", " actually", " hold", " Hmm",
++    " hmm", " Alternatively", " alternatively", " However", " however",
++    " instead", " Instead", " But", " but", " though", " although", " yet",
++    " rather", " unless", " otherwise", " nonetheless", " nevertheless",
++    " regardless", " still", " anyway", " Or", " or", " either", " whether",
++    " uncertain", " unsure", " possibly", " might", " could", " another",
++    " different", " reconsider", " rethink", " backtrack", " retry",
++    " revisit", " doubt", " confused", " wrong", " mistake", " error",
++    " incorrect",
++]
++
++
++def resolve_token_ids(tokenizer) -> dict:
++    """Map each marker to ONE token id via encode + decode round-trip check."""
++    resolved: dict = {}
++    skipped: list = []
++    for marker in MARKERS:
++        ids = tokenizer.encode(marker, add_special_tokens=False)
++        if len(ids) == 1 and tokenizer.decode(ids) == marker:
++            resolved[marker] = int(ids[0])
++        else:
++            skipped.append((marker, ids))
++    for marker, ids in skipped:
++        logger.info("overthinking penalty: skipping %r: encodes to %s",
++                    marker, ids)
++    logger.info("overthinking penalty: resolved %d/%d markers",
++                len(resolved), len(MARKERS))
++    if len(resolved) < len(MARKERS) * 0.8:
++        raise ValueError(
++            "fewer than 80% of overthinking markers resolved - wrong model?")
++    return resolved
++
++
++def think_token_ids(tokenizer) -> tuple:
++    """(<think>, </think>, newline) token ids from the tokenizer."""
++    start, end = tokenizer.convert_tokens_to_ids([_THINK_OPEN, _THINK_CLOSE])
++    unk = getattr(tokenizer, "unk_token_id", None)
++    if start is None or end is None or start == unk or end == unk:
++        raise ValueError(
++            f"tokenizer has no {_THINK_OPEN}/{_THINK_CLOSE} tokens - "
++            "think_only penalty mode cannot apply")
++    newline = tokenizer.encode("\n", add_special_tokens=False)
++    if len(newline) != 1:
++        raise ValueError(f"newline is not a single token ({newline})")
++    return int(start), int(end), int(newline[0])
++
++
++def build_overthinking_penalty_payload(
++    tokenizer,
++    default_lambda: float = 2.0,
++    default_think_only: bool = True,
++) -> str:
++    """Build the dill payload for the default overthinking penalty."""
++    from sglang.srt.sampling.custom_logit_processor import (
++        CustomLogitProcessor,
++    )
++
++    token_ids = tuple(sorted(resolve_token_ids(tokenizer).values()))
++    think_start, think_end, newline = think_token_ids(tokenizer)
++
++    # dill serializes this subclass by value; the base class is resolved by
++    # name on the scheduler side, so both processes must run the same SGLang.
++    class OverthinkingPenaltyLogitProcessor(CustomLogitProcessor):
++        PENALTY_TOKEN_IDS = token_ids
++        THINK_START_TOKEN_ID = think_start
++        THINK_END_TOKEN_ID = think_end
++        NEW_LINE_TOKEN_ID = newline
++        DEFAULT_PENALTY_LAMBDA = default_lambda
++        DEFAULT_THINK_ONLY = default_think_only
++
++        def __call__(self, logits, custom_param_list=None):
++            if custom_param_list is None:
++                return logits
++            for i, row_params in enumerate(custom_param_list):
++                params = row_params or {}
++
++                # Request state: inside an OPEN <think> block?
++                req = params.get("__req__")
++                cur_ids = in_open_think = None
++                if req is not None:
++                    cur_ids = [*req.origin_input_ids, *req.output_ids]
++                    in_open_think = (
++                        self.THINK_START_TOKEN_ID in cur_ids
++                        and self.THINK_END_TOKEN_ID not in cur_ids)
++
++                # ---- Part 1: thinking budget (fork semantics) ----
++                budget = params.get("thinking_budget")
++                if (isinstance(budget, int)
++                        and not isinstance(budget, bool)
++                        and budget >= 0
++                        and in_open_think):
++                    start_index = cur_ids.index(self.THINK_START_TOKEN_ID)
++                    num_after_start = len(cur_ids) - start_index - 1
++                    if num_after_start >= budget:
++                        if (not req.output_ids or req.output_ids[-1]
++                                != self.NEW_LINE_TOKEN_ID):
++                            # Step A: force a newline before closing.
++                            logits[i, :] = -float("inf")
++                            logits[i, self.NEW_LINE_TOKEN_ID] = 0.0
++                        else:
++                            # Step B: force </think>.
++                            logits[i, :] = -float("inf")
++                            logits[i, self.THINK_END_TOKEN_ID] = 0.0
++                        continue  # row fully masked; penalty moot
++
++                # ---- Part 2: overthinking penalty (paper Eq. 1) ----
++                lam = params.get("penalty_lambda",
++                                 self.DEFAULT_PENALTY_LAMBDA)
++                try:
++                    lam = float(lam)
++                except (TypeError, ValueError):
++                    continue
++                if lam == 0.0:
++                    continue
++                if params.get("think_only", self.DEFAULT_THINK_ONLY):
++                    if in_open_think is False:
++                        continue
++                    # in_open_think True, or None when no __req__ was sent
++                    # (custom_params omitted) -> degrade to always-on penalty
++                    # instead of silently dropping the row.
++                logits[i, self.PENALTY_TOKEN_IDS] -= lam
++            return logits
++
++    return OverthinkingPenaltyLogitProcessor.to_str()

@@ -30,6 +30,9 @@ und diese Dokumentation.
 | `INSTALL.md` | Installation, GPU-Profiles, Troubleshooting | original |
 | `thinking_budget.py` | Payload-Builder für Thinking-Budget | original (Helper) |
 | `overthinking_penalty.py` | **Payload-Builder für Overthinking-Penalty** | **NEU — Kern-Adaption** |
+| `bench_with_penalty.py` | Wrapper: `bench_serving` mit Penalty-Payload via `--extra-request-body` | **NEU** |
+| `PLAN-server-default-penalty.md` | Design/Anchors des Server-Default-Penalty-Patches | **NEU** |
+| `patches/server-default-penalty.patch` | Patch (server_args, tokenizer_manager, neues Sampling-Modul): `OTP=1` injiziert den Penalty serverseitig | **NEU** |
 | `README.md` | diese Datei | **NEU** |
 
 ---
@@ -163,6 +166,34 @@ Die wichtigsten `serve.sh`-Env-Vars (vollständige Liste im Skriptkopf):
 | `CUDA_GRAPH_BS` | erfasste CUDA-Graph-Batchgrößen |
 | `EXTRA_ARGS` | rohe Zusatz-Flags für `launch_server` (z. B. `--enable-metrics`) |
 | `ENABLE_CLP` | `1` (= Default) → `--enable-custom-logit-processor` — **Voraussetzung für Penalty UND Budget** |
+| `OTP` | `1` → `--default-overthinking-penalty`: Penalty wird **serverseitig in jeden Request injiziert**, der keinen eigenen `custom_logit_processor` setzt (siehe unten) |
+| `PENALTY_LAMBDA` | Default-λ des injizierten Payloads (`2.0`) — nur relevant bei `OTP=1` |
+| `PENALTY_ALWAYS` | `1` → `--penalty-always` (jeder Token statt nur `<think>`); Default `0` = think-only |
+
+### 2b. Server-Default-Penalty (`OTP=1`) — kein Request-Feld nötig
+
+Seit dem Patch `patches/server-default-penalty.patch` (gegen die im Wheel
+ausgelieferte SGLang-Fork, anwendbar mit `git apply` aus dem venv-Root; Punkte
+A–D dokumentiert in `PLAN-server-default-penalty.md`) baut der Server beim
+Start selbst einen Penalty-Payload — gleicher Processor, gleiche Marker, nur
+ohne den CLI-Umweg:
+
+```bash
+MODEL=./Qwen3.8-27B-Escha-W2 OTP=1 bash runtime/sglang/serve.sh
+# Startlog: "default overthinking penalty active (lambda=2.0, think_only=True)"
+```
+
+- **Wirkt auf**: chat/completions, completions und `/generate` — jeder Request
+  ohne eigenes `custom_logit_processor`. Requests MIT eigenem Payload bleiben
+  unangetastet.
+- **Vorrang unverändert**: request-`custom_params` > Server-Default > Fallback.
+  Ein Client kann pro Request abschalten: `"custom_params": {"penalty_lambda": 0}`,
+  oder kombinieren: `{"penalty_lambda": 4.0, "thinking_budget": 28672}`.
+- `OTP=1` ohne `ENABLE_CLP=1` bricht in `serve.sh` mit Fehler ab (der injizierte
+  Payload wäre sonst ein Custom-Logit-Processor auf einem Server, der die
+  ablehnt).
+- Deaktiviert = Default: ohne `OTP=1` verhält sich der Server bit-identisch zum
+  ungepatchten Stand.
 
 ### 3. Requests senden
 
