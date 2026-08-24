@@ -34,6 +34,7 @@ und diese Dokumentation.
 | `PLAN-server-default-penalty.md` | Design/Anchors des Server-Default-Penalty-Patches | **NEU** |
 | `patches/server-default-penalty.patch` | Patch (server_args, tokenizer_manager, neues Sampling-Modul): `OTP=1` injiziert den Penalty serverseitig | **NEU** |
 | `examples/penalty_example.py` | Beispiel-Client für einen `OTP=1`-Server: Default-Injektion, Override λ=0 / λ=4, Kombi mit Budget | **NEU** |
+| `USAGE-penalty.md` | **Detaillierte Benutzung**: Serverstart mit Flags (serve.sh UND roher CLI-Weg), curl-/Python-Beispiele, Wirkung messen, Troubleshooting | **NEU** |
 | `README.md` | diese Datei | **NEU** |
 
 ---
@@ -201,6 +202,11 @@ Laufendes Beispiel (alle vier Varianten gegen einen `OTP=1`-Server):
 ```bash
 .venv/bin/python runtime/sglang/examples/penalty_example.py [BASE_URL]
 ```
+
+**Schritt-für-Schritt-Benutzung** — Serverstart mit den neuen Flags (sowohl
+der `serve.sh`-Weg als auch der rohe `launch_server`-CLI-Aufruf), curl- und
+Python-Beispiele, Wirkung messen und Troubleshooting: siehe
+[`USAGE-penalty.md`](USAGE-penalty.md).
 
 ### 3. Requests senden
 
