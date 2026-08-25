@@ -1,1 +1,4 @@
 Qwen3.8-27B-Escha-W2/
+.venv/
+nohup.out
+__pycache__/

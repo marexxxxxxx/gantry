@@ -150,7 +150,9 @@ DETERMINISTIC=${DETERMINISTIC:-0}  # 1 = --enable-deterministic-inference. Greed
                            #     exits at startup. Works on Ampere / Ada / Hopper.
 
 # ---- environment the escha stack needs ------------------------------------------------------
-[[ -n "$VENV" && -f "$VENV/bin/activate" ]] && source "$VENV/bin/activate"
+# NB: an `[[ .. ]] && cmd` guard here would silently kill the whole script under `set -e`
+#     when the condition is false — use if/fi.
+if [[ -n "$VENV" && -f "$VENV/bin/activate" ]]; then source "$VENV/bin/activate"; fi
 PYBIN=$(command -v python)
 TORCH_LIB=$("$PYBIN" -c 'import torch,os;print(os.path.join(os.path.dirname(torch.__file__),"lib"))')
 export LD_LIBRARY_PATH="$TORCH_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"   # escha._C links libc10
