@@ -1,96 +1,110 @@
-# Overthinking-Penalty — detaillierte Benutzung
+<p align="right"><a href="USAGE-penalty.de.md">🇩🇪 Deutsch</a> | <b>🇬🇧 English</b></p>
 
-Alle Wege zum Einsatz der Overthinking-Penalty (arXiv 2606.00206) auf diesem
-Qwen3.8-27B-Escha-W2-Server: vom Ein-Schalter-Serverdefault (`OTP=1`) über den
-rohen CLI-Aufruf bis zur Kontrolle pro Request. Grundlagen (Marker-Mechanik,
-Parametervertrag) stehen in `README.md`; hier geht es ums **Bedienen**.
+# Overthinking Penalty — Detailed Usage
+
+Every way to put the overthinking penalty (arXiv 2606.00206) to work on this
+Qwen3.8-27B-Escha-W2 server: from the one-switch server default (`OTP=1`)
+through the raw CLI invocation to per-request control. Fundamentals (marker
+mechanics, parameter contract) live in [`README.md`](README.md); this document
+is about **operating** it.
+
+## Table of contents
+
+0. [The two paths at a glance](#0-the-two-paths-at-a-glance)
+1. [Quickstart](#1-quickstart-copy--run)
+2. [Server default via `serve.sh`: env vars](#2-server-default-via-servesh-env-vars)
+3. [Raw CLI path (without `serve.sh`)](#3-raw-cli-path-without-servesh)
+4. [As a client](#4-as-a-client) — [do nothing](#41-do-nothing-the-normal-case) · [per-request control](#42-turn-downup-per-request-custom_params) · [batch & `/generate`](#43-batch-n1-and-native-generate) · [example script](#44-full-example-as-a-script) · [your own payload](#45-your-own-payload-instead-of-the-server-default-path-a)
+5. [Measuring the effect](#5-measuring-the-effect)
+6. [Troubleshooting / FAQ](#6-troubleshooting--faq)
+7. [Flag/var reference](#7-flagvar-reference-compact)
 
 ---
 
-## 0. Die zwei Wege im Überblick
+## 0. The two paths at a glance
 
-| | Weg A: **Payload pro Request** (Original) | Weg B: **Server-Default `OTP=1`** (Patch) |
+| | Path A: **payload per request** (original) | Path B: **server default `OTP=1`** (patch) |
 |---|---|---|
-| Wer aktiviert? | der Client (schickt den Payload mit) | der Server-Admin (Startflag) |
-| Client-Aufwand | Payload bauen + in jeden Request legen | **keiner** — plain OpenAI-Requests |
-| Stärke/Laufzeit | im Payload gebacken (`--lambda`, `--always`) | beim Serverstart (`PENALTY_LAMBDA`, `PENALTY_ALWAYS`) |
-| Pro-Request-Änderung | eigene Werte via `custom_params` | gleiche `custom_params` überschreiben die Defaults |
-| Gut für | Benchmarks, unterschiedliche Profile je Request | Alltag: alle Clients profitieren ohne Umbau |
+| Who activates it? | the client (sends the payload along) | the server admin (start flag) |
+| Client effort | build payload + attach to every request | **none** — plain OpenAI requests |
+| Strength/scope | baked into the payload (`--lambda`, `--always`) | at server start (`PENALTY_LAMBDA`, `PENALTY_ALWAYS`) |
+| Per-request changes | own values via `custom_params` | same `custom_params` override the defaults |
+| Good for | benchmarks, different profiles per request | everyday use: all clients benefit without rework |
 
-Beide Wege benutzen denselben Processor, dieselben 49 Marker, denselben
-Vorrang: **request-`custom_params` > gebackene/baked-in Defaults > Fallback**.
+Both paths use the same processor, the same 49 markers and the same precedence:
+**request-`custom_params` > baked-in defaults > fallback**.
 
 ---
 
-## 1. Schnellstart (kopieren & laufen lassen)
+## 1. Quickstart (copy & run)
 
 ```bash
 cd /home/user/smal_qwen
 
-# 1) Server MIT Penalty als Default starten (16-GB-Profil, RTX 5070 Ti):
+# 1) Start the server WITH the penalty as default (16 GB profile, RTX 5070 Ti):
 MODEL=./Qwen3.8-27B-Escha-W2 VENV=.venv \
     MEM=0.90 CTXLEN=16384 CUDA_GRAPH_BS='1 2 4 8' \
     OTP=1 PENALTY_LAMBDA=2.0 \
     bash runtime/sglang/serve.sh
 
-# 2) Im Startlog muss erscheinen:
+# 2) The startup log must contain:
 #    [serve] ... OTP=1(lam=2.0)
 #    default overthinking penalty active (lambda=2.0, think_only=True)
 
-# 3) Gegen einen ZWEITEN Terminal fragen — ganz normaler Chat, KEIN Payload:
+# 3) Ask from a SECOND terminal — perfectly ordinary chat, NO payload:
 curl -s http://127.0.0.1:30000/v1/chat/completions \
     -H 'Content-Type: application/json' \
     -d '{"model": "escha-qwen38-27b-w2",
-         "messages": [{"role": "user", "content": "Was ist 17*24? Denk kurz."}],
+         "messages": [{"role": "user", "content": "What is 17*24? Think briefly."}],
          "max_tokens": 512, "temperature": 0.6}' | head -c 600
 ```
 
-Der Request oben enthält nichts Penalty-Spezifisches — der Server injiziert
-den Processor selbst. Genau das ist der Sinn von `OTP=1`.
+The request above contains nothing penalty-specific — the server injects the
+processor itself. That is exactly what `OTP=1` is for.
 
 ---
 
-## 2. Weg A — `serve.sh`: Env-Vars
+## 2. Server default via `serve.sh`: env vars
 
-`serve.sh` übersetzt die Env-Vars in die CLI-Flags von Weg B.
+`serve.sh` translates these env vars into the CLI flags of path B.
 
 ```bash
-# Standard: an, lambda 2.0, nur innerhalb <think>
+# Standard: on, lambda 2.0, only inside <think>
 MODEL=./Qwen3.8-27B-Escha-W2 OTP=1 bash runtime/sglang/serve.sh
 
-# Stärker und überall (auch außerhalb von <think>; paper-treu):
+# Stronger and everywhere (also outside <think>; paper-faithful):
 MODEL=./Qwen3.8-27B-Escha-W2 OTP=1 PENALTY_LAMBDA=3.0 PENALTY_ALWAYS=1 \
     bash runtime/sglang/serve.sh
 
-# Sanfter (kaum Eingriff):
+# Gentler (minimal intervention):
 MODEL=./Qwen3.8-27B-Escha-W2 OTP=1 PENALTY_LAMBDA=1.0 \
     bash runtime/sglang/serve.sh
 
-# Kombi mit dem Thinking-Budget-Knob bleibt unverändert möglich:
+# Combining with the thinking-budget knob still works unchanged:
 MODEL=./Qwen3.8-27B-Escha-W2 OTP=1 PENALTY_LAMBDA=2.0 INT8=on \
     MEM=0.92 CTXLEN=100000 HOST=0.0.0.0 API_KEY=marec \
     bash runtime/sglang/serve.sh
 ```
 
-| Env-Var | Default | Bedeutung |
+| Env var | Default | Meaning |
 |---|---|---|
-| `OTP` | `0` | `1` = Penalty als Serverdefault injizieren |
-| `PENALTY_LAMBDA` | `2.0` | Stärke λ; Paper-Sweep 0.5–4.0. Höher = kürzeres/knapperes Reasoning |
-| `PENALTY_ALWAYS` | `0` | `1` = jeder Token wird penalisiert, nicht nur `<think>`-Tokens (berührt auch Finalantworten/Code!) |
-| `ENABLE_CLP` | `1` | Muss `1` sein, wenn `OTP=1` (sonst bricht `serve.sh` mit Fehler ab) |
+| `OTP` | `0` | `1` = inject the penalty as the server default |
+| `PENALTY_LAMBDA` | `2.0` | Strength λ; paper sweep 0.5–4.0. Higher = shorter/tighter reasoning |
+| `PENALTY_ALWAYS` | `0` | `1` = penalize every token, not just `<think>` tokens (also touches final answers/code!) |
+| `ENABLE_CLP` | `1` | Must be `1` when `OTP=1` is set (otherwise `serve.sh` aborts with an error) |
 
-Hintergrund zur Wahl von λ: 2.0 ist der Paper-Default und auf DIESEM Modell
-gemessen (siehe `README.md`, Abschnitt Demo). > 2.5 macht Reasoning deutlich
-knapper; > 4.0 riskiert, dass legitime Umplanung ("wait", "but") unterdrückt
-wird. Zum Ausprobieren: Server mit λ=2.0 starten und per Request auf 4.0
-hochgehen (Abschnitt 4) — ein Neustart ist dafür NICHT nötig.
+Background on choosing λ: 2.0 is the paper default and was measured on THIS
+model (see [`README.md`](README.md), demo section). Above 2.5 reasoning becomes
+noticeably terser; above 4.0 you risk suppressing legitimate re-planning
+("wait", "but"). To experiment: start the server at λ=2.0 and step up to 4.0
+per request (section 4) — NO restart required for that.
 
 ---
 
-## 3. Weg B — reiner CLI-Weg (ohne `serve.sh`)
+## 3. Raw CLI path (without `serve.sh`)
 
-Wer den Server selbst startet (`python -m sglang.launch_server …`) oder die
-Flags in ein eigenes systemd-Unit/Docker-CMD packen will, benutzt direkt:
+If you start the server yourself (`python -m sglang.launch_server …`) or want
+to put the flags into your own systemd unit / Docker CMD, use these directly:
 
 ```bash
 cd /home/user/smal_qwen
@@ -120,60 +134,60 @@ python -m sglang.launch_server \
     --penalty-think-only
 ```
 
-Die letzten vier Zeilen sind der Penalty-Teil:
+The last four lines are the penalty part:
 
-| Flag | Wirkung |
+| Flag | Effect |
 |---|---|
-| `--enable-custom-logit-processor` | schaltet die Mechanik frei (**Pflicht** für beide Wege) |
-| `--default-overthinking-penalty` | injiziert den Payload in jeden Request ohne eigenen Processor |
-| `--penalty-lambda 2.0` | Default-Stärke des injizierten Payloads |
-| `--penalty-think-only` \| `--penalty-always` | Scope: nur `<think>` (Default) vs. jeder Token |
+| `--enable-custom-logit-processor` | unlocks the mechanism (**required** for both paths) |
+| `--default-overthinking-penalty` | injects the payload into every request without its own processor |
+| `--penalty-lambda 2.0` | default strength of the injected payload |
+| `--penalty-think-only` \| `--penalty-always` | scope: only `<think>` (default) vs. every token |
 
-Kurzformen zum Testen ohne `serve.sh`-Rest:
+Short forms for testing without the rest of `serve.sh`:
 
 ```bash
-# minimal (nur prüfen, ob die Flags da sind):
+# minimal (just check the flags exist):
 python -m sglang.launch_server --help | grep -A1 "penalty\|custom-logit"
 
-# hart paper-treu:
+# hard paper-faithful:
 ... --enable-custom-logit-processor --default-overthinking-penalty \
     --penalty-lambda 4.0 --penalty-always
 
-# wieder AUS (Verhalten wie ungepatcht): einfach die beiden
-# penalty-Flags weglassen — Default ist aus.
+# back OFF (behaviour like unpatched): simply omit the two penalty
+# flags — off is the default.
 ```
 
-Beim Start prüft der Server den Tokenizer und loggt entweder
-`default overthinking penalty active (lambda=…, think_only=True)` oder
-`default overthinking penalty disabled: <Grund>` (z. B. Tokenizer ohne
-`<think>`-Token). Bei `disabled` läuft der Server ganz normal WEITER — nur
-ohne Default-Penalty.
+At startup the server checks the tokenizer and logs either
+`default overthinking penalty active (lambda=…, think_only=True)` or
+`default overthinking penalty disabled: <reason>` (e.g. tokenizer without a
+`<think>` token). On `disabled`, the server keeps running NORMALLY — just
+without the default penalty.
 
 ---
 
-## 4. Als Client nutzen
+## 4. As a client
 
-### 4.1 Gar nichts tun (der Normalfall)
+### 4.1 Do nothing (the normal case)
 
-Jeder gewöhnliche OpenAI-kompatible Aufruf bekommt die Penalty automatisch:
+Every ordinary OpenAI-compatible call gets the penalty automatically:
 
 ```bash
 curl -s http://127.0.0.1:30000/v1/chat/completions \
     -H 'Content-Type: application/json' -d '{
       "model": "escha-qwen38-27b-w2",
-      "messages": [{"role": "user", "content": "Denke Schritt für Schritt: …"}],
+      "messages": [{"role": "user", "content": "Think step by step: …"}],
       "max_tokens": 4096, "temperature": 0.6,
       "chat_template_kwargs": {"enable_thinking": true}
     }'
 ```
 
-### 4.2 Pro Request abdrehen / verstärken (`custom_params`)
+### 4.2 Turn down/up per request (`custom_params`)
 
-`custom_params` ist eine SGLang-Erweiterung und **überschreibt** die
-Serverdefaults nur für diesen Request:
+`custom_params` is an SGLang extension and **overrides** the server defaults
+for this one request only:
 
 ```bash
-# Penalty für diesen EINEN Request komplett aus:
+# Switch the penalty completely OFF for this ONE request:
 curl -s http://127.0.0.1:30000/v1/chat/completions \
     -H 'Content-Type: application/json' -d '{
       "model": "escha-qwen38-27b-w2",
@@ -181,27 +195,27 @@ curl -s http://127.0.0.1:30000/v1/chat/completions \
       "custom_params": {"penalty_lambda": 0}
     }'
 
-# Stärker als der Serverdefault:
+# Stronger than the server default:
 #   … "custom_params": {"penalty_lambda": 4.0}
 
-# Nur den Deckel: kein Penalty, aber CoT endet nach ~28k Tokens:
+# Just the cap: no penalty, but the CoT ends after ~28k tokens:
 #   … "custom_params": {"penalty_lambda": 0, "thinking_budget": 28672}
 ```
 
-### 4.3 Batch (n>1) und natives `/generate`
+### 4.3 Batch (n>1) and native `/generate`
 
-Beide Pfade sind gepatcht und funktionieren unverändert:
+Both paths are patched and work unchanged:
 
 ```bash
-# n=2 über chat/completions:
+# n=2 via chat/completions:
 curl -s http://127.0.0.1:30000/v1/chat/completions \
     -H 'Content-Type: application/json' -d '{
       "model": "escha-qwen38-27b-w2",
-      "messages": [{"role": "user", "content": "Zähle vorwärts."}],
+      "messages": [{"role": "user", "content": "Count forwards."}],
       "n": 2, "max_tokens": 64, "temperature": 0
     }'
 
-# natives /generate (sampling_params statt custom_params auf Top-Level):
+# native /generate (sampling_params instead of custom_params at top level):
 curl -s http://127.0.0.1:30000/generate \
     -H 'Content-Type: application/json' -d '{
       "text": "The capital of France is",
@@ -209,26 +223,26 @@ curl -s http://127.0.0.1:30000/generate \
     }'
 ```
 
-### 4.4 Komplett-Beispiel als Skript
+### 4.4 Full example as a script
 
 ```bash
 .venv/bin/python runtime/sglang/examples/penalty_example.py [BASE_URL]
 ```
 
-Vergleicht live: Serverdefault / Override λ=0 / Override λ=4 / Kombi mit
-Budget — inkl. finish_reason, Token- und Zeichen-Zahlen.
+Compares live: server default / override λ=0 / override λ=4 / combined with
+the budget — including finish_reason, token and character counts.
 
-### 4.5 Eigenen Payload statt Serverdefault (Weg A)
+### 4.5 Your own payload instead of the server default (path A)
 
-Ein Client, der SELBST einen `custom_logit_processor` mitschickt, überschreibt
-den Serverdefault für diesen Request vollständig (eigener λ, eigener Scope):
+A client that sends ITS OWN `custom_logit_processor` fully overrides the
+server default for that request (own λ, own scope):
 
 ```bash
-# Payload einmalig bauen:
+# Build the payload once:
 .venv/bin/python runtime/sglang/overthinking_penalty.py \
     --model ./Qwen3.8-27B-Escha-W2 --lambda 4.0 --always > otp_always.json
 
-# und mitschicken ("clp" = Inhalt der Datei als String):
+# and send it along ("clp" = file contents as string):
 CLP=$(cat otp_always.json); python3 - "$CLP" <<'EOF'
 import json, sys, urllib.request
 body = {"model": "escha-qwen38-27b-w2",
@@ -244,41 +258,44 @@ EOF
 
 ---
 
-## 5. Wirkung messen
+## 5. Measuring the effect
 
-1. **Log-Zeile** beim Start: `default overthinking penalty active (…)`.
-2. **A/B am selben Prompt** (serverdefault an, per Request aus/an):
-   `finish_reason=length` + leeres `content` = Reasoning in den Deckel gelaufen;
-   mit Penalty sollte das seltener passieren und `completion_tokens` sinken.
-3. **Demo-Vergleich** gegen einen laufenden Server:
+1. **Log line** at startup: `default overthinking penalty active (…)`.
+2. **A/B on the same prompt** (server default on, toggled off/on per request):
+   `finish_reason=length` + empty `content` = the reasoning ran into the cap;
+   with the penalty this should happen less often and `completion_tokens`
+   should drop.
+3. **Demo comparison** against a running server:
    `.venv/bin/python runtime/sglang/overthinking_penalty.py --demo \
         --model ./Qwen3.8-27B-Escha-W2 --base-url http://127.0.0.1:30000/v1`
-   (sendet off/default/stark und tabelliert die Ergebnisse).
+   (sends off/default/strong and tabulates the results).
 
 ---
 
 ## 6. Troubleshooting / FAQ
 
-| Symptom | Ursache & Fix |
+| Symptom | Cause & fix |
 |---|---|
-| `serve.sh` bricht ab: „OTP=1 requires ENABLE_CLP=1" | Du hast `ENABLE_CLP=0` gesetzt. Ohne CLP würde jeder Request den injizierten Payload ablehnen. Entweder weglassen (Default ist 1) oder `OTP=0`. |
-| Log sagt `default overthinking penalty disabled: …` | Payload-Build fehlgeschlagen (falsche MODEL-Dir? Tokenizer ohne `<think>`?). Der Server läuft weiter, nur ohne Default-Penalty. |
-| Client will wirklich KEINE Penalty, kann aber nicht umbauen | Request mit `"custom_params": {"penalty_lambda": 0}` senden — oder Server ohne `OTP=1` neu starten (dann bit-identisch zum ungepatchten Stand). |
-| Antwortqualität leidet / Antworten wirken gehetzt | λ zu hoch oder `PENALTY_ALWAYS=1` (penalisiert auch Finalantworten). Runter mit `PENALTY_LAMBDA` bzw. ALWAYS ausschalten — Neustart genügt. |
-| Ich sehe keinen Effekt | Prüfe die Log-Zeile (läuft der Server wirklich mit `OTP=1`?), und vergleiche A/B mit λ=0 auf DEMSELBEN Prompt. Bei kurzen Non-Thinking-Prompts (`</think>` früh geschlossen) greift think_only bewusst nicht. |
-| Patch nach Wheel-Update weg | Neu anwenden: `git apply runtime/sglang/patches/server-default-penalty.patch` im venv-Root (Punkte A–D in `PLAN-server-default-penalty.md`). |
+| `serve.sh` aborts: "OTP=1 requires ENABLE_CLP=1" | You set `ENABLE_CLP=0`. Without CLP every request would reject the injected payload. Either leave it unset (default is 1) or use `OTP=0`. |
+| Log says `default overthinking penalty disabled: …` | Payload build failed (wrong MODEL dir? tokenizer without `<think>`?). The server keeps running, just without the default penalty. |
+| Client really must have NO penalty but cannot be reworked | Send requests with `"custom_params": {"penalty_lambda": 0}` — or restart the server without `OTP=1` (then bit-identical to the unpatched state). |
+| Answer quality suffers / answers seem rushed | λ too high or `PENALTY_ALWAYS=1` (penalizes final answers too). Lower `PENALTY_LAMBDA` resp. switch ALWAYS off — a restart is enough. |
+| I see no effect | Check the log line (is the server really running with `OTP=1`?), and A/B against λ=0 on the SAME prompt. On short non-thinking prompts (`</think>` closed early), think_only deliberately does not apply. |
+| Patch gone after a wheel update | Re-apply: `git apply runtime/sglang/patches/server-default-penalty.patch` in the venv root (points A–D in [`DESIGN-server-default-penalty.md`](DESIGN-server-default-penalty.md)). |
 
 ---
 
-## 7. Flag-/Var-Referenz (kompakt)
+## 7. Flag/var reference (compact)
 
 **CLI:** `--enable-custom-logit-processor` · `--default-overthinking-penalty` ·
-`--penalty-lambda FLOAT` (Default 2.0) · `--penalty-think-only` (Default) /
+`--penalty-lambda FLOAT` (default 2.0) · `--penalty-think-only` (default) /
 `--penalty-always`
 
-**serve.sh:** `OTP` · `PENALTY_LAMBDA` · `PENALTY_ALWAYS` (+ `ENABLE_CLP` als
-Vorbedingung)
+**serve.sh:** `OTP` · `PENALTY_LAMBDA` · `PENALTY_ALWAYS` (+ `ENABLE_CLP` as a
+precondition)
 
-**Request:** `custom_params.penalty_lambda` (float, 0 = aus) ·
+**Request:** `custom_params.penalty_lambda` (float, 0 = off) ·
 `custom_params.think_only` (bool) · `custom_params.thinking_budget` (int) ·
-`custom_logit_processor` (String-Payload, überschreibt den Serverdefault)
+`custom_logit_processor` (string payload, overrides the server default)
+
+

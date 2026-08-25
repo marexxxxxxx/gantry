@@ -1,3 +1,5 @@
+<p align="right"><a href="INSTALL.de.md">🇩🇪 Deutsch</a> | <b>🇬🇧 English</b></p>
+
 # Escha Runtime — install & serve
 
 This repository is the **runtime**: one wheel (`escha-*.whl`) holding the compiled `escha` package +
@@ -6,7 +8,19 @@ Escha model directory of a supported architecture. The quantized weights are a *
 repository: **`EschaLabs/Qwen3.8-27B-Escha-W2`**
 (<https://huggingface.co/EschaLabs/Qwen3.8-27B-Escha-W2>).
 
-## Requirements
+## Table of contents
+
+1. [Requirements](#1-requirements)
+2. [Installation step by step](#2-installation-step-by-step)
+3. [Serving the model](#3-serving-the-model)
+4. [Behaviour worth knowing](#4-behaviour-worth-knowing)
+5. [Running on your GPU](#5-running-on-your-gpu) — [by compute capability](#by-compute-capability-architecture) · [by VRAM](#by-vram) · [four key settings](#four-settings-that-are-worth-getting-right) · [concurrency](#concurrency)
+6. [Bounded thinking (`thinking_budget`)](#6-bounded-thinking-thinking_budget)
+7. [Troubleshooting](#7-troubleshooting)
+
+---
+
+## 1. Requirements
 
 **All are hard, and three of them fail quietly:**
 
@@ -42,6 +56,8 @@ repository: **`EschaLabs/Qwen3.8-27B-Escha-W2`**
   `WARNING ... you can try downgrading to transformers==4.57.1` about RoPE — that is a generic
   upstream sglang warning and is **safe to ignore**; do **not** downgrade.)
 
+## 2. Installation step by step
+
 1. `python3.12 -m venv .venv && source .venv/bin/activate`
 2. `pip install -U pip wheel`
 3. **Install PyTorch from the CUDA-12 index first** (it must be the cu12 build — `escha._C` is
@@ -68,29 +84,37 @@ repository: **`EschaLabs/Qwen3.8-27B-Escha-W2`**
    pip install -U "huggingface_hub[cli]"
    hf download EschaLabs/Qwen3.8-27B-Escha-W2 --local-dir ./Qwen3.8-27B-Escha-W2
    ```
-6. Serve it — point `MODEL` at the downloaded model directory:
-   ```bash
-   MODEL=./Qwen3.8-27B-Escha-W2 bash serve.sh
-   ```
-   - **Kernel route is auto-selected at runtime by GPU** — no env var needed. The kernels ship a
-     single fatbin with two launch-geometry routes; `escha` queries the device compute capability
-     and picks the measured-optimal one: `blackwell` (barrier-light, SM-adaptive split-K) on
-     **sm_89 Ada, sm_90 Hopper, and sm_100/sm_120 Blackwell**; `lovelace` (original geometry) on
-     **sm_80/sm_86 Ampere**. Both are bit-identical; force one with
-     `ESCHA_ROUTE=lovelace|blackwell` to A/B on your card (Hopper's default is a best-guess —
-     worth A/B'ing). Check the active route with
-     `python -c "import escha,torch; torch.zeros(1,device='cuda'); print(torch.ops.escha.escham_route())"`
-     (`2`=blackwell, `1`=lovelace).
-   - See the top of `serve.sh` for the full knob list (`MEM`, `CTXLEN`, `GRAPHS`, `THINK`, `RADIX`,
-     `INT8`, `DETERMINISTIC`, …). The defaults are the profile every published number for this
-     model was measured on, on a 24 GB card.
-7. OpenAI-compatible endpoint on `:30000` (`http://127.0.0.1:30000/v1`). The served model id is
-   `SERVED_NAME` from `serve.sh` (override with `SERVED_NAME=...`); list it with:
-   ```bash
-   curl -s http://127.0.0.1:30000/v1/models | python3 -m json.tool
-   ```
+## 3. Serving the model
 
-## Behaviour worth knowing
+**Serve it** — point `MODEL` at the downloaded model directory:
+
+```bash
+MODEL=./Qwen3.8-27B-Escha-W2 bash serve.sh
+```
+
+- **Kernel route is auto-selected at runtime by GPU** — no env var needed. The kernels ship a
+  single fatbin with two launch-geometry routes; `escha` queries the device compute capability
+  and picks the measured-optimal one: `blackwell` (barrier-light, SM-adaptive split-K) on
+  **sm_89 Ada, sm_90 Hopper, and sm_100/sm_120 Blackwell**; `lovelace` (original geometry) on
+  **sm_80/sm_86 Ampere**. Both are bit-identical; force one with
+  `ESCHA_ROUTE=lovelace|blackwell` to A/B on your card (Hopper's default is a best-guess —
+  worth A/B'ing). Check the active route with
+  `python -c "import escha,torch; torch.zeros(1,device='cuda'); print(torch.ops.escha.escham_route())"`
+  (`2`=blackwell, `1`=lovelace).
+- See the top of `serve.sh` for the full knob list (`MEM`, `CTXLEN`, `GRAPHS`, `THINK`, `RADIX`,
+  `INT8`, `DETERMINISTIC`, …). The defaults are the profile every published number for this
+  model was measured on, on a 24 GB card.
+- **OpenAI-compatible endpoint on `:30000`** (`http://127.0.0.1:30000/v1`). The served model id is
+  `SERVED_NAME` from `serve.sh` (override with `SERVED_NAME=...`); list it with:
+  ```bash
+  curl -s http://127.0.0.1:30000/v1/models | python3 -m json.tool
+  ```
+
+- **Overthinking penalty as server default:** add `OTP=1` (plus `PENALTY_LAMBDA`, `PENALTY_ALWAYS`)
+  — see [`README.md`](README.md#8-server-default-penalty-otp1) and
+  [`USAGE-penalty.md`](USAGE-penalty.md) for all penalty knobs.
+
+## 4. Behaviour worth knowing
 
 - **Thinking is per-request.** `chat_template_kwargs: {"enable_thinking": false}` is honoured
   against the default `THINK=1` server, with or without `tools`; a **top-level `enable_thinking`
@@ -126,7 +150,7 @@ repository: **`EschaLabs/Qwen3.8-27B-Escha-W2`**
   shared-memory-per-block limit and the server exits at startup. `serve.sh` forwards any extra
   arguments straight to `launch_server`, so a flag it does not model is still reachable.
 
-## Running on your GPU
+## 5. Running on your GPU
 
 The weights are **10.15 GB**. What changes across cards is the **compute-capability knob** (one
 attention-backend override on the newest cards) and the **VRAM budget** (context length, the
@@ -183,7 +207,7 @@ architecture that launches many small kernels per token, so eager decode is laun
 | **32 GB** | RTX 5090 | `ATTN_BACKEND=triton MEM=0.85 CTXLEN=65536 MAXREQ=32 MAXMAMBA=32 CUDA_GRAPH_BS="1 2 4 8 12 16 24 32" bash serve.sh` — **measured**: 87.1 tok/s bs=1, 955 tok/s peak at 16 streams, 28.2 GB peak of 32.6. `INT8=on` adds +7.2–7.4% decode at bs=1, paired A/B (and +12.2% KV tokens, not free VRAM — the saved ~1.2 GB is recycled into the pool). |
 | **40 GB+** | A100, H100, L40S-48 | `MEM=0.85 CTXLEN=131072 bash serve.sh`; int8 auto-OFF, raise `CTXLEN`/concurrency freely. Untested. |
 
-**Four settings that are worth getting right:**
+### Four settings that are worth getting right
 
 1. **`CUDA_GRAPH_BS` must include your maximum batch size — and must not exceed 32.** A batch size
    that was not captured runs *eager* (the server logs `cuda graph: False` at that
@@ -210,12 +234,14 @@ architecture that launches many small kernels per token, so eager decode is laun
    try to increase --mem-fraction-static"). The two failures are: pool-too-small at startup (raise
    `MEM`) and capture-OOM after the weights load (lower `MEM`, or shorten `CUDA_GRAPH_BS`).
 
-**Concurrency.** This is a **hybrid** model: most layers are linear-attention with a per-request
+### Concurrency
+
+This is a **hybrid** model: most layers are linear-attention with a per-request
 recurrent-state pool, so max concurrency is governed by that pool (`MAXMAMBA`), *not* by KV memory.
 The effective `max_running_requests` is clamped to `min(MAXREQ, MAXMAMBA // ratio)`, ratio ≈ 4 with
 the radix cache on, ≈ 1 with `RADIX=0`. A startup log line reports the clamp.
 
-## Bounded thinking (`thinking_budget`)
+## 6. Bounded thinking (`thinking_budget`)
 
 **Read this before running any benchmark or agent against a thinking-ON server.** With thinking on,
 the model can spend the entire `max_tokens` budget reasoning and never reach its answer. You get:
@@ -261,7 +287,7 @@ If you would rather not think at all, `THINK=0` patches the model's own chat tem
 default-closed — and also suppresses the reasoning-effort instruction the template would otherwise
 inject into the system prompt — at some cost in reasoning-dependent accuracy.
 
-## Troubleshooting
+## 7. Troubleshooting
 
 - **`subprocess.CalledProcessError` from `gcc` during "Capture cuda graph".** Not an escha or
   sglang fault — your host C compiler cannot build triton's shim, and the traceback's visible
@@ -271,7 +297,7 @@ inject into the system prompt — at some cost in reasoning-dependent accuracy.
 
 - **`finish_reason: "length"` with `content: null` on a thinking-ON server.** The reasoning ran past
   your `max_tokens`. Raise the cap or, better, set a
-  [thinking budget](#bounded-thinking-thinking_budget) so an answer is always produced.
+  [thinking budget](#6-bounded-thinking-thinking_budget) so an answer is always produced.
 
 - **HTTP 400 mentioning "Unexpected reasoning effort".** `reasoning_effort` must be exactly
   `xhigh`, `medium` or `low`. The chat template raises on anything else.

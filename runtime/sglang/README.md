@@ -1,152 +1,230 @@
-# Escha Runtime für Qwen3.8-27B-Escha-W2 — SGLang-Adaptionen
+<p align="right"><a href="README.de.md">🇩🇪 Deutsch</a> | <b>🇬🇧 English</b></p>
 
-Dieses Verzeichnis ist die **Laufzeitumgebung**: das `escha`-Wheel mit dem gepatchten
-SGLang-Fork, der Startskript `serve.sh`, zwei Hilfsskripte zum Bau von
-Custom-Logit-Processor-Payloads (`thinking_budget.py`, **neu:** `overthinking_penalty.py`)
-und diese Dokumentation.
+# Escha Runtime for Qwen3.8-27B-Escha-W2 — SGLang Adaptations
 
-## Danksagung / Credits
+This directory is the **runtime environment** for the 2-bit-quantized model
+[`EschaLabs/Qwen3.8-27B-Escha-W2`](https://huggingface.co/EschaLabs/Qwen3.8-27B-Escha-W2):
+the `escha` wheel with the patched SGLang fork, the `serve.sh` launcher,
+helper scripts for custom-logit-processor payloads (**thinking budget** and
+**overthinking penalty**), and the accompanying documentation.
 
-- **Modell & Runtime-Grundlage:** [`EschaLabs/Qwen3.8-27B-Escha-W2`](https://huggingface.co/EschaLabs/Qwen3.8-27B-Escha-W2)
-  — das 2-Bit-quantisierte Checkpoint (escha-Methode, ~10 GB), das Wheel
-  `escha-1.2.0+qwen3dense` und der ursprüngliche `serve.sh`-Launcher stammen aus dieser
-  Distribution. Alle Leistungen rund um Quantisierung, Kernels und Benchmark-Profile
-  gehen an EschaLabs.
-- **Wissenschaftliche Grundlage der Overthinking-Penalty:**
+The centerpiece of this adaptation is a **training-free overthinking penalty**
+that stops quantized reasoning models from tangling themselves up in their own
+chain of thought — enabled server-side via a start flag (`OTP=1`) or controlled
+per request.
+
+## Table of contents
+
+1. [What's in here?](#1-whats-in-here)
+2. [Credits & scientific basis](#2-credits--scientific-basis)
+3. [Background: overthinking under quantization](#3-background-overthinking-under-quantization)
+4. [The solution: logit penalty on hesitation markers](#4-the-solution-logit-penalty-on-hesitation-markers)
+5. [How it works in detail](#5-how-it-works-in-detail)
+6. [Quickstart](#6-quickstart)
+7. [Server launch in detail (`serve.sh`)](#7-server-launch-in-detail-servesh)
+8. [Server-default penalty (`OTP=1`)](#8-server-default-penalty-otp1)
+9. [Sending requests & recipes](#9-sending-requests--recipes)
+10. [Measuring the effect](#10-measuring-the-effect)
+11. [Verification](#11-verification)
+12. [Limitations & notes](#12-limitations--notes)
+13. [Further documentation](#13-further-documentation)
+
+---
+
+## 1. What's in here?
+
+| File | Purpose | Status |
+|---|---|---|
+| `escha-1.2.0+qwen3dense-cp312-*.whl` | Runtime wheel: `escha` + SGLang fork | original |
+| `serve.sh` | Server launcher; all knobs as env vars | original (see file header + [`INSTALL.md`](INSTALL.md)) |
+| `start-penalty.sh` / `stop-server.sh` | Start the server in the background (penalty on) / stop it | helper scripts |
+| `INSTALL.md` | Installation, GPU profiles, troubleshooting | original |
+| `thinking_budget.py` | Payload builder for the thinking budget | original (helper) |
+| `overthinking_penalty.py` | **Payload builder for the overthinking penalty** | **NEW — core adaptation** |
+| `bench_with_penalty.py` | Benchmark wrapper: `sglang.bench_serving` with the penalty payload in every request | **NEW** |
+| `DESIGN-server-default-penalty.md` | Design document for the server-default patch (code anchors, patch points A–D) | **NEW** |
+| `patches/server-default-penalty.patch` | Patch against the fork: `OTP=1` injects the penalty server-side | **NEW** |
+| `examples/penalty_example.py` | Example client against an `OTP=1` server: default injection, override λ=0 / λ=4, combined with budget | **NEW** |
+| `USAGE-penalty.md` | **Detailed usage guide**: both activation paths, curl/Python examples, measuring the effect, troubleshooting | **NEW** |
+| `README.md` / `README.de.md` | this file (EN/DE) | **NEW** |
+
+---
+
+## 2. Credits & scientific basis
+
+- **Model & runtime foundation:** [`EschaLabs/Qwen3.8-27B-Escha-W2`](https://huggingface.co/EschaLabs/Qwen3.8-27B-Escha-W2)
+  — the 2-bit-quantized checkpoint (escha method, ~10 GB); the `escha-1.2.0+qwen3dense`
+  wheel and the original `serve.sh` launcher come from that distribution.
+  All credit for quantization, kernels and benchmark profiles goes to EschaLabs.
+- **Scientific basis of the overthinking penalty:**
   Lotfi, Kirichenko, Li, Liu (Meta FAIR):
   *"Quantized Reasoning Models Think They Need to Think Longer, but They Do Not"*
-  ([arXiv:2606.00206](https://arxiv.org/abs/2606.00206)). Die Marker-Liste, die
-  Penalty-Formel und die λ-Empfehlungen stammen aus dem Paper (Appendix C, Table 8).
-- Die Implementierung hier (`overthinking_penalty.py`) ist eine **lokale Adaption**
-  für genau diesen Fork/Checkpoint; Fehler in der Adaption gehen auf uns, nicht auf
-  EschaLabs oder die Paper-Autoren.
-
-## Inhalt
-
-| Datei | Zweck | Status |
-|---|---|---|
-| `escha-1.2.0+qwen3dense-cp312-*.whl` | Runtime-Wheel (escha + SGLang-Fork) | original |
-| `serve.sh` | Server-Launcher, alle Knobs als Env-Vars | original (Details s. Dateikopf + `INSTALL.md`) |
-| `INSTALL.md` | Installation, GPU-Profiles, Troubleshooting | original |
-| `thinking_budget.py` | Payload-Builder für Thinking-Budget | original (Helper) |
-| `overthinking_penalty.py` | **Payload-Builder für Overthinking-Penalty** | **NEU — Kern-Adaption** |
-| `bench_with_penalty.py` | Wrapper: `bench_serving` mit Penalty-Payload via `--extra-request-body` | **NEU** |
-| `PLAN-server-default-penalty.md` | Design/Anchors des Server-Default-Penalty-Patches | **NEU** |
-| `patches/server-default-penalty.patch` | Patch (server_args, tokenizer_manager, neues Sampling-Modul): `OTP=1` injiziert den Penalty serverseitig | **NEU** |
-| `examples/penalty_example.py` | Beispiel-Client für einen `OTP=1`-Server: Default-Injektion, Override λ=0 / λ=4, Kombi mit Budget | **NEU** |
-| `USAGE-penalty.md` | **Detaillierte Benutzung**: Serverstart mit Flags (serve.sh UND roher CLI-Weg), curl-/Python-Beispiele, Wirkung messen, Troubleshooting | **NEU** |
-| `README.md` | diese Datei | **NEU** |
+  ([arXiv:2606.00206](https://arxiv.org/abs/2606.00206)). The marker list, the
+  penalty formula and the λ recommendations come from the paper (Appendix C,
+  Table 8).
+- The implementation here (`overthinking_penalty.py`, server patch) is a
+  **local adaptation** for exactly this fork/checkpoint; errors in the adaptation
+  are on us, not on EschaLabs or the paper authors.
 
 ---
 
-## Das Problem: Overthinking unter aggressiver Quantisierung
+## 3. Background: overthinking under quantization
 
-Das Paper zeigt: PTQ-quantisierte Reasoning-Modelle finden die richtige Antwort oft
-*mitten* in der Chain-of-Thought — sampeln dann aber Zögerungsmarker („Wait", „But",
-„Alternatively"), öffnen neue Denkzweige und reden sich aus der bereits gefundenen
-Antwort heraus. Folgen: CoT-Länge bis **4,5×**, Accuracy bricht ein (AWQ W3 auf
-MATH-500: 85,6 % → 47,0 %).
+Post-training quantization (PTQ) does not primarily damage answer quality in
+reasoning models — it damages the **termination behavior of the chain of
+thought**. The paper shows:
 
-Genau das ist auf diesem W2-Export sichtbar: Reasoning-Traces laufen bis ans
-Token-Budget, Antworten enden mit `finish_reason: "length"` und `content: null`.
+- PTQ-quantized reasoning models often find the correct answer *in the middle*
+  of the chain-of-thought already …
+- … but then sample **hesitation markers** ("Wait", "But", "Alternatively"),
+  open new reasoning branches and talk themselves out of the answer they have
+  already found.
+- Consequences: CoT length up to **4.5×**, accuracy collapses (AWQ W3 on
+  MATH-500: 85.6% → 47.0%).
 
-## Die Lösung: Logit-Penalty auf Zögerungsmarkern (training-frei)
-
-An **jedem** Dekodierschritt wird von den Logits aller 49 Markertokens ein fester
-Wert λ abgezogen (`z'(v) = z(v) − λ`). Kein Training, kein Extra-Forward-Pass,
-kein messbarer Overhead. Paper-Ergebnisse: CoT −12…−23 %, Accuracy gleich oder
-besser (+bis 6,2 pp bei AWQ W3), Overthinking-Fehler bis −58 %.
+Exactly this pattern is visible on this W2 export: reasoning traces run to the
+token budget, answers end with `finish_reason: "length"` and empty
+`content: null` — an eval harness scores that as **wrong**, not slow; an agent
+framework sees a no-op.
 
 ---
 
-## Adaption im Detail: `overthinking_penalty.py`
+## 4. The solution: logit penalty on hesitation markers
 
-### Mechanismus
+At **every** decoding step, a fixed value λ is subtracted from the logits of all
+49 marker tokens (`z′(v) = z(v) − λ`):
 
-1. **Payload-Bau (offline, einmalig):** Das Skript löst die Marker gegen die Tokens
-   des *eigenen* Modells auf, definiert eine Processor-Klasse mit eingebackenen
-   Defaults und serialisiert sie per dill als hex-JSON nach stdout — exakt dasselbe
-   Transportformat wie `thinking_budget.py`. Der Server lädt die Klasse zur Laufzeit
-   über den SGLang-Mechanismus `custom_logit_processor`
-   (`--enable-custom-logit-processor`; `serve.sh` setzt das via `ENABLE_CLP=1`
-   **standardmäßig**).
-2. **Request-Seite:** Der Client schickt zwei SGLang-Erweiterungsfelder:
-   `"custom_logit_processor": "<payload>"` und optional
-   `"custom_params": {...}`. Der Fork übergibt pro Batch-Zeile ein Param-Dict an
-   `processor.__call__(logits, custom_param_list)` und injiziert automatisch das
-   Req-Objekt unter `"__req__"` (State-Tracking: `origin_input_ids` + `output_ids`,
-   siehe `schedule_batch.py`).
-3. **Pro Zeile:** erst ggf. Budget-Zwangsschluss (Teil 1), sonst Penalty (Teil 2).
+- **No training, no fine-tuning, no extra forward pass** — the intervention
+  happens directly on the logits of the regular decoding step; there is no
+  measurable overhead.
+- Paper results: CoT length **−12…−23 %**, accuracy equal or better
+  (+up to 6.2 pp at AWQ W3), overthinking errors up to **−58 %**.
+- The scope is configurable: by default only **inside** an open `<think>` block
+  (final answers and code remain untouched); optionally paper-faithful at every
+  step (`--always`).
 
-### Token-Recherche (am echten Checkpoint verifiziert)
+---
 
-- Auflösung ist **encode-basiert**: `tok.encode(marker, add_special_tokens=False)`
-  mit Round-Trip-Check (`decode(ids) == marker`). `convert_tokens_to_ids()`
-  liefert bei diesem ~248k-Vokabular für Klartext-Marker nur `None` — der naheliegende
-  Weg funktioniert also gerade nicht.
-- **49 von 50** Paper-Markern sind hier Einzeltokens mit exaktem Round-Trip.
-  Einzig `" recheck"` zerfällt in `[311, 1960]` → wird übersprungen (mit Warnung auf
-  stderr). Beispiele: `" perhaps"→8106, " maybe"→6970, " wait"→3655,
-  " Wait"→13428, " But"→1921, " alternatively"→66073, " wrong"→4808`.
-- Denkankerntokens: `<think>=248068`, `</think>=248069`, Newline=`198` — identisch zu
-  den Konstanten des Forks (`Qwen38ThinkingBudgetLogitProcessor`). Sie werden zur
-  Build-Zeit vom Tokenizer gelesen, nicht hartkodiert.
+## 5. How it works in detail
 
-### Parameter-Vertrag (`custom_params`, alle Keys OPTIONAL)
+### 5.1 Architecture in three steps
 
-| Key | Typ | Bedeutung | Fallback |
+1. **Payload build (offline, once):** `overthinking_penalty.py` resolves the
+   markers against the tokens of *its own* model, defines a processor class
+   with baked-in defaults, and serializes it via dill as hex-JSON to stdout —
+   exactly the same transport format as `thinking_budget.py`. The server loads
+   the class at runtime through the SGLang mechanism `custom_logit_processor`
+   (`--enable-custom-logit-processor`; `serve.sh` sets this via `ENABLE_CLP=1`
+   **by default**).
+2. **Request side:** The client sends two SGLang extension fields:
+   `"custom_logit_processor": "<payload>"` and optionally
+   `"custom_params": {...}`. Per batch row, the fork passes a param dict to
+   `processor.__call__(logits, custom_param_list)` and automatically injects
+   the request object under `"__req__"` (state tracking:
+   `origin_input_ids` + `output_ids`, see `schedule_batch.py`).
+3. **Per batch row and decode step:** first, if applicable, the forced budget
+   close-out (force newline, then `</think>`), otherwise the penalty.
+
+### 5.2 Token research (verified against the real checkpoint)
+
+- Resolution is **encode-based**: `tok.encode(marker, add_special_tokens=False)`
+  with a round-trip check (`decode(ids) == marker`). `convert_tokens_to_ids()`
+  returns only `None` for plain-text markers in this ~248k vocabulary — so the
+  obvious approach just does not work here.
+- **49 of 50** paper markers are single tokens with an exact round trip. Only
+  `" recheck"` splits into `[311, 1960]` → skipped (with a warning on stderr).
+  Examples: `" perhaps"`→8106, `" maybe"`→6970, `" wait"`→3655,
+  `" Wait"`→13428, `" But"`→1921, `" alternatively"`→66073, `" wrong"`→4808.
+- Thinking anchor tokens: `<think>`=248068, `</think>`=248069, newline=`198` —
+  identical to the constants of the fork (`Qwen38ThinkingBudgetLogitProcessor`).
+  They are read from the tokenizer at build time, never hardcoded.
+
+### 5.3 Parameter contract (`custom_params`, all keys OPTIONAL)
+
+| Key | Type | Meaning | Fallback |
 |---|---|---|---|
-| `penalty_lambda` | float | Abzug pro Markertoken und Schritt. **`0` schaltet die Penalty komplett ab.** | CLI `--lambda` (im Payload eingebacken), Default 2.0 |
-| `think_only` | bool | `true`: Penalty **nur innerhalb** eines offenen `<think>`-Blocks (finale Antwort/Code bleiben unangetastet). `false`: an jedem Schritt (paper-treu). | CLI `--think-only`/`--always` (eingebacken), Default `true` |
-| `thinking_budget` | int | Max. Reasoning-Tokens nach `<think>`; danach erzwingt der Processor (wie der Stock-Processor) erst Newline, dann `</think>`. Nicht gesetzt = aus. | — (aus) |
+| `penalty_lambda` | float | Subtraction per marker token and step. **`0` switches the penalty off completely.** | CLI `--lambda` (baked into payload), default 2.0 |
+| `think_only` | bool | `true`: penalty **only inside** an open `<think>` block (final answers/code untouched). `false`: every step (paper-faithful). | CLI `--think-only`/`--always` (baked in), default `true` |
+| `thinking_budget` | int | Max. reasoning tokens after `<think>`; afterwards the processor forces a newline, then `</think>`. Unset = off. | — (off) |
 
-**Präzedenz:** Request-`custom_params` > CLI-Default im Payload > eingebauter Fallback.
+**Precedence chain:**
 
-**Kombination:** SGLang erlaubt nur **einen** `custom_logit_processor`-String pro
-Request — deshalb fasst dieser Processor **Penalty UND Thinking-Budget in einer
-Klasse** zusammen. Beide Hebel sind in einem Request nutzbar:
+```
+request custom_params  >  CLI defaults (baked into payload)  >  built-in fallbacks
+```
+
+With `OTP=1` (server default) the same chain applies — the injected payload is
+just the lowest fallback; any request can override everything.
+
+**Why penalty and budget live in one class:** SGLang allows only **one**
+`custom_logit_processor` string per request. This processor therefore combines
+both levers — both are usable within a single request:
 
 ```jsonc
 { "custom_logit_processor": "<otp.json>",
   "custom_params": {"penalty_lambda": 2.0, "think_only": true, "thinking_budget": 28672} }
 ```
 
-**Degrade-Verhalten:** Fehlt `__req__` (z. B. weil `custom_params` ganz weggelassen
-wurde), kann der Think-Scope nicht geprüft werden — dann penaltyiert der Processor
-*immer*, statt die Zeile still zu überspringen (kein stummes Nichtstun).
-Ungültiges `penalty_lambda` (z. B. String) → Zeile wird übersprungen, kein Crash.
+**Degrade behavior (intentional):**
 
-### CLI-Flags
+- If `__req__` is missing (e.g. because `custom_params` was omitted entirely),
+  the think scope cannot be checked — the processor then penalizes *always*
+  instead of silently skipping the row (no silent no-op).
+- Invalid `penalty_lambda` (e.g. string) → the row is skipped, no crash.
+- λ = 0 → penalty off; an active `thinking_budget` still applies.
 
-| Flag | Bedeutung | Default |
+### 5.4 CLI flags of `overthinking_penalty.py`
+
+| Flag | Meaning | Default |
 |---|---|---|
-| `--model DIR` | Modellordner (Tokenizer); Pflicht | — |
-| `--lambda FLOAT`, `-l` | eingebackener Default-λ; Paper-Sweep 0.5–4.0 | `2.0` |
-| `--think-only` / `--always` | eingebackener Default-Scope (mutually exclusive) | `--think-only` |
-| `--demo` | Gegen laufenden Server testen: off vs. default vs. λ=4 | aus |
-| `--base-url URL` | Endpoint für `--demo` | `http://127.0.0.1:30000/v1` |
-| `--served-name NAME` | Model-ID für `--demo` | `escha-qwen38-27b-w2` |
-| `--max-tokens N` | Demo-Budget | `4096` |
+| `--model DIR` | Model directory (tokenizer); required | — |
+| `--lambda FLOAT`, `-l` | Baked-in default λ; paper sweep 0.5–4.0 | `2.0` |
+| `--think-only` / `--always` | Baked-in default scope (mutually exclusive) | `--think-only` |
+| `--demo` | Test against a running server: off vs. default vs. λ=4 | off |
+| `--base-url URL` | Endpoint for `--demo` | `http://127.0.0.1:30000/v1` |
+| `--served-name NAME` | Model ID for `--demo` | `escha-qwen38-27b-w2` |
+| `--max-tokens N` | Demo budget | `4096` |
 
 ---
 
-## Benutzung
+## 6. Quickstart
 
-### 1. Payload bauen (einmalig)
+Four steps from zero to a running server with the penalty:
 
 ```bash
 cd /home/user/smal_qwen
+
+# 1) Build the payload (once; defaults: λ=2.0, think-only)
 .venv/bin/python runtime/sglang/overthinking_penalty.py \
-    --model ./Qwen3.8-27B-Escha-W2 > otp.json          # Defaults: λ=2.0, think-only
-# Varianten:
-#   ... --lambda 4.0 --always > otp_always.json        # paper-treu, stärker
+    --model ./Qwen3.8-27B-Escha-W2 > otp.json
+
+# 2) Start the server WITH the penalty as server default (16 GB profile):
+MODEL=./Qwen3.8-27B-Escha-W2 VENV=.venv \
+    MEM=0.90 CTXLEN=16384 CUDA_GRAPH_BS='1 2 4 8' OTP=1 \
+    bash runtime/sglang/serve.sh
+
+# 3) The startup log must contain:
+#    [serve] ... OTP=1(lam=2.0)
+#    default overthinking penalty active (lambda=2.0, think_only=True)
+
+# 4) Ask from a SECOND terminal — plain OpenAI request, NO payload needed:
+curl -s http://127.0.0.1:30000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model": "escha-qwen38-27b-w2",
+         "messages": [{"role": "user", "content": "What is 17*24? Think briefly."}],
+         "max_tokens": 512, "temperature": 0.6}' | head -c 600
 ```
 
-stderr meldet die Auflösung (`# resolved 49/49 overthinking markers`).
+Step 1's stderr reports the token resolution
+(`# resolved 49/49 overthinking markers`).
+All variants, the raw CLI path and troubleshooting are in
+[`USAGE-penalty.md`](USAGE-penalty.md).
 
-### 2. Server starten
+---
 
-Beispielaufruf (aus dem Repo-Root; loggt nach `/tmp/opencode/server.log`):
+## 7. Server launch in detail (`serve.sh`)
+
+Example invocation from the repo root (logs to `/tmp/opencode/server.log`):
 
 ```bash
 setsid nohup env MODEL=./Qwen3.8-27B-Escha-W2 VENV=.venv \
@@ -155,60 +233,70 @@ setsid nohup env MODEL=./Qwen3.8-27B-Escha-W2 VENV=.venv \
     bash runtime/sglang/serve.sh >/tmp/opencode/server.log 2>&1 &
 ```
 
-Die wichtigsten `serve.sh`-Env-Vars (vollständige Liste im Skriptkopf):
+The most important env vars (full list in the script header):
 
-| Var | Bedeutung |
+| Var | Meaning |
 |---|---|
-| `MODEL` | Modellordner (Pflicht) |
-| `VENV` | zu aktivierendes venv (hier `.venv` im Repo) |
-| `MEM` | `--mem-fraction-static` (KV-Pool-Größe) |
-| `CTXLEN` | Kontext-Cap pro Request |
-| `HOST` / `PORT` | Bind-Adresse (Default 127.0.0.1:30000); `API_KEY` bei `0.0.0.0` setzen! |
-| `API_KEY` | Bearer-Key für Clients |
-| `CUDA_GRAPH_BS` | erfasste CUDA-Graph-Batchgrößen |
-| `EXTRA_ARGS` | rohe Zusatz-Flags für `launch_server` (z. B. `--enable-metrics`) |
-| `ENABLE_CLP` | `1` (= Default) → `--enable-custom-logit-processor` — **Voraussetzung für Penalty UND Budget** |
-| `OTP` | `1` → `--default-overthinking-penalty`: Penalty wird **serverseitig in jeden Request injiziert**, der keinen eigenen `custom_logit_processor` setzt (siehe unten) |
-| `PENALTY_LAMBDA` | Default-λ des injizierten Payloads (`2.0`) — nur relevant bei `OTP=1` |
-| `PENALTY_ALWAYS` | `1` → `--penalty-always` (jeder Token statt nur `<think>`); Default `0` = think-only |
+| `MODEL` | Model directory (required) |
+| `VENV` | venv to activate (here `.venv` in the repo) |
+| `MEM` | `--mem-fraction-static` (KV pool size) |
+| `CTXLEN` | Per-request context cap |
+| `HOST` / `PORT` | Bind address (default 127.0.0.1:30000); with `0.0.0.0` set `API_KEY`! |
+| `API_KEY` | Bearer key for clients |
+| `CUDA_GRAPH_BS` | Captured CUDA-graph batch sizes |
+| `EXTRA_ARGS` | Raw extra flags for `launch_server` (e.g. `--enable-metrics`) |
+| `ENABLE_CLP` | `1` (= default) → `--enable-custom-logit-processor` — **required for BOTH penalty and budget** |
+| `OTP` | `1` → server-default penalty active (see next section) |
+| `PENALTY_LAMBDA` | Default λ of the injected payload (`2.0`) — only relevant with `OTP=1` |
+| `PENALTY_ALWAYS` | `1` → every token instead of `<think>` only; default `0` = think-only |
+| `KVDTYPE` | KV-cache dtype, default `fp8_e4m3`; see [`docs/kv-cache-quantization.md`](../../docs/kv-cache-quantization.md) |
 
-### 2b. Server-Default-Penalty (`OTP=1`) — kein Request-Feld nötig
+GPU-dependent profiles (which values for which card) are covered by
+[`INSTALL.md`](INSTALL.md), section *Running on your GPU*.
 
-Seit dem Patch `patches/server-default-penalty.patch` (gegen die im Wheel
-ausgelieferte SGLang-Fork, anwendbar mit `git apply` aus dem venv-Root; Punkte
-A–D dokumentiert in `PLAN-server-default-penalty.md`) baut der Server beim
-Start selbst einen Penalty-Payload — gleicher Processor, gleiche Marker, nur
-ohne den CLI-Umweg:
+---
+
+## 8. Server-default penalty (`OTP=1`)
+
+Since the patch `patches/server-default-penalty.patch`, the server builds a
+penalty payload itself at startup — same processor, same markers, just without
+the CLI detour. Apply with `git apply` from the venv root; code anchors and
+patch points A–D are documented in
+[`DESIGN-server-default-penalty.md`](DESIGN-server-default-penalty.md).
 
 ```bash
 MODEL=./Qwen3.8-27B-Escha-W2 OTP=1 bash runtime/sglang/serve.sh
-# Startlog: "default overthinking penalty active (lambda=2.0, think_only=True)"
+# Startup log: "default overthinking penalty active (lambda=2.0, think_only=True)"
 ```
 
-- **Wirkt auf**: chat/completions, completions und `/generate` — jeder Request
-  ohne eigenes `custom_logit_processor`. Requests MIT eigenem Payload bleiben
-  unangetastet.
-- **Vorrang unverändert**: request-`custom_params` > Server-Default > Fallback.
-  Ein Client kann pro Request abschalten: `"custom_params": {"penalty_lambda": 0}`,
-  oder kombinieren: `{"penalty_lambda": 4.0, "thinking_budget": 28672}`.
-- `OTP=1` ohne `ENABLE_CLP=1` bricht in `serve.sh` mit Fehler ab (der injizierte
-  Payload wäre sonst ein Custom-Logit-Processor auf einem Server, der die
-  ablehnt).
-- Deaktiviert = Default: ohne `OTP=1` verhält sich der Server bit-identisch zum
-  ungepatchten Stand.
+Properties:
 
-Laufendes Beispiel (alle vier Varianten gegen einen `OTP=1`-Server):
+- **Applies to** chat/completions, completions and `/generate` — every request
+  without its own `custom_logit_processor`. Requests **with** their own payload
+  remain untouched.
+- **Precedence unchanged**: request-`custom_params` > server default > fallback.
+  Switch off per request: `"custom_params": {"penalty_lambda": 0}`;
+  combine: `{"penalty_lambda": 4.0, "thinking_budget": 28672}`.
+- `OTP=1` without `ENABLE_CLP=1` aborts in `serve.sh` with an error (the
+  injected payload would otherwise be a custom logit processor on a server that
+  rejects those).
+- **Disabled = default:** without `OTP=1` the server behaves bit-identically to
+  the unpatched state.
+- If the payload build fails (e.g. tokenizer without `<think>`), the server logs
+  `default overthinking penalty disabled: <reason>` and keeps **running
+  normally** — just without the default penalty.
+
+Runnable example (all four variants against an `OTP=1` server):
 
 ```bash
 .venv/bin/python runtime/sglang/examples/penalty_example.py [BASE_URL]
 ```
 
-**Schritt-für-Schritt-Benutzung** — Serverstart mit den neuen Flags (sowohl
-der `serve.sh`-Weg als auch der rohe `launch_server`-CLI-Aufruf), curl- und
-Python-Beispiele, Wirkung messen und Troubleshooting: siehe
-[`USAGE-penalty.md`](USAGE-penalty.md).
+---
 
-### 3. Requests senden
+## 9. Sending requests & recipes
+
+### 9.1 With your own payload (path A)
 
 ```bash
 CLP=$(cat otp.json)
@@ -221,7 +309,7 @@ body = {
                   "content": "What is the largest eight-digit base 2 integer? "
                              "Express your answer in base 10."}],
     "max_tokens": 8192, "temperature": 0.6, "top_p": 0.95,
-    # SGLang-Erweiterungen:
+    # SGLang extensions:
     "custom_logit_processor": clp,
     "custom_params": {"penalty_lambda": 2.0, "think_only": True},
 }
@@ -234,50 +322,91 @@ print(json.load(urllib.request.urlopen(req, timeout=3600))["choices"][0]
 EOF
 ```
 
-Rezepte:
+### 9.2 Recipe table (`custom_params`)
 
-| Ziel | `custom_params` |
+| Goal | `custom_params` |
 |---|---|
-| Default (λ=2, nur im Denken) | `{}` weglassen oder `{}` |
-| Stärker / paper-treu überall | `{"penalty_lambda": 4.0, "think_only": false}` |
-| **Komplett abschalten** (pro Request) | `{"penalty_lambda": 0}` |
-| Nur Deckel auf dem Denken | `{"penalty_lambda": 0, "thinking_budget": 28672}` |
-| Beides kombiniert | `{"penalty_lambda": 2.0, "think_only": true, "thinking_budget": 28672}` |
+| Default (λ=2, thinking only) | omit or `{}` |
+| Stronger / paper-faithful everywhere | `{"penalty_lambda": 4.0, "think_only": false}` |
+| **Switch off completely** (per request) | `{"penalty_lambda": 0}` |
+| Only cap the thinking | `{"penalty_lambda": 0, "thinking_budget": 28672}` |
+| Both combined | `{"penalty_lambda": 2.0, "think_only": true, "thinking_budget": 28672}` |
 
-### 4. Wirkung prüfen (`--demo`)
-
-```bash
-.venv/bin/python runtime/sglang/overthinking_penalty.py \
-    --model ./Qwen3.8-27B-Escha-W2 --demo
-```
-
-Vergleicht für einen Reasoning-Prompt drei Konfigurationen (off / default / λ=4) und
-reportet `finish_reason`, `completion_tokens`, `reasoning_chars`, `answer_chars`.
-Erwartbarer Effekt: weniger Reasoning-Zeichen, öfter `stop` statt `length`.
+On choosing λ: **2.0** is the paper default and was measured on THIS model.
+Above 2.5 reasoning becomes noticeably terser; above 4.0 you risk suppressing
+legitimate re-planning ("wait", "but"). For experimenting, a per-request
+override suffices — no restart required.
 
 ---
 
-## Verifikation (durchgeführt)
+## 10. Measuring the effect
 
-- `py_compile` sauber; Payload ist valides JSON, dill-Roundtrip lädt die Klasse
-  (49 Tokens, Think-IDs 248068/248069, Defaults korrekt eingebacken).
-- Logiktests mit Fake-Reqs/Tensoren: inside-think bestraft, closed-think/nicht-think
-  unberührt (think_only), `λ=0` aus, `{}`-Params → Defaults, `think_only:false` →
-  always-on, Request-λ-Override (z. B. 4.5), Garbage-λ ohne Crash, leere/None-Paramliste
-  unverändert.
-- Budget-Tests: Budget überschritten + letztes Token ≠ Newline → Newline erzwungen;
-  letztes Token = Newline → `</think>` erzwungen; unter Budget → unangetastet;
-  gemischter Batch (Zeile A Maskierung, Zeile B Penalty) korrekt getrennt.
-- Token-Auflösung am echten Tokenizer: 49/49, ` recheck` sauber übersprungen.
+Three ways to see it:
 
-## Hinweise / Grenzen
+1. **Log line** at server startup: `default overthinking penalty active (…)`.
+2. **Demo comparison** against a running server — sends off/default/strong and
+   tabulates `finish_reason`, `completion_tokens`, `reasoning_chars`,
+   `answer_chars`:
+   ```bash
+   .venv/bin/python runtime/sglang/overthinking_penalty.py \
+       --model ./Qwen3.8-27B-Escha-W2 --demo
+   ```
+   Expected effect: fewer reasoning characters, more often `stop` instead of
+   `length`.
+3. **Benchmark with penalty:** `bench_with_penalty.py` injects the payload into
+   **every** request of an `sglang.bench_serving` run (off-run: `--lambda 0`):
+   ```bash
+   .venv/bin/python runtime/sglang/bench_with_penalty.py \
+       --model-dir ./Qwen3.8-27B-Escha-W2 --lambda 2.0 --think-only \
+       --dataset-name random --num-prompts 100
+   ```
 
-- Die Felder `custom_logit_processor`/`custom_params` sind **SGLang-Erweiterungen** —
-  Standard-OpenAI-Clients ignorieren sie; LM Studio/opencode etc. nutzen sie nicht
-  automatisch (eigene Requests nötig).
-- dill serialisiert die Klasse by-value; der Server muss denselben SGLang-Fork
-  (gleiches Wheel) fahren wie der Payload-Builder — hier gegeben, da beide `.venv`
-  bzw. dieses Wheel nutzen.
-- Die Marker wirken nur als **Einzeltokens**: deshalb fehlt `" recheck"` (2 Tokens).
-- Negative `penalty_lambda` wäre technisch möglich (Boost) und entspricht der
-  Negativ-Kontrollbedingung des Papers — nicht empfohlen für Produktion.
+A/B tip: send the same prompt once with `"penalty_lambda": 0` and once with the
+default; compare `finish_reason` + token counts.
+
+---
+
+## 11. Verification
+
+Carried out on this fork/checkpoint:
+
+- `py_compile` clean; payload is valid JSON, dill round-trip loads the class
+  (49 tokens, think IDs 248068/248069, defaults baked in correctly).
+- Logic tests with fake reqs/tensors: inside-think penalized, closed-think/
+  non-think untouched (think_only), `λ=0` off, `{}` params → defaults,
+  `think_only:false` → always-on, request-λ override (e.g. 4.5), garbage-λ
+  without crash, empty/None param list unchanged.
+- Budget tests: budget exceeded + last token ≠ newline → newline forced;
+  last token = newline → `</think>` forced; under budget → untouched;
+  mixed batch (row A masking, row B penalty) correctly separated.
+- Token resolution on the real tokenizer: 49/49, `" recheck"` cleanly skipped.
+- Server patch verified against the live server (startup log, override λ=0/λ=4,
+  batch n>1) — see [`DESIGN-server-default-penalty.md`](DESIGN-server-default-penalty.md).
+
+---
+
+## 12. Limitations & notes
+
+- The fields `custom_logit_processor`/`custom_params` are **SGLang extensions** —
+  standard OpenAI clients ignore them; LM Studio/opencode etc. do not use them
+  automatically (own requests needed). That is why the common case is `OTP=1`:
+  then clients need not send anything.
+- dill serializes the class by value; the server must run the same SGLang fork
+  (same wheel) as the payload builder — given here, since both use `.venv`
+  resp. this wheel.
+- The markers only work as **single tokens**: hence `" recheck"` is missing
+  (2 tokens).
+- Negative `penalty_lambda` would be technically possible (boost) and matches
+  the paper's negative control condition — not recommended for production.
+
+---
+
+## 13. Further documentation
+
+| Document | Content |
+|---|---|
+| [`USAGE-penalty.md`](USAGE-penalty.md) / [DE](USAGE-penalty.de.md) | Step-by-step usage: both activation paths, client examples, measuring the effect, troubleshooting/FAQ, compact flag reference |
+| [`INSTALL.md`](INSTALL.md) / [DE](INSTALL.de.md) | Installation (requirements incl. three silent failures), GPU profiles by compute capability & VRAM, troubleshooting |
+| [`DESIGN-server-default-penalty.md`](DESIGN-server-default-penalty.md) / [DE](DESIGN-server-default-penalty.de.md) | Architecture decision of the server patch: verified code anchors, patch points A–D, edge cases, rollback |
+| [`../docs/kv-cache-quantization.md`](../../docs/kv-cache-quantization.md) | FP8 KV cache: research in the fork, measurements (2× context), quality A/B, HiCache failure |
+

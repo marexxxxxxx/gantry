@@ -1,7 +1,32 @@
+<p align="right"><b>🇩🇪 Deutsch</b> | <a href="kv-cache-quantization.md">🇬🇧 English</a></p>
+
 # KV-Cache-Quantisierung für Qwen3.8-27B-Escha-W2
 
 **Datum:** 2026-08-21
-**Geänderte Dateien:** `runtime/sglang/serve.sh` (einzige funktionale Änderung), neu: `ctxmon.sh` (Monitoring), dieses Dokument.
+**Geänderte Dateien:** [`runtime/sglang/serve.sh`](../runtime/sglang/serve.sh) (einzige funktionale Änderung), neu: `ctxmon.sh` (Monitoring), dieses Dokument.
+
+**Kurzfassung:** FP8-KV (`fp8_e4m3`) verdoppelt die Token-Kapazität des Pools **exakt**
+(32 345 → 64 690 Tokens) ohne messbaren Qualitätsverlust — verifiziert per Greedy-A/B
+und einem SWE-bench-Lite-Agentenlauf. HiCache (RAM-Offload) ist für diese
+Hybridarchitektur **nicht funktionsfähig** (HiRadixCache nur MHA/MLA) und wird durch
+einen Early-Guard in `serve.sh` abgefangen, bevor 9,5 GB Gewichte geladen werden.
+
+## Inhaltsverzeichnis
+
+1. [Ziel & Ausgangslage](#1-ziel--ausgangslage)
+2. [Recherche im Fork](#2-recherche-im-fork)
+   - [Was möglich ist / was nicht](#recherche-im-detail)
+3. [Änderungen an `runtime/sglang/serve.sh`](#aenderungen-an-servesh)
+   - [3.1 Knob `KVDTYPE`](#31-neuer-knob-kvdtype-default-fp8_e4m3)
+   - [3.2 Knobs `HICACHE`/`HICACHE_GB`/`HICACHE_FORCE`](#32-neue-knobs-hicache--hicache_gb--hicache_force)
+   - [3.3 Auto-Default `ATTN_BACKEND=triton`](#33-auto-default-attn_backendtriton-auf-blackwell)
+   - [3.4 Kommentare/Header aktualisiert](#34-kommentareheader-aktualisiert)
+   - [3.5 Konsistenz-Fix](#35-konsistenz-fix)
+4. [Messungen](#4-messungen-live-gleiche-karte-gleiches-mem)
+5. [Qualitäts-A/B-Test FP16 vs. FP8](#5-qualitäts-ab-test-fp16-vs-fp8)
+6. [HiCache-Live-Test (fehlgeschlagen)](#6-hicache-live-test-ram-offload--fehlgeschlagen-wie-vorhergesagt)
+7. [Betrieb](#7-betrieb)
+8. [Knobs-Referenz](#8-knobs-referenz)
 
 ---
 
@@ -24,8 +49,9 @@ waren noch für eine 24-GB-Karte geschrieben.
 
 ---
 
-## 2. Recherche im Fork (was überhaupt möglich ist)
+## 2. Recherche im Fork
 
+<a id="recherche-im-detail"></a>
 Untersucht wurde der installierte Fork unter
 `.venv/lib/python3.12/site-packages/sglang/`:
 
@@ -46,6 +72,7 @@ Untersucht wurde der installierte Fork unter
 
 ---
 
+<a id="aenderungen-an-servesh"></a>
 ## 3. Änderungen an `runtime/sglang/serve.sh`
 
 ### 3.1 Neuer Knob `KVDTYPE` (Default: `fp8_e4m3`)
