@@ -243,6 +243,7 @@ Die wichtigsten Env-Vars (vollständige Liste im Skriptkopf):
 | `HOST` / `PORT` | Bind-Adresse (Default 127.0.0.1:30000); bei `0.0.0.0` zwingend `API_KEY` setzen! |
 | `API_KEY` | Bearer-Key für Clients |
 | `CUDA_GRAPH_BS` | erfasste CUDA-Graph-Batchgrößen |
+| `SERIAL` | `1` (Default) = single-flight: eine laufende Generation gleichzeitig, weitere Requests warten in der FIFO-Schlange des Servers (kein 429/503, kein paralleles GPU-Decode) — das VRAM-sichere Profil für Multi-Agenten-Clients; `0` = auto/batched. S. [INSTALL.de.md](INSTALL.de.md#single-flight-modus-f%C3%BCr-multi-agenten-clients-default) |
 | `EXTRA_ARGS` | rohe Zusatz-Flags für `launch_server` (z. B. `--enable-metrics`) |
 | `ENABLE_CLP` | `1` (= Default) → `--enable-custom-logit-processor` — **Voraussetzung für Penalty UND Budget** |
 | `OTP` | `1` → Serverdefault-Penalty aktiv (siehe nächster Abschnitt) |

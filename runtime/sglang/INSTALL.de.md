@@ -224,7 +224,7 @@ Hybridarchitektur mit vielen kleinen Kernels pro Token; eager Decode ist launch-
 | VRAM | Beispiel | Empfohlener Start |
 |---|---|---|
 | **16 GB** | RTX 5060 Ti, RTX 5080 | `ATTN_BACKEND=triton MEM=0.90 CTXLEN=16384 CUDA_GRAPH_BS="1 2 4 8" bash serve.sh` — neben 10,15 GB Gewichten bleibt ein kleiner Pool; bei Capture-OOM zuerst `CTXLEN` senken. Ungetestet. |
-| **24 GB** | RTX 4090, RTX 3090, L40S, A6000 | `MODEL=... bash serve.sh` — die ausgelieferten Defaults (`MEM=0.72 CTXLEN=65536 MAMBA_RATIO=0.3 RADIX=0 GRAPHS=1 CUDA_GRAPH_BS="1 2 4 8 12 16"`). **Validiert auf RTX 4090 und RTX 3090.** Single-User-Profil: der rekurrente Pool klemmt es auf **8–9 Streams**, deshalb fallen die Capture-Einträge `12`/`16` weg. Für Durchsatz: `MEM=0.86 CTXLEN=32768 MAXREQ=32 MAXMAMBA=32 CUDA_GRAPH_BS="1 2 4 8 12 16 24 32"` (4090: 649 tok/s @ 16; 3090: 383). Auf einer 3090 für Single-User zusätzlich `ESCHA_ROUTE=blackwell`. |
+| **24 GB** | RTX 4090, RTX 3090, L40S, A6000 | `MODEL=... bash serve.sh` — die ausgelieferten Defaults (`MEM=0.72 CTXLEN=65536 MAMBA_RATIO=0.3 RADIX=0 GRAPHS=1 CUDA_GRAPH_BS="1 2 4 8 12 16"`). **Validiert auf RTX 4090 und RTX 3090.** Single-User-Profil: `SERIAL=1` (der Default) klemmt es auf **einen Stream**, deshalb fallen die Capture-Einträge `12`/`16` weg. Für Durchsatz: `SERIAL=0 MAXREQ=32 MAXMAMBA=32 CUDA_GRAPH_BS="1 2 4 8 12 16 24 32"` (4090: 649 tok/s @ 16; 3090: 383). Auf einer 3090 für Single-User zusätzlich `ESCHA_ROUTE=blackwell`. |
 | **32 GB** | RTX 5090 | `ATTN_BACKEND=triton MEM=0.85 CTXLEN=65536 MAXREQ=32 MAXMAMBA=32 CUDA_GRAPH_BS="1 2 4 8 12 16 24 32" bash serve.sh` — **gemessen**: 87,1 tok/s bs=1, 955 tok/s Peak bei 16 Streams, 28,2 GB Peak von 32,6. `INT8=on` bringt +7,2–7,4 % Decode bei bs=1 im gepaarten A/B (und +12,2 % KV-Tokens, kein freies VRAM — die gesparten ~1,2 GB wandern in den Pool). |
 | **40 GB+** | A100, H100, L40S-48 | `MEM=0.85 CTXLEN=131072 bash serve.sh`; int8 auto-AUS, `CTXLEN`/Parallelität frei hoch. Ungetestet. |
 
@@ -267,6 +267,54 @@ rekurrenten State-Pool pro Request; die maximale Parallelität bestimmt dieser P
 (`MAXMAMBA`) — nicht der KV-Speicher. Das effektive `max_running_requests` wird geklemmt
 auf `min(MAXREQ, MAXMAMBA // ratio)`, ratio ≈ 4 mit Radix-Cache, ≈ 1 mit `RADIX=0`.
 Eine Startup-Log-Zeile meldet die Klemme.
+
+### Single-Flight-Modus für Multi-Agenten-Clients (Default)
+
+**Eine GPU, mehrere Agenten** (Paperclip + Hermes + OpenCode gegen denselben Server): Jede
+laufende Generation legt eigenen KV-Cache *und* rekurrenten State an, N gleichzeitige Requests
+vervielfachen also VRAM — die Fehlermode ist ein Retract oder OOM mitten in der Generation,
+nicht nur langsameres Decode. `serve.sh` läuft deshalb im Default **single-flight**: maximal ein
+Request im `running`-State, jeder weitere Request **wartet in der FIFO-Schlange** des Servers,
+bis der Slot frei ist.
+
+```bash
+MODEL=./Qwen3.8-27B-Escha-W2 bash serve.sh                          # SERIAL=1 (Default)
+SERIAL=0 MAXREQ=32 MAXMAMBA=32 CUDA_GRAPH_BS="1 2 4 8" MODEL=... bash serve.sh   # batched Throughput
+```
+
+`SERIAL=1` ändert nur *Defaults* — ein explizites `MAXREQ=32` etc. gewinnt weiterhin:
+
+| Knob | Default unter `SERIAL=1` | Wirkung |
+|---|---|---|
+| `MAXREQ` | `1` | `--max-running-requests 1` — der Running-Batch des Schedulers hält einen Request, der Rest wartet FIFO in der Schlange. **Das ist die harte Obergrenze.** |
+| `MAXMAMBA` | `1` | Rekurrenter State-Pool hält einen Stream → effektive Klemme `min(MAXREQ, MAXMAMBA // ratio)` bleibt 1 |
+| `CUDA_GRAPH_BS` | `"1"` | Nur der Batch-1-Graph wird capturt — kein VRAM für Parallel-Batch-Graphen |
+
+Erwartetes Verhalten: Request A (lange Generation) läuft; Request B, gestartet während A
+läuft, **wartet** (offene Verbindung, kein 429/503) und beginnt erst, wenn A fertig ist;
+B schlägt dann erfolgreich. Es gibt **keine Schlangen-Tiefen-Limit** — ein wartender Request
+wird nur abgewiesen, wenn sein eigenes Prompt+Output den KV-Pool sprengt; das ist eine
+Admissions-Prüfung pro Request, keine Queueing-Regel. Schlagentiefe ist einsehbar unter
+`curl -s localhost:30000/metrics` (`num_running_reqs` / `num_queue_reqs`, Default an).
+
+Client-Hinweis: Ein wartender Request hält seine HTTP-Verbindung offen, Agenten-Timeouts müssen
+also die erwartete Wartezeit überschreiten (Client-Konfiguration, nicht die des Servers).
+
+**Timeouts:** SGLangs Warte- und Lauf-Timeouts (`SGLANG_REQ_WAITING_TIMEOUT` /
+`SGLANG_REQ_RUNNING_TIMEOUT`) sind per Default `-1` (niemals) und in `serve.sh` auf `-1`
+gepinnt — kein wartender Request wird abgewiesen, keine lange Generation wegen der Dauer
+getötet. Einen wartenden Request können nur noch Client-Timeouts abreißen (Paperclip / Hermes /
+OpenCode) — die müssen über der erwarteten Wartezeit liegen.
+
+Verifizieren mit:
+
+```bash
+bash runtime/sglang/verify-single-flight.sh            # Defaults: Port 30000, SERVED_NAME
+```
+
+Es feuert einen langen Request A, startet B drei Sekunden später und prüft, dass Bs erstes
+Byte nicht vor As Ende ankommt, dass B erfolgreich ist (HTTP 200, nicht 429/503) und dass
+`num_running_reqs` nie über 1 steigt.
 
 ## 6. Begrenztes Denken (`thinking_budget`)
 

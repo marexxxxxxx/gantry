@@ -244,6 +244,7 @@ The most important env vars (full list in the script header):
 | `HOST` / `PORT` | Bind address (default 127.0.0.1:30000); with `0.0.0.0` set `API_KEY`! |
 | `API_KEY` | Bearer key for clients |
 | `CUDA_GRAPH_BS` | Captured CUDA-graph batch sizes |
+| `SERIAL` | `1` (default) = single-flight: one in-flight generation at a time, extra requests wait in the server's FIFO queue (no 429/503, no parallel GPU decode) — the VRAM-safe profile for multi-agent clients; `0` = auto/batched. See [INSTALL.md](INSTALL.md#single-flight-mode-for-multi-agent-clients-default) |
 | `EXTRA_ARGS` | Raw extra flags for `launch_server` (e.g. `--enable-metrics`) |
 | `ENABLE_CLP` | `1` (= default) → `--enable-custom-logit-processor` — **required for BOTH penalty and budget** |
 | `OTP` | `1` → server-default penalty active (see next section) |

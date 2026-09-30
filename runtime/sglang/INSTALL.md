@@ -203,7 +203,7 @@ architecture that launches many small kernels per token, so eager decode is laun
 | VRAM | Example | Suggested launch |
 |---|---|---|
 | **16 GB** | RTX 5060 Ti, RTX 5080 | `ATTN_BACKEND=triton MEM=0.90 CTXLEN=16384 CUDA_GRAPH_BS="1 2 4 8" bash serve.sh` — 10.15 GB of weights leaves a small pool; drop `CTXLEN` first if capture OOMs. Untested. |
-| **24 GB** | RTX 4090, RTX 3090, L40S, A6000 | `MODEL=... bash serve.sh` — the shipped defaults (`MEM=0.72 CTXLEN=65536 MAMBA_RATIO=0.3 RADIX=0 GRAPHS=1 CUDA_GRAPH_BS="1 2 4 8 12 16"`). **Validated on RTX 4090 and RTX 3090.** Single-user profile: the recurrent pool clamps it to **8–9 streams**, so the `12`/`16` capture entries are dropped. For throughput use `MEM=0.86 CTXLEN=32768 MAXREQ=32 MAXMAMBA=32 CUDA_GRAPH_BS="1 2 4 8 12 16 24 32"` (4090: 649 tok/s @ 16; 3090: 383). On a 3090 add `ESCHA_ROUTE=blackwell` for single-user work. |
+| **24 GB** | RTX 4090, RTX 3090, L40S, A6000 | `MODEL=... bash serve.sh` — the shipped defaults (`MEM=0.72 CTXLEN=65536 MAMBA_RATIO=0.3 RADIX=0 GRAPHS=1 CUDA_GRAPH_BS="1 2 4 8 12 16"`). **Validated on RTX 4090 and RTX 3090.** Single-user profile: `SERIAL=1` (the default) clamps it to **one stream**, so the `12`/`16` capture entries are dropped. For throughput use `SERIAL=0 MAXREQ=32 MAXMAMBA=32 CUDA_GRAPH_BS="1 2 4 8 12 16 24 32"` (4090: 649 tok/s @ 16; 3090: 383). On a 3090 add `ESCHA_ROUTE=blackwell` for single-user work. |
 | **32 GB** | RTX 5090 | `ATTN_BACKEND=triton MEM=0.85 CTXLEN=65536 MAXREQ=32 MAXMAMBA=32 CUDA_GRAPH_BS="1 2 4 8 12 16 24 32" bash serve.sh` — **measured**: 87.1 tok/s bs=1, 955 tok/s peak at 16 streams, 28.2 GB peak of 32.6. `INT8=on` adds +7.2–7.4% decode at bs=1, paired A/B (and +12.2% KV tokens, not free VRAM — the saved ~1.2 GB is recycled into the pool). |
 | **40 GB+** | A100, H100, L40S-48 | `MEM=0.85 CTXLEN=131072 bash serve.sh`; int8 auto-OFF, raise `CTXLEN`/concurrency freely. Untested. |
 
@@ -240,6 +240,52 @@ This is a **hybrid** model: most layers are linear-attention with a per-request
 recurrent-state pool, so max concurrency is governed by that pool (`MAXMAMBA`), *not* by KV memory.
 The effective `max_running_requests` is clamped to `min(MAXREQ, MAXMAMBA // ratio)`, ratio ≈ 4 with
 the radix cache on, ≈ 1 with `RADIX=0`. A startup log line reports the clamp.
+
+### Single-flight mode for multi-agent clients (default)
+
+**One GPU, several agents** (Paperclip + Hermes + OpenCode against the same server): every
+in-flight generation allocates its own KV cache *and* recurrent state, so N concurrent requests
+multiply VRAM — the failure mode is a mid-generation retract or OOM, not just slower decode.
+`serve.sh` therefore defaults to **single-flight**: at most one request is in `running` state;
+every further request **waits in the server's FIFO queue** until the slot is free.
+
+```bash
+MODEL=./Qwen3.8-27B-Escha-W2 bash serve.sh                          # SERIAL=1 (default)
+SERIAL=0 MAXREQ=32 MAXMAMBA=32 CUDA_GRAPH_BS="1 2 4 8" MODEL=... bash serve.sh   # batched throughput
+```
+
+`SERIAL=1` only changes *defaults* — an explicit `MAXREQ=32` etc. still wins:
+
+| Knob | Default under `SERIAL=1` | Effect |
+|---|---|---|
+| `MAXREQ` | `1` | `--max-running-requests 1` — the scheduler's running batch holds one request, the rest queue FIFO. **This is the hard cap.** |
+| `MAXMAMBA` | `1` | recurrent-state pool holds one stream → effective cap `min(MAXREQ, MAXMAMBA // ratio)` stays 1 |
+| `CUDA_GRAPH_BS` | `"1"` | only the batch-1 graph is captured — no VRAM spent on parallel-batch graphs |
+
+Expected behavior: request A (long generation) runs; request B, started while A runs, **waits**
+(open connection, no 429/503) and starts only after A finishes; B then succeeds. There is **no
+queue-depth limit** — a waiter is only rejected when its own prompt+output exceeds the KV pool,
+which is a per-request admission error, not queueing. Queue depth is observable at
+`curl -s localhost:30000/metrics` (`num_running_reqs` / `num_queue_reqs`, on by default).
+
+Client note: a waiting request holds its HTTP connection open, so agent-side timeouts must
+exceed the expected queue wait (client config, not the server's).
+
+**Timeouts:** SGLang's queue-wait and run timeouts (`SGLANG_REQ_WAITING_TIMEOUT` /
+`SGLANG_REQ_RUNNING_TIMEOUT`) default to `-1` (never time out) and are pinned to `-1` in
+`serve.sh`, so no waiter is ever dropped and no long generation is killed for duration. The
+only timeouts that can still cut a waiting request are client-side (Paperclip / Hermes /
+OpenCode) — those must be set above the expected queue wait.
+
+Verify with:
+
+```bash
+bash runtime/sglang/verify-single-flight.sh            # defaults: port 30000, SERVED_NAME
+```
+
+It fires a long request A, starts B three seconds later, and asserts that B's first byte does
+not arrive before A finishes, that B succeeds (HTTP 200, not 429/503), and that
+`num_running_reqs` never exceeds 1.
 
 ## 6. Bounded thinking (`thinking_budget`)
 

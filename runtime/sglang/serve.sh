@@ -37,7 +37,17 @@ CTXLEN=${CTXLEN:-65536}     # the model's own limit is 262144. This is a CAP per
                             #     alongside the weights. Raise on a bigger card, lower with MEM.
 CHUNK=${CHUNK:-2048}        # chunked-prefill-size. Bounds the activation spike on a long prompt;
                             #     leave it alone unless you are tuning TTFT on a large card.
-MAXREQ=${MAXREQ:-0}         # max concurrent requests; 0 = auto.
+SERIAL=${SERIAL:-1}         # 1 = single-flight (DEFAULT): at most ONE in-flight generation at a
+                            #     time. Built for multi-agent clients (Paperclip, Hermes, OpenCode)
+                            #     sharing one GPU: extra requests WAIT in the server's FIFO queue
+                            #     (never rejected with 429/503, never parallel GPU decode) until
+                            #     the active generation finishes. 0 = previous auto behavior
+                            #     (MAXREQ=0 -> batched throughput, VRAM permitting).
+# Which pool knobs did the CALLER provide? Must be captured BEFORE the ${VAR:-default} lines
+# below set every knob — the single-flight block uses these to tell "explicit" from "default".
+_GIVEN_MAXREQ=${MAXREQ+set}; _GIVEN_MAXMAMBA=${MAXMAMBA+set}; _GIVEN_CGBS=${CUDA_GRAPH_BS+set}
+MAXREQ=${MAXREQ:-0}         # max concurrent requests; 0 = auto. SERIAL=1 (the default) changes
+                            #     this default to 1 — see the single-flight block below.
 MAXMAMBA=${MAXMAMBA:-0}     # --max-mamba-cache-size; 0 = auto.
 MAMBA_RATIO=${MAMBA_RATIO:-0.3}  # --mamba-full-memory-ratio. 0.3 (not the 0.9 default) is what
                             #     leaves the pool room for KV *and* CUDA-graph capture at CTXLEN
@@ -83,8 +93,28 @@ CUDA_GRAPH_BS=${CUDA_GRAPH_BS:-"1 2 4 8 12 16"}  # batch sizes captured when GRA
                            #     log prints the list actually captured). They start mattering once
                            #     you raise MAXREQ/MAXMAMBA/MEM. 32 is the decode kernel's max M, so
                            #     "1 2 4 8 12 16 24 32" captures fine on a throughput profile. Past
-                           #     32 a batch falls through to a large-M path meant for prefill, and
-                           #     the server refuses to capture it.
+                            #     32 a batch falls through to a large-M path meant for prefill, and
+                            #     the server refuses to capture it.
+
+# ---- single-flight profile ------------------------------------------------------------------
+# SERIAL=1 (the default) makes the GPU run ONE generation at a time. It only changes DEFAULTS:
+# an explicit value always wins, so `SERIAL=1 MAXREQ=32 MAXMAMBA=32 CUDA_GRAPH_BS="1 2 4 8"
+# bash serve.sh` is still a valid throughput setup. What the three caps do:
+#   MAXREQ=1        -> --max-running-requests 1: the scheduler's running batch holds one request;
+#                      further requests sit in its waiting queue (FIFO) until the slot frees.
+#                      THIS is the hard cap; SGLang never rejects waiters with 429/503.
+#   MAXMAMBA=1      -> the recurrent-state pool holds one stream, so the effective cap
+#                      min(MAXREQ, MAXMAMBA // ratio) stays 1 even if MAXREQ is raised later.
+#   CUDA_GRAPH_BS=1 -> capture only the batch-1 graph; no VRAM is spent on parallel-batch graphs
+#                      that single-flight can never use.
+if [[ "$SERIAL" == "1" ]]; then
+  [[ -n "$_GIVEN_MAXREQ" ]]   || MAXREQ=1
+  [[ -n "$_GIVEN_MAXMAMBA" ]] || MAXMAMBA=1
+  [[ -n "$_GIVEN_CGBS" ]]     || CUDA_GRAPH_BS=1
+elif [[ "$SERIAL" != "0" ]]; then
+  echo "[serve] ERROR: SERIAL must be 0|1 (got '$SERIAL')" >&2; exit 1
+fi
+
 THINK=${THINK:-1}          # 1 = thinking-ON + --reasoning-parser qwen3 (simplest, always works).
                            # 0 = thinking-OFF: patches the model's chat template to default-closed
                            #     AND drops the reasoning parser.
@@ -159,6 +189,13 @@ export LD_LIBRARY_PATH="$TORCH_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"   # esc
 [[ -n "$ESCHA_SRC" ]] && export PYTHONPATH="$ESCHA_SRC${PYTHONPATH:+:$PYTHONPATH}"
 export SGLANG_MAMBA_CONV_DTYPE=float16          # must match --dtype float16 or causal_conv1d crashes
 export SGLANG_DISABLE_CUDNN_CHECK=1
+# Request timeouts — pinned to -1 (NEVER time out) for single-flight serving. The SGLang
+# defaults are already -1, but a future fork release could flip them to a finite value and
+# then a queued request (or one long xhigh-reasoning generation) would die mid-wait. -1 means:
+# a request waits in the queue as long as it must, and a running generation is never killed
+# for duration. True hangs are still caught by the watchdog (300s per forward batch).
+export SGLANG_REQ_WAITING_TIMEOUT=${SGLANG_REQ_WAITING_TIMEOUT:--1}
+export SGLANG_REQ_RUNNING_TIMEOUT=${SGLANG_REQ_RUNNING_TIMEOUT:--1}
 # This checkpoint is TEXT-ONLY (the vision tower is in the quant `ignore` list — the checkpoint
 # has zero visual.* tensors). Default to NOT instantiating the vision tower: it saves VRAM on
 # every card, and prevents an image request from silently decoding through a random-init tower
@@ -381,6 +418,7 @@ PY
 fi
 
 echo "[serve] MODEL=$MODEL NAME=$SERVED_NAME $HOST:$PORT MEM=$MEM CTX=$CTXLEN GRAPHS=$GRAPHS THINK=$THINK RADIX=$RADIX INT8=$INT8 KVDTYPE=$KVDTYPE HICACHE=$HICACHE${ATTN_BACKEND:+ ATTN=$ATTN_BACKEND}${OTP:+ OTP=1(lam=$PENALTY_LAMBDA$([ "$PENALTY_ALWAYS" == "1" ] && echo ,always))}"
+echo "[serve] pool: SERIAL=$SERIAL MAXREQ=$MAXREQ MAXMAMBA=$MAXMAMBA CUDA_GRAPH_BS=$CUDA_GRAPH_BS"
 echo "[serve] tool-call-parser=$TOOL_PARSER  ptxas=$TRITON_PTXAS_PATH"
 
 exec "$PYBIN" -m sglang.launch_server \
