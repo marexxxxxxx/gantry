@@ -121,6 +121,9 @@ class LogReader:
         #: Zaehler der tatsaechlich betrachteten Indexeintraege. Nur fuer Tests:
         #: er macht die Kosten der Zuordnung messbar, ohne Zeitmessung.
         self.window_scans = 0
+        #: Schritte, die das Verbrauchen einer Zugriffszeile kostet. Muss 1 je
+        #: Treffer sein - hoechster Wert waere eine erneute lineare Suche.
+        self.consume_steps = 0
 
     @staticmethod
     def _is_ok(status):
@@ -145,6 +148,7 @@ class LogReader:
         self.last_error = None
         self._ok_access = []
         self._failed_access = []
+        self.consume_steps = 0
         self._decoder.reset()
 
     def _file_identity(self):
@@ -268,56 +272,62 @@ class LogReader:
         for event in events:
             if event.kind != FINISHED:
                 continue
-            best = self._nearest(event, ok=True)
-            if best is not None:
-                event.meta["ip_port"] = best["ip_port"]
-                event.meta["status"] = best["status"]
-                self._consume(best)
+            hit = self._nearest(event, ok=True)
+            if hit is not None:
+                position, _, access = hit
+                event.meta["ip_port"] = access["ip_port"]
+                event.meta["status"] = access["status"]
+                self._consume(position, ok=True)
                 continue
-            failed = self._nearest(event, ok=False)
-            if failed is not None:
+            hit = self._nearest(event, ok=False)
+            if hit is not None:
+                position, _, access = hit
                 # Fehlgeschlagener Request: Status mitgeben, aber keine IP als
                 # Halter. Task 8 kann das als Fehlerfall behandeln. Die Zeile
                 # wird verbraucht - ein 500 gehoert zu genau einem Request.
-                event.meta["status"] = failed["status"]
-                self._consume(failed)
+                event.meta["status"] = access["status"]
+                self._consume(position, ok=False)
         self._prune_access(events)
         return events
 
     def _nearest(self, event, ok):
-        """Naechste passende Access-Zeile im Fenster, oder None.
+        """(Position, at, Eintrag) der naechsten passenden Access-Zeile, oder None.
 
         Der Index ist nach `at` sortiert und nach Erfolg/Misserfolg getrennt, das
         Suchfenster per bisect eingegrenzt. Frueher war das ein linearer Scan
         ueber die ganze Reserve, zweimal pro Event - auf dem echten Log mit 92k
         Zeilen verdoppelte das die Poll-Zeit (2.3 s -> 4.2 s).
+
+        Die Position wird mitgeliefert, damit _consume den Treffer direkt
+        loeschen kann. Ohne das durchsuchte _consume beide Indizes noch einmal
+        linear: bei 47k gepaarten Zeilen 1,1 Mrd. Schritte.
         """
         index = self._ok_access if ok else self._failed_access
         window = self.pair_window_s
         event_at = event.at
         left = bisect.bisect_left(index, event_at - window, key=_index_key)
         best = None
-        for entry in index[left:]:
-            at = entry[0]
+        for offset, (at, access) in enumerate(index[left:], start=left):
             if at > event_at + window:
                 break
             self.window_scans += 1
-            if best is None or abs(at - event_at) < abs(best[0] - event_at):
-                best = entry
-        return best[1] if best is not None else None
+            if best is None or abs(at - event_at) < abs(best[1] - event_at):
+                best = (offset, at, access)
+        return best
 
-    def _consume(self, entry):
+    def _consume(self, position, ok):
         """Eine Access-Zeile genau einmal verwenden.
 
         Ohne das bekommen alle finished-Events im Fenster denselben 500er
-        gestempelt, obwohl er zu genau einem Request gehoert.
+        gestempelt, obwohl er zu genau einem Request gehoert. Die Position kommt
+        aus _nearest, das kostet hier genau einen Schritt.
         """
-        for index in (self._ok_access, self._failed_access):
-            for position, (_, candidate) in enumerate(index):
-                if candidate is entry:
-                    del index[position]
-                    return True
-        return False
+        index = self._ok_access if ok else self._failed_access
+        if position >= len(index):
+            return False
+        self.consume_steps += 1
+        del index[position]
+        return True
 
     def _prune_access(self, events):
         """Reserve auf das Zeitfenster beschneiden.

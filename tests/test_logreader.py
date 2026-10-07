@@ -274,18 +274,23 @@ class TestIpPairing(ReaderCase):
         self.assertEqual(event.meta["status"], 200)
         self.assertEqual(event.meta["ip_port"], "127.0.0.1:40076")
 
-    def test_pending_access_does_not_grow_without_bound(self):
-        # Im echten Log stehen 92450 Access-Zeilen, davon nur ~2300 unter /v1/.
-        # Ohne Aufraeumen waechst die Liste unbegrenzt (3 pro Minute /metrics).
+    def test_monitoring_traffic_never_enters_the_reserve(self):
+        # Gehoert seit Runde 2 in _collect, nicht mehr in den Prune: der
+        # /metrics-Eigenverkehr wird verworfen, bevor er gemerkt wird. Der Name
+        # sagt, was tatsaechlich geprueft wird - der alte Name
+        # ("does_not_grow_without_bound") versprach den Prune und pruefte ihn
+        # nicht: mit gestopptem _prune_access blieb er gruen.
         for i in range(50):
             self.append(
                 f'[2026-10-07 17:19:20] INFO:     127.0.0.1:{40000 + i} - '
                 f'"GET /metrics HTTP/1.1" 200 OK'
             )
         self.reader.poll()
-        self.assertEqual(len(self.reader.pending_access), 0)
+        self.assertEqual(self.reader.pending_access, [])
 
-    def test_old_access_lines_are_dropped_but_recent_one_survives(self):
+    def test_prune_drops_old_model_lines_but_keeps_the_recent_one(self):
+        # Das ist der Test, der einen toten _prune_access faengt: /v1/-Zeilen
+        # gelangen bis in die Reserve, erst der Prune beschneidet sie.
         for i in range(5):
             self.append(
                 f'[2026-10-07 17:0{i}:20] INFO:     10.0.0.9:1111 - '
@@ -296,6 +301,17 @@ class TestIpPairing(ReaderCase):
         # das waere auch bei vollstaendigem Verlust erfuellt.
         self.assertEqual(len(self.reader.pending_access), 1)
         self.assertEqual(self.reader.pending_access[0]["ip_port"], "10.0.0.9:1111")
+
+    def test_prune_is_what_bounds_the_reserve(self):
+        # Gegenprobe zum Namen: mit totem Prune waechst die Reserve ungebremst.
+        self.reader._prune_access = lambda events: None
+        for i in range(5):
+            self.append(
+                f'[2026-10-07 17:0{i}:20] INFO:     10.0.0.9:1111 - '
+                f'"POST /v1/chat/completions HTTP/1.1" 200 OK'
+            )
+        self.reader.poll()
+        self.assertEqual(len(self.reader.pending_access), 5)
 
 
 class TestLargeLogs(ReaderCase):
@@ -410,6 +426,81 @@ class TestPairingCost(ReaderCase):
             self.append(ACCESS)
         self.append(FINISHED)
 
+    def _paired_traffic(self, count):
+        """count Access-Zeilen, je direkt gefolgt von einem passenden Event."""
+        base = 1700000000
+        for i in range(count):
+            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(base + i * 2))
+            self.append(
+                f'[{when}] INFO:     10.0.0.{i % 250}:1111 - '
+                f'"POST /v1/chat/completions HTTP/1.1" 200 OK'
+            )
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(base + i * 2 + 1))
+            self.append(
+                '{"timestamp": "%s", "event": "request.finished", "rid": "r%d", '
+                '"obj": {"rid": "r%d", "received_time": 1.0}, "out": {"meta_info": '
+                '{"id": "x", "finish_reason": {"type": "stop", "matched": 1}, '
+                '"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0}}}'
+                % (stamp, i, i)
+            )
+
+    def _paired_traffic(self, count, noise=0):
+        """count Access-Zeilen, je direkt gefolgt von einem passenden Event.
+
+        `noise` ist die Zahl zusaetzlicher /v1/-Zeilen, die nie paaren
+        (/v1/models-Abfragen). Die bleiben im Index liegen und stehen VOR dem
+        Treffer - genau die Form, in der eine erneute lineare Suche in
+        _consume quadratisch wird.
+        """
+        base = 1700000000
+        for i in range(count):
+            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(base + i * 2))
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(base + i * 2 + 1))
+            for j in range(noise):
+                self.append(
+                    f'[{when}] INFO:     10.9.9.{j % 250}:1111 - '
+                    f'"GET /v1/models HTTP/1.1" 200 OK'
+                )
+            self.append(
+                f'[{when}] INFO:     10.0.0.{i % 250}:1111 - '
+                f'"POST /v1/chat/completions HTTP/1.1" 200 OK'
+            )
+            self.append(
+                '{"timestamp": "%s", "event": "request.finished", "rid": "r%d", '
+                '"obj": {"rid": "r%d", "received_time": 1.0}, "out": {"meta_info": '
+                '{"id": "x", "finish_reason": {"type": "stop", "matched": 1}, '
+                '"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0}}}'
+                % (stamp, i, i)
+            )
+
+    def test_consuming_a_paired_line_costs_one_step_per_pair(self):
+        # _consume bekommt die Position aus _nearest und loescht direkt. Mit
+        # ungepaarten /v1/-Zeilen davor (der Fall, der quadriert) muss es
+        # weiterhin genau einen Schritt je Paar kosten.
+        for count in (100, 600):
+            reader = LogReader(self.path, pair_window_s=30.0)
+            open(self.path, "w", encoding="utf-8").close()
+            self._paired_traffic(count, noise=3)
+            events = reader.poll()
+            paired = [e for e in events if e.meta["ip_port"]]
+            self.assertEqual(len(paired), count, "die Paarung muss greifen")
+            self.assertEqual(reader.consume_steps, count)
+
+    def test_consume_cost_does_not_grow_with_the_number_of_pairs(self):
+        # Verdoppelt sich die Menge ungepaarter /v1/-Zeilen, darf die Arbeit je
+        # Paar nicht wachsen: 1 Schritt, unabhaengig von der Indexgroesse.
+        for noise in (0, 3, 12):
+            reader = LogReader(self.path, pair_window_s=30.0)
+            open(self.path, "w", encoding="utf-8").close()
+            self._paired_traffic(120, noise=noise)
+            events = reader.poll()
+            paired = [e for e in events if e.meta["ip_port"]]
+            self.assertEqual(len(paired), 120, "die Paarung muss greifen")
+            self.assertEqual(
+                reader.consume_steps, 120,
+                f"bei {noise} ungepaarten Zeilen stiegen die Verbrauchsschritte",
+            )
+
     def test_pairing_scan_does_not_grow_with_monitoring_traffic(self):
         scans = {}
         for count in (10, 5000):
@@ -448,6 +539,75 @@ class TestPairingCost(ReaderCase):
             self.assertLessEqual(reader.window_scans, count + 10)
         # Der Zaehler muss sublinear bleiben: Eigenverkehr wird nie durchsucht.
         self.assertLess(reader.window_scans, 50)
+
+
+class TestPendingAccessIsDerived(ReaderCase):
+    """pending_access muss beide Indexzustaende abbilden.
+
+    Die Property ist abgeleitet, damit Reserve und Suchstruktur nicht
+    auseinanderlaufen. Ohne Test fuer genau diese Invariante laesst sich einer
+    der beiden Indizes aus der Property entfernen, ohne dass ein Test rot wird.
+    """
+
+    def _access(self, second, peer, status, reason):
+        return (
+            f'[2026-10-07 17:19:{second:02d}] INFO:     {peer} - '
+            f'"POST /v1/chat/completions HTTP/1.1" {status} {reason}'
+        )
+
+    def _finished(self, second, rid):
+        return (
+            '{"timestamp": "2026-10-07T17:19:%02d.654321", "event": "request.finished", '
+            '"rid": "%s", "obj": {"rid": "%s", "received_time": 1.0}, '
+            '"out": {"meta_info": {"id": "%s", "finish_reason": {"type": "stop", '
+            '"matched": 1}, "prompt_tokens": 10, "completion_tokens": 5, '
+            '"cached_tokens": 0}}}' % (second, rid, rid, rid)
+        )
+
+    def _log_with_both_states(self, consumed=True):
+        # 200 und 500 so weit auseinander, dass der Event keine paart - die
+        # beiden Zeilen bleiben in der Reserve und muessen beide sichtbar sein.
+        self.append(self._access(20, "10.0.0.1:1111", 200, "OK"))
+        self.append(self._access(24, "10.0.0.2:2222", 500, "Internal Server Error"))
+        if consumed:
+            self.append(self._finished(60, "r1"))
+
+    def test_property_shows_successful_and_failed_entries(self):
+        self._log_with_both_states(consumed=False)
+        self.reader.poll()
+        entries = self.reader.pending_access
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(
+            sorted(e["status"] for e in entries), [200, 500]
+        )
+
+    def test_property_agrees_with_both_indexes(self):
+        self._log_with_both_states(consumed=False)
+        self.reader.poll()
+        from_indexes = [
+            entry for _, entry in sorted(
+                self.reader._ok_access + self.reader._failed_access,
+                key=lambda item: item[0],
+            )
+        ]
+        self.assertEqual(self.reader.pending_access, from_indexes)
+        self.assertEqual(
+            len(self.reader._ok_access) + len(self.reader._failed_access),
+            len(self.reader.pending_access),
+        )
+
+    def test_property_is_empty_once_both_indexes_are_empty(self):
+        self._log_with_both_states(consumed=True)
+        self.reader.poll()
+        self.assertEqual(self.reader.pending_access, [])
+        self.assertEqual(self.reader._ok_access, [])
+        self.assertEqual(self.reader._failed_access, [])
+
+    def test_consuming_a_failed_entry_shortens_the_property(self):
+        failed = self._access(24, "10.0.0.2:2222", 500, "Internal Server Error")
+        self.append(failed, self._finished(25, "r1"))
+        self.reader.poll()
+        self.assertEqual(self.reader.pending_access, [])
 
 
 class TestFailedAttribution(ReaderCase):
