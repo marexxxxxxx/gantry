@@ -45,6 +45,32 @@ Verbindung mit deutlichem Zuwachs sendet SSE-Tokens und hat damit den Slot. Alle
 anderen sind wartend. Verifiziert am 2026-10-07: 35 Verbindungen, genau eine mit
 +112 KB in 15 s (≈ 7,5 KB/s).
 
+### Offene Verbindungen sind nicht die Warteliste
+
+Verifiziert am 2026-10-07 um 09:41 — die beiden Größen laufen gegeneinander:
+
+| | 06:53 | 09:41 |
+|---|---|---|
+| `num_waiting_reqs` aus `/get_load` | 180 | 1492 |
+| offene TCP-Verbindungen auf :30000 | 35 | 1 |
+
+Gegenprobe über `/proc/<pid>/fd` mit Inode-Abgleich gegen `/proc/net/tcp{,6}`: von
+11 Socket-Deskriptoren des Servers sind genau zwei echte TCP-Sockets (LISTEN und die
+eine ESTAB-Verbindung des Halters), die übrigen neun sind Unix-Sockets für die IPC
+zwischen Tokenizer und Scheduler. Die 1492 Wartenden haben also nachweislich keine
+offenen Verbindungen.
+
+Naheliegende Erklärung: Verbindungen wurden geschlossen, während die Requests in der
+Scheduler-Queue hängen blieben. Dafür spricht, dass die Queue mit ~11 Requests pro
+6 Minuten drainiert, also exakt der Abbaudrate *eines* Slots, und das Log keine
+einzige `disconnect`- oder `abort`-Meldung enthält. Der Anteil verwaister Einträge ist
+nicht messbar.
+
+**Folge:** Der Slot-Halter ist weiterhin zuverlässig erkennbar — die
+`bytes_sent`-Methode greift unverändert. Nicht ableitbar sind dagegen Position und
+Zuordnung einzelner Wartender. Das Dashboard führt die beiden Zahlen deshalb getrennt
+und beschriftet jede als das, was sie ist.
+
 ## Architektur
 
 Vier Einheiten, jede mit genau einer Aufgabe.
@@ -70,7 +96,7 @@ Pollt alle 2 s:
 | `/get_server_info` mit `Authorization: Bearer marec` | `max_req_input_len`, einmalig beim Start gelesen |
 | `/metrics` ohne Auth | `gen_throughput`, `num_queue_reqs`, `num_running_reqs` |
 | `nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total` | GPU-Auslastung, VRAM |
-| `ss -tinH ... sport = :30000` | Verbindungen, `bytes_sent` |
+| `ss -tinH ... sport = :30000` | offene Verbindungen, `bytes_sent`. Feld fehlt in manchen Snapshots → fehlender Wert zählt als 0, Parser bricht nicht ab |
 | `tail -c` auf `/tmp/escha_server_lan.log` | `#full token`, `#queue-req` |
 
 ### `slotmon/history.py` — Persistenz
@@ -82,8 +108,13 @@ nicht unbegrenzt.
 
 ### `slotmon/server.py` — Dashboard
 
-FastAPI/uvicorn (beides in der vorhandenen venv vorhanden). Eine Seite, die sich per
+FastAPI/uvicorn. Beides ist im systemweiten `python3.12` vorhanden
+(`python3.12 -c "import fastapi, uvicorn, httpx"`). Eine Seite, die sich per
 SSE aktualisiert statt zu pollen. Bindet auf `0.0.0.0:8090`, ohne Auth.
+
+**Abhängigkeiten:** kein pytest, kein `pip install` (PEP 668, externally-managed).
+Tests laufen über stdlib `unittest`, Ausführung mit
+`python3.12 -m unittest discover -s tests`. Kein venv nötig, keine Neuinstallation.
 
 ### `systems.json` — IP → Name
 
@@ -105,8 +136,8 @@ Unbekannte IP fällt auf die rohe IP zurück, nie auf einen Fehler.
    - **neuer Halter** → alter Eintrag wird abgeschlossen (`ended_at`, Dauer, letzter
      ctx-Wert, Ø tok/s) und landet in `history.jsonl`; neuer Eintrag startet mit
      `started_at = jetzt`
-   - **kein Halter** → Slot ist frei; wartende Connection mit der längsten Wartezeit
-     wird als `NÄCHSTER` markiert
+   - **kein Halter** → Slot ist frei. Kein Nachfolger wird benannt, weil sich die
+     Reihenfolge der Wartenden nicht ableiten lässt (siehe *Bekannte Grenzen*)
 
 ### Bekannte Grenzen
 
@@ -115,8 +146,14 @@ Unbekannte IP fällt auf die rohe IP zurück, nie auf einen Fehler.
 - Die Reihenfolge der Wartenden ist aus dem Socket-Stand nicht exakt ableitbar, weil
   sglang intern nach eigener Scheduler-Logik sortiert. `Position 1` ist eine Näherung aus
   der Queue-Länge, nicht die echte Position.
+- **Die Warteliste lässt sich keinem System zuordnen.** Offene Verbindungen und
+  `num_waiting_reqs` laufen gegeneinander (siehe oben), vermutlich weil geschlossene
+  Verbindungen in der Queue hängen bleiben. Welcher Client auf welcher Position wartet,
+  ist ohne Eingriff in den Datenpfad nicht feststellbar. Der Monitor behauptet das
+  auch nicht.
 
-Beide stehen als Hinweis im Dashboard.
+Beide ersten Punkte stehen als Hinweis im Dashboard, der dritte als Fußnote an der
+Wartelisten-Kachel.
 
 ### Abgeleitete Werte
 
@@ -125,8 +162,9 @@ Beide stehen als Hinweis im Dashboard.
   ist, wird sie aus der aktuellen Laufzeit des laufenden Slots genommen. Fehlt auch die,
   zeigt die Kachel `–` statt einer erfundenen Zahl. Die Kachel ist als Schätzung
   gekennzeichnet.
-- **Position des NÄCHSTEN** — 1, sobald der Slot frei wird; während ein Slot belegt ist,
-  zeigt der Zeitstrahl die Position aus der Queue-Länge, ebenfalls als Näherung markiert.
+- **Position des NÄCHSTEN** — entfällt. Ohne belastbare Zuordnung der Wartenden zu
+  Verbindungen wäre jede Position geraten. Stattdessen zeigt der Zeitstrahl bei freiem
+  Slot `BEREIT FÜR NÄCHSTEN` ohne Namen.
 - **Ø tok/s je abgeschlossener Eintrag** — Mittel der über die Lebensdauer gemittelten
   Durchsätze, nicht der Summe.
 
@@ -136,17 +174,24 @@ Zwei Reiter. Der Reiterwechsel ändert nur die Ansicht, nicht die Daten; die Wer
 aktualisieren sich im Hintergrund weiter. „Verlauf" merkt sich seine Position.
 
 **Reiter „Jetzt"**
-- KPI-Raster (5): SLOT (BELEGT/frei), QUEUE, TOK/S, GPU, WARTEZEIT
+- KPI-Raster (6): SLOT (BELEGT/frei), WARTEND (`num_waiting_reqs`), VERBINDUNGEN
+  (offene TCP-Verbindungen), TOK/S, GPU, WARTEZEIT. WARTEND und VERBINDUNGEN stehen
+  nebeneinander, weil sie sich stark unterscheiden können und nur zusammen erklären,
+  was los ist.
 - Große Karte des aktiven Halters: grüner Rand, Badge `HAT DEN SLOT`, IP:Port darunter
 - Vier Kennzahlen: LÄUFT (seit `started_at`), TOK/S (`gen_throughput`), CTX (`#full token`
   aus dem Server-Log), AUSGABEN in Prozent
 - Fortschrittsbalken: `AUSGABEN = #full token / max_req_input_len`. `max_req_input_len`
   kommt einmalig aus `/get_server_info` (83994). Der Balken misst die Füllung des
   Eingabekontexts, nicht die Antwortlänge — er zeigt, wie viel vom Fenster verbraucht ist
-- Tabelle der Wartplätze, nach System gruppiert, mit Anzahl je System
+- **Verbindungen, nach System gruppiert** — nur die tatsächlich offenen Verbindungen mit
+  Anzahl und Dauer je System. Der Titel sagt ausdrücklich *Verbindungen*, nicht
+  *Wartende*, und direkt darunter steht als Fußnote der Grund: Die Warteschlange des
+  Servers ist länger als die Zahl offener Verbindungen; wer auf welcher Position wartet,
+  ist nicht feststellbar.
 
 **Reiter „Verlauf"**
-- Zeitstrahl der Slot-Übergaben: LÄUFT (grün), FERTIG (grau), NÄCHSTER (gelb)
+- Zeitstrahl der Slot-Übergaben: LÄUFT (grün), FERTIG (grau)
   mit Dauer, ctx und tok/s je Eintrag
 - Sparkline tok/s der letzten 60 s
 - Summen: Übergaben, Ø Dauer, verbleibende Queue
@@ -159,8 +204,9 @@ einen bekannten Zustand statt eines geratenen Werts.
 | Fehler | Verhalten |
 |---|---|
 | `/get_load` oder `/metrics` nicht erreichbar | Quellen als getrennte Altersangaben führen. Ist nur eine tot, zeigen die übrigen Kacheln weiter; das Slot-Feld wird grau mit „verbunden mit Server: nein". Monitor läuft weiter und erholt sich ohne Neustart. |
-| Kein Socket mit Datenfluss | Slot-Karte: „frei", mit Wartezeit. Kein Name wird erfunden. |
-| `ss` fehlt / keine Verbindungen | Slot-Kachel zeigt „unbekannt" statt einer Zahl, Slot-Halter-Name bleibt leer. Die Kachel bleibt sichtbar, damit der Ausfall nicht wie ein freier Server aussieht. |
+| Kein Socket mit Datenfluss | Slot-Karte: „frei", mit Wartezeit. Kein Name wird erfunden, kein Nachfolger benannt. |
+| `ss` fehlt / keine Verbindungen | Slot-Kachel zeigt „unbekannt" statt einer Zahl, Slot-Halter-Name bleibt leer. Die Kachel bleibt sichtbar, damit der Ausfall nicht wie ein freier Server aussieht. Die Kachel VERBINDUNGEN zeigt dann `–`, nicht `0`. |
+| `num_waiting_reqs` fehlt in `/get_load` | Kachel WARTEND zeigt `–`. VERBINDUNGEN füllt sich trotzdem. Keine der beiden Zahlen wird aus der anderen geschätzt. |
 | `nvidia-smi` fehlt oder scheitert | GPU- und VRAM-Kachel zeigen `–`. Nie `0`, weil 0 als Aussage gelesen wird. |
 | `systems.json` fehlt oder Syntaxfehler | Start bricht mit klarer Meldung ab. Läuft nicht halb konfiguriert. Fehlende *IP* im File ist kein Fehler. |
 | `history.jsonl` defekt | Kaputte Zeile wird übersprungen, Datei beim nächsten Schreiben neu aufgebaut. Kein Absturz. |
@@ -224,8 +270,9 @@ ausschaltbar sein.
 
 Gegen die echten Daten des laufenden Servers, im Nur-Lese-Modus.
 
-1. **Erkennt den echten Halter** — Monitor starten, 5 s warten. Erwartung:
-   `192.168.9.2:53268` als Halter, alle anderen als Wartende.
+1. **Erkennt den echten Halter** — Monitor starten, 5 s warten. Erwartung: die eine
+   Verbindung mit wachsendem `bytes_sent` ist der Halter. Keine Festlegung auf eine
+   bestimmte IP, die ändert sich mit dem Client.
 2. **Erkennt einen Wechsel** — kleiner echter Request durch, während ein anderer wartet.
    Erwartung: neuer Halter erscheint, alter Eintrag mit Dauer und Ø tok/s in der Historie.
 3. **`ss`-Delta-Logik gegen Fixtures** — aufgezeichnete Snapshot-Paare: gleiche Paare →
@@ -242,11 +289,15 @@ Gegen die echten Daten des laufenden Servers, im Nur-Lese-Modus.
    Server) → Kacheln zeigen Alter statt Zahl, Monitor läuft weiter.
 8. **Doppelstart** — `monitor.sh start` zweimal → zweiter Aufruf meldet „läuft bereits",
    Exit 0.
+9. **Zwei Zahlen bleiben zwei Zahlen** — Fixture mit `num_waiting_reqs: 1492` und genau
+   einer offenen Verbindung. Erwartung: beide Kacheln zeigen ihre eigene Zahl, keine wird
+   aus der anderen abgeleitet, keine wird als „0 Wartende" dargestellt.
 
 ### Was nicht getestet wird
 
-Ein mehrtägiger Dauerlauf mit ~422 Wartenden lässt sich nicht simulieren. Wird nicht
-behauptet.
+Ein mehrtägiger Dauerlauf mit über 1400 Wartenden lässt sich nicht simulieren. Wird nicht
+behauptet. Ebenso: welcher Prozess sich hinter einer hängengebliebenen Queue-Eintrag
+verbirgt. Der Monitor stellt das nicht fest und behauptet es auch nicht.
 
 ### Kein Eingriff in den Server
 
