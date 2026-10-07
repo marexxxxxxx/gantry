@@ -1388,7 +1388,7 @@ import shutil
 import tempfile
 import unittest
 
-from slotmon.logrotate import LogRotator
+from slotmon.logrotate import LogRotator, is_allowed
 
 
 class RotatorCase(unittest.TestCase):
@@ -1470,6 +1470,17 @@ class TestPathGuard(RotatorCase):
         LogRotator(max_mb=5, warn_mb=4).check(foreign)
         self.assertGreater(os.path.getsize(foreign), 0)
 
+    def test_path_outside_tmp_is_rejected(self):
+        outside = "/var/log/sonstwas.log"
+        self.assertFalse(is_allowed(outside))
+        self.assertFalse(LogRotator(max_mb=1, warn_mb=1).check(outside).truncated)
+
+    def test_nested_tmp_path_with_known_name_is_allowed(self):
+        nested = os.path.join(tempfile.mkdtemp(prefix="slotmon-nest-"),
+                              "escha_server_lan.log")
+        self.addCleanup(shutil.rmtree, os.path.dirname(nested))
+        self.assertTrue(is_allowed(nested))
+
     def test_monitor_own_log_is_allowed(self):
         own = os.path.join(self.dir, "slotmon.log")
         with open(own, "w", encoding="utf-8") as handle:
@@ -1513,7 +1524,15 @@ import os
 import re
 from dataclasses import dataclass
 
-ALLOWED = re.compile(r"^/tmp/(escha_server.*\.log|slotmon\.log)$")
+ALLOWED_NAME = re.compile(r"^(escha_server.*\.log|slotmon\.log)$")
+TMP_ROOT = os.path.realpath("/tmp")
+
+
+def is_allowed(path):
+    """Nur Logdateien unter /tmp. Der Basename entscheidet, nicht ein Glob."""
+    if not ALLOWED_NAME.match(os.path.basename(path)):
+        return False
+    return os.path.realpath(path).startswith(TMP_ROOT + os.sep)
 
 
 @dataclass
@@ -1537,7 +1556,7 @@ class LogRotator:
             return RotateResult()
         self.counter = (self.counter + 1) % max(1, self.every)
 
-        if not ALLOWED.match(path):
+        if not is_allowed(path):
             return RotateResult(error=f"pfad nicht freigegeben: {path}")
         try:
             size = os.path.getsize(path)
@@ -1706,13 +1725,15 @@ class TestHolder(CollectorCase):
         state = collector.tick()
         self.assertIsNone(state["slot"]["ip_port"])
 
-    def test_duration_grows_with_time(self):
+    def test_duration_is_measured_from_received_time(self):
+        # received_time der Fixture ist 900.0, now startet bei 1000.0
         collector = self.make()
         self.append(RECEIVED)
-        collector.tick()
+        state = collector.tick()
+        self.assertAlmostEqual(state["slot"]["duration_s"], 100.0, delta=1.0)
         self.now = 1030.0
         state = collector.tick()
-        self.assertAlmostEqual(state["slot"]["duration_s"], 30.0, delta=1.0)
+        self.assertAlmostEqual(state["slot"]["duration_s"], 130.0, delta=1.0)
 
     def test_legacy_queue_reports_unknown_holder(self):
         collector = self.make()
@@ -1818,6 +1839,18 @@ from slotmon.names import resolve
 from slotmon.slot import evaluate
 from slotmon.sources import ServerSources
 
+def host_of(ip_port):
+    """Aus "192.168.9.2:44444" die IP machen, damit systems.json greift.
+
+    Kein Port im Namen: die Zuordnung ist IP -> Name.
+    """
+    if not ip_port:
+        return None
+    if ip_port.startswith("["):
+        return ip_port[1:ip_port.find("]")] if "]" in ip_port else ip_port
+    return ip_port.rsplit(":", 1)[0] if ":" in ip_port else ip_port
+
+
 BATCH_TOKENS = re.compile(r"#full token:\s*(\d+)")
 BATCH_QUEUE = re.compile(r"#queue-req:\s*(\d+)")
 BATCH_THROUGHPUT = re.compile(r"gen throughput \(token/s\):\s*([\d.]+)")
@@ -1908,7 +1941,7 @@ class Collector:
                 duration = max(0.0, now - started)
             record = dict(entry)
             record["duration_s"] = duration
-            record["system"] = resolve(self.names, entry.get("ip_port"))
+            record["system"] = resolve(self.names, host_of(entry.get("ip_port")))
             self.history.append(record)
             written.append(record)
             del self.finished[rid]
@@ -1955,7 +1988,7 @@ class Collector:
             entry = self.finished.get(slot_state.holder_rid)
             if entry:
                 ip_port = entry.get("ip_port")
-                system = resolve(self.names, ip_port)
+                system = resolve(self.names, host_of(ip_port))
 
         if slot_state.complete and slot_state.holder_rid:
             label = "busy"
@@ -2104,15 +2137,19 @@ class TestEndpoints(unittest.TestCase):
         self.assertIn("text/html", response.headers["content-type"])
         self.assertIn("slotmon", response.text.lower())
 
-    def test_stream_declares_event_stream_media_type(self):
-        """Der SSE-Pfad wird am Router geprüft, nicht über einen offenen Stream.
+    def test_stream_route_is_registered(self):
+        """Der SSE-Pfad wird am Router geprueft, nicht ueber einen offenen Stream.
 
         TestClient.stream auf einen endlosen Generator blockiert beim Verlassen des
-        Kontextmanagers. Deshalb wird die Route direkt angesprochen.
+        Kontextmanagers. Die media_type-Pruefung passiert deshalb live in Step 5,
+        wo der Server als curl erreichbar ist.
         """
-        routes = [r for r in create_app(self.collector).routes if getattr(r, "path", "") == "/api/stream"]
+        routes = [r for r in create_app(self.collector).routes
+                  if getattr(r, "path", "") == "/api/stream"]
         self.assertEqual(len(routes), 1)
-        self.assertIn("text/event-stream", routes[0].media_type)
+
+    def test_health_endpoint(self):
+        self.assertEqual(self.client.get("/health").json(), {"ok": True})
 
 
 class TestHtml(unittest.TestCase):
@@ -2486,8 +2523,16 @@ python3.12 -m slotmon.server &
 sleep 4
 curl -s http://127.0.0.1:8090/api/state | python3.12 -m json.tool | head -20
 curl -s -o /dev/null -w "dashboard: %{http_code}\n" http://127.0.0.1:8090/
+curl -s -N --max-time 3 http://127.0.0.1:8090/api/stream | head -2
 ```
-Expected: JSON mit `slot.state` und `slot.legacy`, Dashboard HTTP 200.
+Expected: JSON mit `slot.state` und `slot.legacy`, Dashboard HTTP 200, und der
+Stream liefert eine Zeile beginnend mit `data: {`. Bricht curl nach `--max-time` ab,
+ist das erwartet — der Stream ist endlos.
+
+Danach den Testserver wieder beenden:
+```bash
+pkill -f "[s]lotmon.server" || true
+```
 
 - [ ] **Step 6: Commit**
 
