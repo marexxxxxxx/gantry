@@ -1,4 +1,8 @@
 Qwen3.8-27B-Escha-W2/
+Qwen3.8-27B-Escha-W2
 .venv/
+.venv
+otp.json
 nohup.out
 __pycache__/
+.superpowers/
