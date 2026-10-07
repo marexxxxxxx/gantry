@@ -50,5 +50,37 @@ class TestLegacy(unittest.TestCase):
         self.assertTrue(state.complete)
 
 
+class TestHolderSinceClock(unittest.TestCase):
+    """`holder_since` ist Unix-Zeit aus dem Log-`timestamp`, nicht `received_time`.
+
+    Live gemessen am echten Server: `timestamp` -> 1791393308.0 (Unix),
+    `obj.received_time` -> 469943.46 (monotoner Zaehler). Wer die beiden
+    verwechselt, rechnet eine Laufzeit von -1.780.923.364 s.
+    """
+
+    UNIX_TS = 1791393308.0
+    RECEIVED_TIME = 469943.46
+
+    def test_holder_since_is_returned_unchanged(self):
+        state = evaluate({"aaa": self.UNIX_TS}, waiting=0)
+        self.assertEqual(state.holder_since, self.UNIX_TS)
+
+    def test_holder_since_is_subtractable_from_wall_clock(self):
+        import time as _time
+
+        state = evaluate({"aaa": self.UNIX_TS}, waiting=0)
+        elapsed = _time.time() - state.holder_since
+        self.assertGreater(elapsed, 0)
+
+    def test_monotonic_received_time_is_not_mistaken_for_unix(self):
+        """Gegenprobe: eine received_time als offene Zeit ergaebe Unsinn."""
+        state = evaluate({"aaa": self.RECEIVED_TIME}, waiting=0)
+        self.assertEqual(state.holder_since, self.RECEIVED_TIME)
+        # evaluate() rechnet nicht um - es gibt genau das zurueck, was reinkommt.
+        # Der Unterschied muss der Aufrufer kennen, sonst entsteht die negative
+        # Laufzeit. Hier festgehalten, damit der Unterschied nicht wegoptimiert wird.
+        self.assertLess(state.holder_since, 1e9)
+
+
 if __name__ == "__main__":
     unittest.main()

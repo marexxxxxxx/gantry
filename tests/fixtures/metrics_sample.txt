@@ -1,0 +1,12 @@
+# HELP sglang:num_running_reqs The number of running requests.
+# TYPE sglang:num_running_reqs gauge
+sglang:num_running_reqs{engine_type="unified",model_name="escha-qwen38-27b-w2",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 1.0
+# HELP sglang:gen_throughput The generation throughput (token/s).
+# TYPE sglang:gen_throughput gauge
+sglang:gen_throughput{engine_type="unified",model_name="escha-qwen38-27b-w2",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 51.34
+# HELP sglang:num_queue_reqs The number of requests in the waiting queue.
+# TYPE sglang:num_queue_reqs gauge
+sglang:num_queue_reqs{engine_type="unified",model_name="escha-qwen38-27b-w2",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 1689.0
+# HELP sglang:num_running_reqs_offline_batch The number of running low-priority offline batch requests(label is 'batch').
+# TYPE sglang:num_running_reqs_offline_batch gauge
+sglang:num_running_reqs_offline_batch{engine_type="unified",model_name="escha-qwen38-27b-w2",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 0.0

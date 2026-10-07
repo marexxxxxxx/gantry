@@ -1,6 +1,18 @@
 """Aus offenen rids und der Queue-Laenge folgen Halter und Altbestand.
 
 Rein: keine Uhr, kein I/O. Die Zeit kommt von aussen herein.
+
+Zwei Uhren, nicht verwechseln
+-----------------------------
+``holder_since`` ist **Unix-Zeit** (~1.79e9) und kommt aus dem ``timestamp``-Feld
+des Log-Eintrags, den ``LogReader.state["open"]`` unter der rid ablegt. Es ist
+**nicht** sglangs monotoner ``received_time`` (~4.7e5, Zaehler ab Serverstart) -
+der steht in ``event.meta["received_time"]`` und erreicht ``evaluate()`` gar nicht.
+
+Deshalb ist ``time.time() - holder_since`` eine Laufzeit in Sekunden, und
+``received_time - time.time()`` waere eine um ~1,79 Mrd. Sekunden negative
+" Laufzeit" - die erfundene Zahl, die dieses Produkt verbietet. Wer hier
+subtrahiert, muss die Unix-Zeit verwenden.
 """
 
 from dataclasses import dataclass

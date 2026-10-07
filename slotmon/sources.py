@@ -40,7 +40,10 @@ class ServerSources:
         url = self.cfg.api + path
         try:
             response = httpx.get(url, headers=headers or {}, timeout=timeout)
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            # InvalidURL erbt nicht von HTTPError (mro: InvalidURL -> Exception),
+            # obwohl UnsupportedProtocol es tut. Ein Tippfehler in API ist
+            # sonst der einzige Fehler, der den Reader mitnimmt.
             return None, f"{type(exc).__name__}: {exc}"
         if response.status_code != 200:
             return None, f"HTTP {response.status_code}"
@@ -109,7 +112,7 @@ class ServerSources:
                 text=True,
                 timeout=timeout,
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        except (OSError, subprocess.TimeoutExpired) as exc:
             return Sample(None, None, f"{type(exc).__name__}: {exc}")
         if done.returncode != 0:
             return Sample(None, None, f"rc={done.returncode}: {done.stderr.strip()[:80]}")
