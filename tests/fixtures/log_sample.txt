@@ -1,0 +1,4 @@
+[2026-10-07 17:19:07] INFO:     127.0.0.1:40076 - "GET /get_load HTTP/1.1" 200 OK
+{"timestamp": "2026-10-07T17:19:07.123456", "event": "request.received", "rid": "a93031d87de846e187ddc80afcfb73eb", "obj": {"rid": "a93031d87de846e187ddc80afcfb73eb", "received_time": 437300.5}}
+[2026-10-07 17:19:20] INFO:     127.0.0.1:40076 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+{"timestamp": "2026-10-07T17:19:24.654321", "event": "request.finished", "rid": "d7d50a43cae04ef3a11f625fc1939662", "obj": {"rid": "d7d50a43cae04ef3a11f625fc1939662", "received_time": 437290.25}, "out": {"meta_info": {"id": "d7d50a43cae04ef3a11f625fc1939662", "finish_reason": {"type": "stop", "matched": 248046}, "prompt_tokens": 4270, "completion_tokens": 1687, "cached_tokens": 0}}}
