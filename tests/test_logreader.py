@@ -388,6 +388,146 @@ class TestReadErrors(ReaderCase):
         self.assertIsNone(self.reader.last_error)
 
 
+class TestPairingCost(ReaderCase):
+    """Die Zuordnung darf nicht linear ueber den Monitor-Eigenverkehr laufen.
+
+    Auf dem echten Log stehen 92k Access-Zeilen, davon ~2.3k unter /v1/. Ein
+    linearer Scan pro Event kostete in Runde 1 die doppelte Poll-Zeit (2.3 s ->
+    4.2 s). Der Zaehler hier ist deterministisch, im Gegensatz zu einer Zeitmessung.
+    """
+
+    def _monitor_traffic(self, count, with_v1=True):
+        for i in range(count):
+            self.append(
+                f'[2026-10-07 17:19:20] INFO:     127.0.0.1:{40000 + i % 1000} - '
+                f'"GET /metrics HTTP/1.1" 200 OK'
+            )
+            self.append(
+                f'[2026-10-07 17:19:21] INFO:     127.0.0.1:{45000 + i % 1000} - '
+                f'"GET /get_load HTTP/1.1" 200 OK'
+            )
+        if with_v1:
+            self.append(ACCESS)
+        self.append(FINISHED)
+
+    def test_pairing_scan_does_not_grow_with_monitoring_traffic(self):
+        scans = {}
+        for count in (10, 5000):
+            reader = LogReader(self.path, pair_window_s=30.0)
+            open(self.path, "w", encoding="utf-8").close()
+            self._monitor_traffic(count)
+            reader.poll()
+            scans[count] = reader.window_scans
+        # 5000 Zeilen Eigenverkehr duerfen die Arbeit nicht vervielfaachen.
+        self.assertLessEqual(
+            scans[5000], scans[10] * 2 + 5,
+            f"Scan wuchs mit dem Eigenverkehr: {scans}",
+        )
+
+    def test_pairing_still_finds_ip_amid_monitoring_traffic(self):
+        self._monitor_traffic(5000)
+        event = self.reader.poll()[0]
+        self.assertEqual(event.meta["ip_port"], "127.0.0.1:40076")
+        self.assertEqual(event.meta["status"], 200)
+
+    def test_failed_lookup_does_not_walk_monitoring_traffic(self):
+        failed = (
+            '[2026-10-07 17:19:20] INFO:     1.2.3.4:1111 - '
+            '"POST /v1/chat/completions HTTP/1.1" 500 Internal Server Error'
+        )
+        for count in (10, 5000):
+            reader = LogReader(self.path, pair_window_s=30.0)
+            open(self.path, "w", encoding="utf-8").close()
+            for i in range(count):
+                self.append(
+                    f'[2026-10-07 17:19:20] INFO:     127.0.0.1:{40000 + i % 1000} - '
+                    f'"GET /metrics HTTP/1.1" 200 OK'
+                )
+            self.append(failed, FINISHED)
+            reader.poll()
+            self.assertLessEqual(reader.window_scans, count + 10)
+        # Der Zaehler muss sublinear bleiben: Eigenverkehr wird nie durchsucht.
+        self.assertLess(reader.window_scans, 50)
+
+
+class TestFailedAttribution(ReaderCase):
+    def _finished(self, second, rid):
+        return (
+            '{"timestamp": "2026-10-07T17:19:%02d.654321", "event": "request.finished", '
+            '"rid": "%s", "obj": {"rid": "%s", "received_time": 1.0}, '
+            '"out": {"meta_info": {"id": "%s", "finish_reason": {"type": "stop", '
+            '"matched": 1}, "prompt_tokens": 10, "completion_tokens": 5, '
+            '"cached_tokens": 0}}}' % (second, rid, rid, rid)
+        )
+
+    def test_one_failed_line_is_claimed_by_only_one_event(self):
+        failed = (
+            '[2026-10-07 17:19:20] INFO:     1.2.3.4:1111 - '
+            '"POST /v1/chat/completions HTTP/1.1" 500 Internal Server Error'
+        )
+        self.append(failed, self._finished(24, "r1"), self._finished(26, "r2"))
+        events = self.reader.poll()
+        self.assertEqual([e.meta["status"] for e in events], [500, None])
+        self.assertEqual([e.meta["ip_port"] for e in events], [None, None])
+
+    def test_failed_line_is_consumed_from_the_reserve(self):
+        failed = (
+            '[2026-10-07 17:19:20] INFO:     1.2.3.4:1111 - '
+            '"POST /v1/chat/completions HTTP/1.1" 503 Service Unavailable'
+        )
+        self.append(failed, self._finished(24, "r1"))
+        self.reader.poll()
+        self.assertEqual(self.reader.pending_access, [])
+
+    def test_successful_line_is_still_claimed_by_only_one_event(self):
+        self.append(ACCESS, self._finished(24, "r1"), self._finished(26, "r2"))
+        events = self.reader.poll()
+        ips = [e.meta["ip_port"] for e in events]
+        self.assertEqual(ips.count("127.0.0.1:40076"), 1)
+        self.assertEqual(ips.count(None), 1)
+
+    def test_two_failed_lines_are_matched_one_to_one(self):
+        # 500@:20 und 503@:30, Events bei :24 und :32. So liegt der erste Event
+        # 4 s von der 500 und 6 s von der 503, der zweite 2 s von der 503 und
+        # 12 s von der 500: jeder nimmt seine naechste Zeile, keine wird doppelt
+        # vergeben.
+        first = (
+            '[2026-10-07 17:19:20] INFO:     1.2.3.4:1111 - '
+            '"POST /v1/chat/completions HTTP/1.1" 500 Internal Server Error'
+        )
+        second = (
+            '[2026-10-07 17:19:30] INFO:     5.6.7.8:2222 - '
+            '"POST /v1/chat/completions HTTP/1.1" 503 Service Unavailable'
+        )
+        self.append(first, second, self._finished(24, "r1"), self._finished(32, "r2"))
+        events = self.reader.poll()
+        self.assertEqual([e.meta["status"] for e in events], [500, 503])
+        self.assertEqual([e.meta["ip_port"] for e in events], [None, None])
+
+
+class TestMetaShape(ReaderCase):
+    def test_every_event_kind_carries_the_same_status_key(self):
+        # Task 8 iteriert alle Events und liest meta.get("status"). Der Schluessel
+        # muss also bei received genauso vorhanden sein wie bei finished.
+        self.append(RECEIVED)
+        received = self.reader.poll()[0]
+        self.assertIn("status", received.meta)
+        self.assertIsNone(received.meta["status"])
+
+    def test_finished_event_has_status_key_too(self):
+        self.append(ACCESS, FINISHED)
+        event = self.reader.poll()[0]
+        self.assertIn("status", event.meta)
+        self.assertEqual(event.meta["status"], 200)
+
+    def test_meta_shape_is_identical_across_kinds(self):
+        self.append(RECEIVED)
+        received = self.reader.poll()[0]
+        self.assertEqual(
+            sorted(received.meta), sorted(["received_time", "ip_port", "status"])
+        )
+
+
 class TestTruncation(ReaderCase):
     def test_shrink_clears_pending_access(self):
         # Der size<offset-Zweig raeumte nur offset/partial auf, eine /v1/-Zeile

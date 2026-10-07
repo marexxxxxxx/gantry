@@ -23,6 +23,7 @@ entgueltige, aktuelle Slot-Anzeige mehr. ``test_ip_cannot_backfill_a_previously_
 haelt diese Grenze fest.
 """
 
+import bisect
 import codecs
 import json
 import os
@@ -44,6 +45,11 @@ CHUNK_BYTES = 1 << 20
 OK_STATUS_MIN = 200
 OK_STATUS_MAX = 299
 
+#: Nur Pfade mit diesem Praefix sind Modell-Requests. Alles andere ist
+#: Eigenverkehr (/metrics, /get_load, /health) oder Verwaltung
+#: (/configure_logging, /abort_request) und kann den Slot nie gehalten haben.
+MODEL_PATH_PREFIX = "/v1/"
+
 ACCESS_RE = re.compile(
     r"\[(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s+INFO:\s+"
     r"(?P<peer>\S+)\s+-\s+\"(?P<method>[A-Z]+)\s+(?P<path>\S+)\s+HTTP/[\d.]+\"\s+"
@@ -61,6 +67,11 @@ class LogEvent:
 
 def _parse_access_ts(text):
     return time.mktime(time.strptime(text, "%Y-%m-%d %H:%M:%S"))
+
+
+def _index_key(item):
+    """Sortierschluessel der (at, dict)-Indexeintrae."""
+    return item[0]
 
 
 def _finish_reason(meta_info):
@@ -82,6 +93,8 @@ def _meta_from_finished(record):
         if isinstance(meta_info.get("finish_reason"), dict) else None,
         "received_time": obj.get("received_time"),
         "ip_port": None,
+        # Task 8 liest meta.get("status") ueber alle Events hinweg, deshalb steht
+        # der Schluessel bei received genauso - siehe _apply-Kommentar.
         "status": None,
     }
 
@@ -92,7 +105,6 @@ class LogReader:
         self.pair_window_s = pair_window_s
         self.offset = 0
         self.partial = ""
-        self.pending_access = []
         self.state = {"open": {}, "seen": set()}
         self._identity = None
         #: Letzter Lesefehler als Text, sonst None. "Kein neues Byte" und
@@ -102,14 +114,37 @@ class LogReader:
         # Zeichenweiser Decoder: ein ueber die Chunk-Grenze geteiltes UTF-8-
         # Zeichen darf nicht zu U+FFFD werden.
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        #: Nach `at` sortierte (at, dict)-Listen, getrennt nach Erfolg/Misserfolg.
+        #: Das ist der Index, den _nearest per bisect durchsucht.
+        self._ok_access = []
+        self._failed_access = []
+        #: Zaehler der tatsaechlich betrachteten Indexeintraege. Nur fuer Tests:
+        #: er macht die Kosten der Zuordnung messbar, ohne Zeitmessung.
+        self.window_scans = 0
+
+    @staticmethod
+    def _is_ok(status):
+        return OK_STATUS_MIN <= status <= OK_STATUS_MAX
+
+    @property
+    def pending_access(self):
+        """Alle vorgemerkten Modell-Zugriffe, nach `at` sortiert.
+
+        Abgeleitet aus den beiden Indizes, damit `pending_access` (Tests, und
+        spaeter Task 8) und die Suchstruktur nie auseinanderlaufen koennen.
+        """
+        return [entry for _, entry in sorted(
+            self._ok_access + self._failed_access, key=_index_key
+        )]
 
     def reset(self):
         self.offset = 0
         self.partial = ""
-        self.pending_access = []
         self.state = {"open": {}, "seen": set()}
         self._identity = None
         self.last_error = None
+        self._ok_access = []
+        self._failed_access = []
         self._decoder.reset()
 
     def _file_identity(self):
@@ -124,7 +159,8 @@ class LogReader:
         """Von vorn lesen: Offset, Restzeile, Decoder und Zuordnungsreserve."""
         self.offset = 0
         self.partial = ""
-        self.pending_access = []
+        self._ok_access = []
+        self._failed_access = []
         self._decoder.reset()
 
     def _read_raw(self, limit):
@@ -174,13 +210,23 @@ class LogReader:
     def _collect(self, line):
         access = ACCESS_RE.search(line)
         if access:
-            self.pending_access.append(
-                {
-                    "ip_port": access.group("peer"),
-                    "path": access.group("path"),
-                    "at": _parse_access_ts(access.group("ts")),
-                    "status": int(access.group("status")),
-                }
+            # Nur Modell-Requests ueberhaupt vormerken. Im echten Log sind 92k
+            # Access-Zeilen zu 99,7% Eigenverkehr (/metrics alle paar Sekunden);
+            # die zu behalten und spaeter durchzugehen war der Flaschenhals.
+            path = access.group("path")
+            if not path.startswith(MODEL_PATH_PREFIX):
+                return None
+            entry = {
+                "ip_port": access.group("peer"),
+                "path": path,
+                "at": _parse_access_ts(access.group("ts")),
+                "status": int(access.group("status")),
+            }
+            ok = self._is_ok(entry["status"])
+            bisect.insort(
+                self._ok_access if ok else self._failed_access,
+                (entry["at"], entry),
+                key=_index_key,
             )
             return None
 
@@ -206,8 +252,11 @@ class LogReader:
             at = time.time()
 
         if kind_name == "request.received":
+            # Gleiche Schluessel wie bei finished, damit Task 8 ueber alle
+            # Events hinweg auf dieselben Felder zugreifen kann.
             meta = {"received_time": (record.get("obj") or {}).get("received_time"),
-                    "ip_port": None}
+                    "ip_port": None,
+                    "status": None}
             kind = RECEIVED
         else:
             meta = _meta_from_finished(record)
@@ -219,58 +268,76 @@ class LogReader:
         for event in events:
             if event.kind != FINISHED:
                 continue
-            best = None
-            for access in self.pending_access:
-                if not access["path"].startswith("/v1/"):
-                    continue
-                # Nur erfolgreiche Requests koennen den Slot gehalten haben.
-                if not OK_STATUS_MIN <= access["status"] <= OK_STATUS_MAX:
-                    continue
-                if abs(access["at"] - event.at) <= self.pair_window_s:
-                    if best is None or abs(access["at"] - event.at) < abs(best["at"] - event.at):
-                        best = access
+            best = self._nearest(event, ok=True)
             if best is not None:
                 event.meta["ip_port"] = best["ip_port"]
                 event.meta["status"] = best["status"]
-                self.pending_access.remove(best)
-            elif self._nearest_failed(event) is not None:
+                self._consume(best)
+                continue
+            failed = self._nearest(event, ok=False)
+            if failed is not None:
                 # Fehlgeschlagener Request: Status mitgeben, aber keine IP als
-                # Halter. Task 8 kann das als Fehlerfall behandeln.
-                event.meta["status"] = self._nearest_failed(event)["status"]
+                # Halter. Task 8 kann das als Fehlerfall behandeln. Die Zeile
+                # wird verbraucht - ein 500 gehoert zu genau einem Request.
+                event.meta["status"] = failed["status"]
+                self._consume(failed)
         self._prune_access(events)
         return events
 
-    def _nearest_failed(self, event):
+    def _nearest(self, event, ok):
+        """Naechste passende Access-Zeile im Fenster, oder None.
+
+        Der Index ist nach `at` sortiert und nach Erfolg/Misserfolg getrennt, das
+        Suchfenster per bisect eingegrenzt. Frueher war das ein linearer Scan
+        ueber die ganze Reserve, zweimal pro Event - auf dem echten Log mit 92k
+        Zeilen verdoppelte das die Poll-Zeit (2.3 s -> 4.2 s).
+        """
+        index = self._ok_access if ok else self._failed_access
+        window = self.pair_window_s
+        event_at = event.at
+        left = bisect.bisect_left(index, event_at - window, key=_index_key)
         best = None
-        for access in self.pending_access:
-            if not access["path"].startswith("/v1/"):
-                continue
-            if OK_STATUS_MIN <= access["status"] <= OK_STATUS_MAX:
-                continue
-            if abs(access["at"] - event.at) <= self.pair_window_s:
-                if best is None or abs(access["at"] - event.at) < abs(best["at"] - event.at):
-                    best = access
-        return best
+        for entry in index[left:]:
+            at = entry[0]
+            if at > event_at + window:
+                break
+            self.window_scans += 1
+            if best is None or abs(at - event_at) < abs(best[0] - event_at):
+                best = entry
+        return best[1] if best is not None else None
+
+    def _consume(self, entry):
+        """Eine Access-Zeile genau einmal verwenden.
+
+        Ohne das bekommen alle finished-Events im Fenster denselben 500er
+        gestempelt, obwohl er zu genau einem Request gehoert.
+        """
+        for index in (self._ok_access, self._failed_access):
+            for position, (_, candidate) in enumerate(index):
+                if candidate is entry:
+                    del index[position]
+                    return True
+        return False
 
     def _prune_access(self, events):
-        """Nur /v1/-Zeilen im Fenster behalten.
+        """Reserve auf das Zeitfenster beschneiden.
 
-        Im echten Log stehen 92450 Access-Zeilen, davon ~2300 unter /v1/. Ohne
-        dieses Aufraeumen waechst pending_access um ~4300 Eintraege pro Stunde
-        (die /metrics-Scrapes des Monitors) und frisst unbegrenzt Speicher.
+        Der Index enthaelt nur noch /v1/-Zeilen (alles andere wird in _collect
+        verworfen). Ein Eintrag, der aelter als das Fenster ist, kann keinen
+        kuenftigen Event mehr treffen und wird verworfen.
         """
         newest = max((event.at for event in events), default=None)
-        newest_access = max((a["at"] for a in self.pending_access), default=None)
-        if newest_access is not None:
-            newest = newest_access if newest is None else max(newest, newest_access)
+        for index in (self._ok_access, self._failed_access):
+            if index:
+                last_at = index[-1][0]
+                newest = last_at if newest is None else max(newest, last_at)
         if newest is None:
             return
         cutoff = newest - self.pair_window_s
-        self.pending_access = [
-            a
-            for a in self.pending_access
-            if a["path"].startswith("/v1/") and a["at"] >= cutoff
-        ]
+        # Indexe sind nach `at` sortiert, also ab hier nur wegschneiden.
+        del self._ok_access[:bisect.bisect_left(self._ok_access, cutoff, key=_index_key)]
+        del self._failed_access[:bisect.bisect_left(
+            self._failed_access, cutoff, key=_index_key)]
 
     def _apply(self, events):
         for event in events:
