@@ -4,7 +4,7 @@ import tempfile
 import time
 import unittest
 
-from slotmon.logreader import LogReader
+from slotmon.logreader import CHUNK_BYTES, LogReader
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "log_sample.txt")
 
@@ -88,6 +88,12 @@ class TestParsing(ReaderCase):
             ("received", "a93031d87de846e187ddc80afcfb73eb"),
             ("finished", "d7d50a43cae04ef3a11f625fc1939662"),
         ])
+        # Die Fixture ist echte Logreihenfolge: Access 17:19:20, finished 17:19:24.
+        # Bisher wurde hier nur kind/rid geprueft - ausgerechnet der einzige Test
+        # mit realistischer Reihenfolge testete die Zuordnung nicht mit.
+        finished = events[1]
+        self.assertEqual(finished.meta["ip_port"], "127.0.0.1:40076")
+        self.assertEqual(finished.meta["status"], 200)
 
 
 class TestState(ReaderCase):
@@ -95,6 +101,33 @@ class TestState(ReaderCase):
         self.append(RECEIVED)
         self.reader.poll()
         self.assertIn("a93031d87de846e187ddc80afcfb73eb", self.reader.state["open"])
+
+    def test_open_rid_value_is_unix_time_not_received_time(self):
+        # received_time ist sglangs monotoner Zaehler (437300.5). Landet der in
+        # state["open"], rechnet Task 8 now - open[rid] und bekommt ~1,79 Mrd. s.
+        self.append(RECEIVED)
+        self.reader.poll()
+        stored = self.reader.state["open"]["a93031d87de846e187ddc80afcfb73eb"]
+        expected = time.mktime(
+            time.strptime("2026-10-07T17:19:07", "%Y-%m-%dT%H:%M:%S")
+        )
+        self.assertAlmostEqual(stored, expected, delta=1.0)
+        # Und die daraus berechnete Dauer ist plausibel, nicht 56 Jahre.
+        duration = time.time() - stored
+        self.assertLess(abs(duration), 10 * 365 * 24 * 3600)
+
+    def test_open_rid_value_stays_unix_when_received_time_absent(self):
+        line = (
+            '{"timestamp": "2026-10-07T17:19:07.123456", "event": "request.received", '
+            '"rid": "nort", "obj": {"rid": "nort"}}'
+        )
+        self.append(line)
+        self.reader.poll()
+        stored = self.reader.state["open"]["nort"]
+        expected = time.mktime(
+            time.strptime("2026-10-07T17:19:07", "%Y-%m-%dT%H:%M:%S")
+        )
+        self.assertAlmostEqual(stored, expected, delta=1.0)
 
     def test_finished_closes_rid(self):
         # Der echte Server loggt fuer DENSELBEN Request dieselbe rid in
@@ -139,18 +172,40 @@ class TestState(ReaderCase):
 
 class TestIpPairing(ReaderCase):
     def test_ip_is_attached_when_close_in_time(self):
-        self.append(FINISHED)
+        # Reale Reihenfolge: Access-Zeile kommt VOR dem finished-Event
+        # (Log 17:19:20 access, 17:19:24 finished).
         self.append(ACCESS)
+        self.append(FINISHED)
         event = self.reader.poll()[0]
         self.assertEqual(event.meta["ip_port"], "127.0.0.1:40076")
 
-    def test_ip_is_dropped_when_too_far_away(self):
+    def test_ip_is_attached_across_polls(self):
+        # Access-Zeile und finished-Event landen in verschiedenen polls.
+        self.append(ACCESS)
+        self.reader.poll()
+        self.assertEqual(self.reader.pending_access[0]["ip_port"], "127.0.0.1:40076")
         self.append(FINISHED)
+        event = self.reader.poll()[0]
+        self.assertEqual(event.meta["ip_port"], "127.0.0.1:40076")
+
+    def test_ip_cannot_backfill_a_previously_returned_event(self):
+        # Dokumentierte Grenze: ein Event, das schon zurueckgegeben wurde, kann
+        # seine IP nicht mehr nachtraeglich bekommen. Die Access-Zeile kam erst
+        # im zweiten poll. Siehe Modul-Docstring.
+        self.append(FINISHED)
+        first = self.reader.poll()[0]
+        self.assertIsNone(first.meta["ip_port"])
+        self.append(ACCESS)
+        self.reader.poll()
+        self.assertIsNone(first.meta["ip_port"])
+
+    def test_ip_is_dropped_when_too_far_away(self):
         old = (
             '[2026-10-07 17:09:20] INFO:     10.0.0.9:1111 - '
             '"POST /v1/chat/completions HTTP/1.1" 200 OK'
         )
         self.append(old)
+        self.append(FINISHED)
         event = self.reader.poll()[0]
         self.assertIsNone(event.meta["ip_port"])
 
@@ -158,11 +213,28 @@ class TestIpPairing(ReaderCase):
         self.append(RECEIVED)
         self.assertIsNone(self.reader.poll()[0].meta["ip_port"])
 
-    def test_prompts_never_appear_in_meta(self):
-        self.append(FINISHED)
+    def test_prompt_text_never_appears_in_meta(self):
+        # Die Fixture enthaelt keinen Prompt-Text. Damit das ueberhaupt geprueft
+        # werden kann, wird eine Zeile mit echtem Prompt-Feld gebaut; nur
+        # Metadaten duerfen in meta landen, der Text selbst nie.
+        line = (
+            '{"timestamp": "2026-10-07T17:19:24.654321", "event": "request.finished", '
+            '"rid": "secret-rid", "obj": {"rid": "secret-rid", "received_time": 437290.25, '
+            '"text": "GEHEIMER-PROMPT-TEXT", "input_ids": [1,2,3]}, '
+            '"out": {"text": "GEHEIME-ANTWORT", "meta_info": {"id": "secret-rid", '
+            '"finish_reason": {"type": "stop", "matched": 1}, "prompt_tokens": 4270, '
+            '"completion_tokens": 1687, "cached_tokens": 0}}}'
+        )
+        self.append(line)
         meta = self.reader.poll()[0].meta
-        self.assertNotIn("prompt", meta)
+        blob = repr(meta)
+        self.assertNotIn("GEHEIMER-PROMPT-TEXT", blob)
+        self.assertNotIn("GEHEIME-ANTWORT", blob)
+        self.assertNotIn("input_ids", blob)
         self.assertNotIn("text", meta)
+        # Metadaten sind weiterhin da - es wird nicht weggefiltert, nur der Text.
+        self.assertEqual(meta["prompt_tokens"], 4270)
+        self.assertEqual(meta["completion_tokens"], 1687)
 
     def test_monitoring_traffic_never_pairs(self):
         # /get_load und /metrics sind Eigenverkehr des Monitors, kein Modell-Request.
@@ -170,23 +242,41 @@ class TestIpPairing(ReaderCase):
             '[2026-10-07 17:19:20] INFO:     127.0.0.1:40076 - '
             '"GET /get_load HTTP/1.1" 200 OK'
         )
-        self.append(FINISHED, noise)
+        self.append(noise, FINISHED)
         self.assertIsNone(self.reader.poll()[0].meta["ip_port"])
 
     def test_abort_and_configure_logging_never_pair(self):
         for path in ("/abort_request", "/configure_logging"):
             with self.subTest(path=path):
                 reader = LogReader(self.path, pair_window_s=30.0)
-                self.append(FINISHED)
                 self.append(
                     f'[2026-10-07 17:19:20] INFO:     127.0.0.1:40076 - '
                     f'"POST {path} HTTP/1.1" 200 OK'
                 )
+                self.append(FINISHED)
                 self.assertIsNone(reader.poll()[0].meta["ip_port"])
+
+    def test_failed_request_never_becomes_slot_holder(self):
+        # Eine 500 ist kein erfolgreicher Slot-Halter. Sie wird nicht gepaart,
+        # der Status bleibt aber fuer Task 8 sichtbar.
+        failed = (
+            '[2026-10-07 17:19:20] INFO:     127.0.0.1:40076 - '
+            '"POST /v1/chat/completions HTTP/1.1" 500 Internal Server Error'
+        )
+        self.append(failed, FINISHED)
+        event = self.reader.poll()[0]
+        self.assertIsNone(event.meta["ip_port"])
+        self.assertEqual(event.meta["status"], 500)
+
+    def test_successful_request_records_status_200(self):
+        self.append(ACCESS, FINISHED)
+        event = self.reader.poll()[0]
+        self.assertEqual(event.meta["status"], 200)
+        self.assertEqual(event.meta["ip_port"], "127.0.0.1:40076")
 
     def test_pending_access_does_not_grow_without_bound(self):
         # Im echten Log stehen 92450 Access-Zeilen, davon nur ~2300 unter /v1/.
-        # OhneAufräumen wächst die Liste unbegrenzt (3 pro Minute /metrics).
+        # Ohne Aufraeumen waechst die Liste unbegrenzt (3 pro Minute /metrics).
         for i in range(50):
             self.append(
                 f'[2026-10-07 17:19:20] INFO:     127.0.0.1:{40000 + i} - '
@@ -195,17 +285,140 @@ class TestIpPairing(ReaderCase):
         self.reader.poll()
         self.assertEqual(len(self.reader.pending_access), 0)
 
-    def test_old_access_lines_are_dropped(self):
+    def test_old_access_lines_are_dropped_but_recent_one_survives(self):
         for i in range(5):
             self.append(
                 f'[2026-10-07 17:0{i}:20] INFO:     10.0.0.9:1111 - '
                 f'"POST /v1/chat/completions HTTP/1.1" 200 OK'
             )
         self.reader.poll()
-        self.assertLessEqual(len(self.reader.pending_access), 1)
+        # Genau eine ueberlebt (die neueste, 17:04:20) - nicht "weniger als 1",
+        # das waere auch bei vollstaendigem Verlust erfuellt.
+        self.assertEqual(len(self.reader.pending_access), 1)
+        self.assertEqual(self.reader.pending_access[0]["ip_port"], "10.0.0.9:1111")
+
+
+class TestLargeLogs(ReaderCase):
+    """Ein 49-MB-Log darf nicht am Stueck in den Speicher."""
+
+    def _write_many(self, count):
+        with open(self.path, "w", encoding="utf-8") as handle:
+            for i in range(count):
+                handle.write(
+                    '{"timestamp": "2026-10-07T17:19:07.123456", '
+                    '"event": "request.received", "rid": "rid-%06d", '
+                    '"obj": {"rid": "rid-%06d", "received_time": %f}}\n' % (i, i, 437300.0 + i)
+                )
+
+    def test_events_are_found_across_chunk_boundaries(self):
+        # Deutlich groesser als CHUNK_BYTES, damit die Zeilen wirklich ueber
+        # Chunk-Grenzen laufen.
+        self._write_many(60000)
+        size = os.path.getsize(self.path)
+        self.assertGreater(size, CHUNK_BYTES * 3)
+        events = self.reader.poll()
+        self.assertEqual(len(events), 60000)
+        self.assertEqual(events[0].rid, "rid-000000")
+        self.assertEqual(events[-1].rid, "rid-059999")
+        self.assertEqual(len(self.reader.state["open"]), 60000)
+
+    def test_reader_never_reads_more_than_a_chunk_at_once(self):
+        # Ohne Chunking wuerde _read_bytes die ganze Datei lesen. Wir messen
+        # den groessten tatsaechlich gelesenen Block ueber den Offset-Sprung.
+        self._write_many(60000)
+        jumps = []
+        original = self.reader._read_raw
+
+        def spy(limit):
+            data = original(limit)
+            jumps.append(len(data))
+            return data
+
+        self.reader._read_raw = spy
+        self.reader.poll()
+        self.assertTrue(jumps, "es wurde nichts gelesen")
+        self.assertLessEqual(max(jumps), CHUNK_BYTES)
+
+    def test_multibyte_character_split_across_chunks_survives(self):
+        # Der Decoder muss zeichenweise ueber Chunk-Grenzen arbeiten, sonst
+        # wird ein geteiltes UTF-8-Zeichen zu U+FFFD.
+        head = "x" * (CHUNK_BYTES - 2)
+        body = (
+            '{"timestamp": "2026-10-07T17:19:07.123456", "event": "request.received", '
+            '"rid": "mü-ü-ü", "obj": {"rid": "mü-ü-ü", "received_time": 1.0}}\n'
+        )
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write(head + "\n" + body)
+        events = self.reader.poll()
+        # Die Zeile beginnt hinter dem Padding; sie muss als GANZES erkannt werden.
+        self.assertEqual([e.rid for e in events], ["mü-ü-ü"])
+
+    def test_partial_line_carries_over_to_next_poll(self):
+        self.append(RECEIVED)
+        # Datei abschneiden, sodass die letzte Zeile unvollstaendig ist.
+        with open(self.path, "r+b") as handle:
+            handle.truncate(len(RECEIVED) + 1 - 10)
+        self.reader.poll()
+        self.assertEqual(self.reader.state["open"], {})
+        self.append(FINISHED)
+        self.assertEqual(self.reader.poll(), [])
+
+
+class TestReadErrors(ReaderCase):
+    def test_missing_file_returns_empty_and_reports_nothing_new(self):
+        events = self.reader.poll()
+        self.assertEqual(events, [])
+        self.assertIsNone(self.reader.last_error)
+
+    def test_unreadable_file_is_reported_distinctly(self):
+        # Kein "leere Ansicht ohne Hinweis": der Fehler steht in last_error.
+        self.append(RECEIVED)
+        os.chmod(self.path, 0o000)
+        self.addCleanup(os.chmod, self.path, 0o644)
+        if os.geteuid() == 0:
+            self.skipTest("root umgeht Berechtigungen")
+        events = self.reader.poll()
+        self.assertEqual(events, [])
+        self.assertIsNotNone(self.reader.last_error)
+        self.assertIn("PermissionError", self.reader.last_error)
+
+    def test_last_error_clears_after_success(self):
+        self.append(RECEIVED)
+        self.reader.poll()
+        self.assertIsNone(self.reader.last_error)
 
 
 class TestTruncation(ReaderCase):
+    def test_shrink_clears_pending_access(self):
+        # Der size<offset-Zweig raeumte nur offset/partial auf, eine /v1/-Zeile
+        # ueberlebte das truncate -s 0. Genau der Pfad, den Task 7 LogRotator
+        # ausloest. Beide Zweige muessen identisch aufraeumen.
+        access = (
+            '[2026-10-07 17:19:20] INFO:     192.168.9.2:1111 - '
+            '"POST /v1/chat/completions HTTP/1.1" 200 OK'
+        )
+        self.append(access)
+        self.reader.poll()
+        self.assertEqual(len(self.reader.pending_access), 1)
+        open(self.path, "w", encoding="utf-8").close()
+        self.reader.poll()
+        self.assertEqual(self.reader.pending_access, [])
+
+    def test_inode_change_clears_pending_access(self):
+        access = (
+            '[2026-10-07 17:19:20] INFO:     192.168.9.2:1111 - '
+            '"POST /v1/chat/completions HTTP/1.1" 200 OK'
+        )
+        self.append(access)
+        self.reader.poll()
+        self.assertEqual(len(self.reader.pending_access), 1)
+        replacement = os.path.join(self.dir, "rotated.log")
+        with open(replacement, "w", encoding="utf-8") as handle:
+            handle.write(RECEIVED + "\n")
+        os.replace(replacement, self.path)
+        self.reader.poll()
+        self.assertEqual(self.reader.pending_access, [])
+
     def test_shrink_is_detected_and_reading_restarts(self):
         self.append(RECEIVED)
         self.reader.poll()
