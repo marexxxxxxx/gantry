@@ -369,7 +369,9 @@ METRICS_ARGS=(); [[ "${ENABLE_METRICS:-1}" == "1" ]] && METRICS_ARGS+=(--enable-
 # ENABLE_LOG_REQUESTS=1 (default): loggt request.received/request.finished mit rid.
 # Der Slot-Monitor (slotmon) braucht diese Events, um zu erkennen welcher Client den
 # einzelnen GPU-Slot haelt. Ohne sie bleibt der Halter unbekannt.
-LOGREQ_ARGS=(); [[ "${ENABLE_LOG_REQUESTS:-1}" == "1" ]] && LOGREQ_ARGS+=(--log-requests)
+# Format MUSS json sein: sglangs Default ist "text" (Receive: obj=... / Finish: obj=...),
+# und nur die json-Variante liefert die maschinenlesbaren {"event": ..., "rid": ...}-Zeilen.
+LOGREQ_ARGS=(); [[ "${ENABLE_LOG_REQUESTS:-1}" == "1" ]] && LOGREQ_ARGS+=(--log-requests --log-requests-format json)
 TRUNC_ARGS=(); [[ "$TRUNCATE" == "1" ]] && TRUNC_ARGS+=(--allow-auto-truncate)
 JSON_ARGS=(); [[ "$JSON_WS" == "1" ]] && JSON_ARGS+=(--constrained-json-disable-any-whitespace)
 DET_ARGS=(); [[ "$DETERMINISTIC" == "1" ]] && DET_ARGS+=(--enable-deterministic-inference)
