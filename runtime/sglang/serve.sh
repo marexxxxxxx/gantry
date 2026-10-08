@@ -366,6 +366,10 @@ if [[ "$OTP" == "1" ]]; then
   [[ "$PENALTY_ALWAYS" == "1" ]] && OTP_ARGS+=(--penalty-always)
 fi
 METRICS_ARGS=(); [[ "${ENABLE_METRICS:-1}" == "1" ]] && METRICS_ARGS+=(--enable-metrics)   # Prometheus /metrics: gen throughput (tok/s), queue depth, token usage
+# ENABLE_LOG_REQUESTS=1 (default): loggt request.received/request.finished mit rid.
+# Der Slot-Monitor (slotmon) braucht diese Events, um zu erkennen welcher Client den
+# einzelnen GPU-Slot haelt. Ohne sie bleibt der Halter unbekannt.
+LOGREQ_ARGS=(); [[ "${ENABLE_LOG_REQUESTS:-1}" == "1" ]] && LOGREQ_ARGS+=(--log-requests)
 TRUNC_ARGS=(); [[ "$TRUNCATE" == "1" ]] && TRUNC_ARGS+=(--allow-auto-truncate)
 JSON_ARGS=(); [[ "$JSON_WS" == "1" ]] && JSON_ARGS+=(--constrained-json-disable-any-whitespace)
 DET_ARGS=(); [[ "$DETERMINISTIC" == "1" ]] && DET_ARGS+=(--enable-deterministic-inference)
@@ -443,6 +447,7 @@ exec "$PYBIN" -m sglang.launch_server \
   "${CLP_ARGS[@]}" \
   "${OTP_ARGS[@]}" \
   "${METRICS_ARGS[@]}" \
+  "${LOGREQ_ARGS[@]}" \
   "${TRUNC_ARGS[@]}" \
   "${GRAPH_ARGS[@]}" \
   "${JSON_ARGS[@]}" \
