@@ -547,38 +547,72 @@ class Collector:
         if metrics.fresh:
             running = metrics.value.get("num_running_reqs")
 
-        # C2 - Geister-rids, **zweiter** und unabhaengiger Beleg.
+        # N5 - der `num_reqs`-Zeuge. Ein rid, der laenger als ein Poll-Intervall
+        # offen ist, obwohl der Scheduler null Request meldet, ist nicht
+        # belegbar.
         #
-        # Der erste Beleg ist die Generationsgrenze im Leser: ein rid, dessen
-        # `request.received` vor dem letzten Serverstart-Banner liegt, kommt
-        # dort gar nicht erst in `open` an. Der ist dauerhaft und von `num_reqs`
-        # unabhaengig.
+        # Wovor genau? Von zwei unabhaengigen Werten, die je fuer sich nichts
+        # beweisen koennen:
+        #   - der Banner sagt, **aus welcher Generation** ein rid stammt. Er
+        #     sieht keinen Geist aus der laufenden Generation (N5).
+        #   - `num_reqs` sagt, **ob der Server den Request kennt**. Genau das
+        #     ist die Luecke: ein Client bricht ab, oder der Server wird mitten
+        #     im Request gestoppt. sglang schreibt fuer jeden Request ein
+        #     `request.received`, aber nur fuer abgeschlossene ein
+        #     `request.finished`. Der rid bleibt fuer immer offen, und mit
+        #     `max_running_requests 1` waehlt `evaluate()` den **aeltesten**
+        #     offenen rid als Halter. Das war die gemessene erfundene Zahl
+        #     `state='busy' rid='stale' duration_s=36100.0`.
         #
-        # Dieser Wächter greift nur, wenn die Generationsgrenze **nichts** weiss,
-        # also wenn im Log noch kein Banner gesehen wurde. Sonst wuerde er das
-        # Falsche loeschen: ein Request, dessen `received` zwischen zwei
-        # `/get_load`-Abfragen eintrifft, ist genau dann schon im Log, aber noch
-        # nicht im Scheduler gezahlt (`num_reqs == 0`). Genau dieser Request
-        # verliert hier seine Startzeit - der rid kehrt im naechsten Tick als
-        # Halter zurueck, aber ohne `received_at`, und seine Historienzeile
-        # bekommt `duration_s = None` (N2).
+        # Warum ein **Alter** und nicht "alle offenen rids"? Weil `read_load`
+        # vor `_drain_events()` laeuft: ein Request, der zwischen zwei
+        # `/get_load`-Abfragen eintrifft, steht im Log, ist aber vom Scheduler
+        # noch nicht gezaehlt. Ohne Altersgrenze wuerde genau dieser frische rid
+        # verworfen - und seine Startzeit waere fuer immer weg (N2). Ein rid,
+        # der juenger als ein Poll-Intervall offen ist, hat diese Race nicht
+        # durchlaufen; einer, der aelter ist, war in mindestens einem weiteren
+        # Poll dem Scheduler vorgestellt worden und wurde trotzdem nicht
+        # gezaehlt.
         #
-        # Steht `num_reqs == 0` und zugleich ein Banner im Log, ist der Widerspruch
-        # zugunsten des Requests aufgeloest: der Leser hat seine Herkunft geprueft.
-        # Ein kleiner, aber nicht nuller Wert zaehlt wartende Request mit und
-        # beweist ohnehin nichts; ist `num_reqs` unbekannt (Quelle tot), gilt
-        # ueberhaupt nichts - eine kaputte Quelle ist kein Beweis.
+        # Die Schwelle ist `cfg.poll_interval` - die eine Zahl, die den Takt
+        # vorgibt. Keine eigene Env-Variable und kein Magic Number: bei
+        # `POLL_INTERVAL=10` gilt dieselbe Logik mit 10 s.
+        #
+        # Der Vergleich ist `<`: genau ein Intervall alt ist nicht "aelter als
+        # eins". Mit `<=` waere ein rid, der im selben Takt einfliesst wie der
+        # Load-Sample, im selben Tick faellig - genau die Race aus N2.
+        #
+        # `num_reqs` kleiner als null, aber ungleich 0, beweist nichts: es zaehlt
+        # wartende Request mit. Ist `num_reqs` unbekannt (Quelle tot, Feld
+        # fehlt), gilt ueberhaupt nichts - eine kaputte Quelle ist kein Beweis,
+        # in keinem Alter.
         num_reqs = load.value.get("num_reqs") if load.fresh else None
         ghosts = 0
         reason = None
-        if (num_reqs == 0 and open_rids
-                and self.reader.generation_start is None):
-            ghosts = len(open_rids)
-            for rid in open_rids:
-                self.received_at.pop(rid, None)
-            open_rids = {}
-            reason = (f"num_reqs=0, aber {ghosts} offene rid(s) im Log ohne "
-                      "Serverstart-Grenze - sie sind nicht belegbar")
+        if num_reqs == 0 and open_rids:
+            max_age = self.cfg.poll_interval
+            stale = [rid for rid, since in open_rids.items()
+                     if (now - since) > max_age]
+            if stale:
+                ghosts = len(stale)
+                for rid in stale:
+                    # Weg aus `received_at` und `finished`: bliebe die Startzeit
+                    # im Dict, taucht der rid beim naechsten Abschluss wieder
+                    # auf - mit leerer Historiezeile.
+                    self.received_at.pop(rid, None)
+                    self.finished.pop(rid, None)
+                    del open_rids[rid]
+                # Und weg aus dem **Leser**. `open_rids` ist eine Kopie, die
+                # `_drain_events()` aus `reader.state["open"]` baut; ein `del`
+                # auf der Kopie laesst den rid im Leser stehen, und beim
+                # naechsten Tick ist er wieder als Halter da - mit
+                # `max_running_requests 1` nimmt `evaluate()` den aeltesten
+                # offenen rid. Das war die Fehlerklasse, die N1 ausgeloest hat.
+                self.reader.drop_open(stale)
+                reason = (
+                    f"num_reqs=0, aber {ghosts} rid(s) im Log laenger als "
+                    f"{max_age:g} s offen - der Server kennt sie nicht "
+                    "(abgebrochener oder beim Stopp verworfener Request)")
 
         self._flush_finished(open_rids, now)
 
@@ -609,6 +643,42 @@ class Collector:
             # `waiting is None` (Server nicht erreichbar) oder Altbestand > 0:
             # der Halter ist nicht bestimmbar, und das wird behauptet.
             label = "unknown"
+
+        if label == "unknown" and reason is None:
+            # **`unknown` ohne `reason` ist verboten.** Ein grundloses
+            # `unknown` ist im Dashboard nicht von einem echten Leerlauf zu
+            # unterscheiden - und genau diese Verwechslung hat den
+            # Phantom-Halter aus Runde 2 glaubhaft gemacht. Jeder Weg hierhin
+            # bekommt deshalb eine Begruendung:
+            #
+            #  - die `num_reqs`-Gegenprobe hat rids verworfen  -> `reason` ist
+            #    bereits gesetzt (siehe oben);
+            #  - `waiting is None`  -> der Server war nicht erreichbar, die
+            #    Warteschlange ist damit unbekannt und `evaluate()` bestimmt
+            #    absichtlich keinen Halter;
+            #  - `legacy > 0`       -> Altbestand: Requests, die vor dem
+            #    Request-Logging eingereiht wurden. Ihre Zahl ist echt, ihre
+            #    Reihenfolge nicht ableitbar.
+            if waiting is None:
+                # `connected` und `waiting is None` sind **zwei verschiedene
+                # Dinge**. `waiting` ist `load.value.get("num_waiting_reqs")`,
+                # und `sources.py:63` holt den Wert mit `.get()`: eine frische
+                # Antwort, die das Feld schlicht nicht traegt, ergibt
+                # `Sample(fresh)` mit `waiting=None` bei `connected=True`.
+                # Gemessen. Die Begruendung nennt deshalb `connected` selbst,
+                # statt es zu behaupten - eine `reason`, die `server.connected`
+                # widerspricht, waere schlimmer als gar keine.
+                reason = (
+                    "Warteschlange unbekannt - "
+                    + (load_error if load_error else "/get_load lieferte keine Zahl")
+                    + (f" (verbunden mit Server: {'ja' if connected else 'nein'})"))
+            elif slot_state.legacy:
+                reason = (
+                    f"Altbestand: {slot_state.legacy} Request(s) vor dem "
+                    "Request-Logging - Halter nicht bestimmbar, bis die "
+                    "Warteschlange auf 0 ist")
+            else:
+                reason = "Halter nicht bestimmbar"
 
         ctx, throughput = self._read_batch()
         tok_per_s = metrics.value.get("gen_throughput") if metrics.fresh else None

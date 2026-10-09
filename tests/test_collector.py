@@ -40,9 +40,24 @@ MAX_REQ_INPUT_LEN = 83994
 def stamp(at, iso=True):
     """Log-Zeitstempel fuer eine Unix-Zeit. `localtime`/`mktime` sind symmetrisch:
     der Reader parst mit `time.strptime` + `time.mktime`, also geht der Wert
-    verlustfrei hin und zurueck."""
-    fmt = "%Y-%m-%dT%H:%M:%S" if iso else "%Y-%m-%d %H:%M:%S"
-    return time.strftime(fmt, time.localtime(at))
+    verlustfrei hin und zurueck.
+
+    Mikrosekunden **nur**, wenn `at` keine ganze Sekunde ist. Das echte Log
+    schreibt `2026-10-08T14:57:35.123456`, dieses Fixture vorher aber nur
+    Sekunden - jeder Sub-Sekunden-Abstand wurde dadurch auf volle Sekunden
+    gerundet, ohne dass es auffiel. Die Bedingung haelt die bisherigen Fixtures
+    byte-identisch: alle benutzen ganze Sekunden.
+
+    `time.strftime` kann `%f` nicht (es gibt die Mikrosekunden nicht aus,
+    sondern schreibt die Zeichenfolge durch), der Bruchteil wird daher von Hand
+    angehaengt.
+    """
+    base = time.strftime("%Y-%m-%dT%H:%M:%S" if iso else "%Y-%m-%d %H:%M:%S",
+                         time.localtime(at))
+    if iso and at % 1 != 0:
+        micro = int(round((at % 1) * 1_000_000))
+        base = f"{base}.{micro:06d}"
+    return base
 
 
 def received(rid="aaa", at=RECEIVED_AT, monotonic=MONOTONIC):
@@ -994,22 +1009,37 @@ class TestGhostRids(CollectorCase):
 
     def test_unknown_load_does_not_drop_anything(self):
         """Faellt /get_load aus, ist `num_reqs` unbekannt. Dann wird nichts
-        verworfen - eine kaputte Quelle ist kein Beweis fuer einen Geist."""
+        verworfen - eine kaputte Quelle ist kein Beweis fuer einen Geist.
+
+        **Assertion geaendert (Runde 3):** hier stand `assertIsNone(reason)`.
+        Das war ein Stellvertreter fuer "kein Geist-Urteil", und als solcher ist
+        es jetzt falsch: die Regel "`unknown` ohne `reason` ist verboten"
+        verlangt an dieser Stelle einen Grund. Geprueft wird jetzt, **worin**
+        der Grund besteht - namely dass er den Serverausfall nennt und keinen
+        Geist unterstellt.
+        """
         collector = self.make()
         collector.sources.read_load = lambda **kw: Sample(None, None, "down")
         self.append(received(rid="aaa"))
         state = collector.tick()
         self.assertEqual(state["slot"]["open_count"], 1)
-        self.assertIsNone(state["slot"]["reason"])
+        reason = state["slot"]["reason"]
+        self.assertIsNotNone(reason)
+        self.assertNotIn("num_reqs", reason)
 
     def test_num_reqs_none_does_not_drop_anything(self):
+        """**Assertion geaendert (Runde 3):** siehe
+        `test_unknown_load_does_not_drop_anything` - `assertIsNone(reason)` war
+        ein Stellvertreter, kein Test."""
         collector = self.make()
         collector.sources.read_load = lambda **kw: self.sample(
             {"num_reqs": None, "num_waiting_reqs": None})
         self.append(received(rid="aaa"))
         state = collector.tick()
         self.assertEqual(state["slot"]["open_count"], 1)
-        self.assertIsNone(state["slot"]["reason"])
+        reason = state["slot"]["reason"]
+        self.assertIsNotNone(reason)
+        self.assertNotIn("laenger als", reason)
 
     def test_reason_is_none_in_the_normal_case(self):
         state = self.make().tick()
@@ -1097,13 +1127,26 @@ class TestGenerationBoundary(CollectorCase):
         wird bei `num_reqs == 0` nicht verworfen - und verliert dabei nicht seine
         Startzeit. Im Folgetick bei `num_reqs == 1` ist er der Halter, mit
         Startzeit.
+
+        **Fixture korrigiert (Runde 3), zweimal aus gemessenen Gruenden:**
+
+        1. Der rid lag bei `NEW_BANNER + 1`; `NEW_BANNER` ist `RECEIVED_AT + 50`
+           und die Uhr steht bei `RECEIVED_AT + 100`. Der rid war **49 s** alt
+           und haette unter jedem Alterskriterium als Phantom gegolten. Der Name
+           sagte "frisch", das Fixture war es nie - und genau darum hat dieser
+           Test den N2-Bug zwei Runden nicht gesehen: er pruefte eine
+           Altersgrenze, die es damals gar nicht gab.
+        2. Das Alter ist jetzt `1.0` und nicht `0.5`. `LogReader._collect`
+           parst `stamp[:19]` und **schneidet Mikrosekunden ab**
+           (`2023-11-14T22:14:59.500000` -> `1700000099.0`), gemessen. Ein
+           Sub-Sekunden-Fixture koennte also nie den Wert liefern, den es
+           behauptet - die Assertion waere falsch, nicht der Code.
         """
         collector = self.make()
         collector.sources.read_load = lambda **kw: self.sample(
             {"num_reqs": 0, "num_waiting_reqs": 0})
         self.append(banner(self.OLD_BANNER))
-        self.append(banner(self.NEW_BANNER))
-        self.append(received(rid="fresh", at=self.NEW_BANNER + 1))
+        self.append(received(rid="fresh", at=self.now - 1.0))
         first = collector.tick()
         self.assertEqual(first["slot"]["open_count"], 1)
         self.assertEqual(first["slot"]["rid"], "fresh")
@@ -1116,18 +1159,17 @@ class TestGenerationBoundary(CollectorCase):
         collector.sources.read_load = lambda **kw: self.sample(
             {"num_reqs": 0, "num_waiting_reqs": 0})
         self.append(banner(self.OLD_BANNER))
-        self.append(banner(self.NEW_BANNER))
-        self.append(received(rid="fresh", at=self.NEW_BANNER + 1))
+        self.append(received(rid="fresh", at=self.now - 1.0))
         collector.tick()
         # Jetzt zaehlt der Scheduler den Request, und er endet.
         collector.sources.read_load = lambda **kw: self.sample(
             {"num_reqs": 1, "num_waiting_reqs": 0})
-        self.append(finished(rid="fresh", at=self.NEW_BANNER + 18),
-                    access(at=self.NEW_BANNER + 18))
+        self.append(finished(rid="fresh", at=self.now + 16.0),
+                    access(at=self.now + 16.0))
         state = collector.tick()
         self.assertEqual(len(state["history"]), 1)
         entry = state["history"][0]
-        self.assertEqual(entry["started_at"], self.NEW_BANNER + 1)
+        self.assertEqual(entry["started_at"], self.now - 1.0)
         self.assertAlmostEqual(entry["duration_s"], 17.0, delta=0.001)
 
     def test_num_reqs_guard_still_works_without_a_banner(self):
@@ -1149,6 +1191,10 @@ class TestGenerationBoundary(CollectorCase):
         Halter, weil `waiting` unbekannt ist und `evaluate()` dann keinen
         bestimmt. Genau das ist der Unterschied zwischen "nicht belegbar" und
         "weg".
+
+        **Assertion geaendert (Runde 3):** `assertIsNone(reason)` war ein
+        Stellvertreter fuer "kein Geist-Urteil". Jetzt wird geprueft, dass der
+        Grund den Serverausfall nennt.
         """
         collector = self.make()
         collector.sources.read_load = lambda **kw: Sample(None, None, "down")
@@ -1157,7 +1203,41 @@ class TestGenerationBoundary(CollectorCase):
         self.assertEqual(state["slot"]["open_count"], 1)
         self.assertIn("aaa", collector.reader.state["open"])
         self.assertIsNone(state["slot"]["rid"])
-        self.assertIsNone(state["slot"]["reason"])
+        reason = state["slot"]["reason"]
+        self.assertIsNotNone(reason)
+        self.assertIn("verbunden mit Server: nein", reason)
+
+    def test_reason_never_contradicts_the_connected_flag(self):
+        """**Gefunden bei der Durchsicht von Runde 3, nicht von einem roten Test.**
+
+        `waiting is None` und `connected is False` sind nicht dasselbe.
+        `sources.py:63` holt `num_waiting_reqs` mit `.get()`; eine frische
+        `/get_load`-Antwort **ohne** dieses Feld ergibt `Sample(fresh)` mit
+        `waiting=None` - bei `connected=True`. Der Runde-3-Zweig schrieb dort
+        pauschal "(verbunden mit Server: nein)" und behauptete damit das
+        Gegenteil von `state["server"]["connected"]`, zwei Zeilen weiter oben
+        im selben Dict. Gemessen: `connected=True`, `reason` sagt "nein".
+
+        Eine `reason`, die einem anderen Feld desselben Zustands widerspricht,
+        ist schlimmer als keine: sie ist als Beleg lesbar und falsch.
+        """
+        collector = self.make()
+        # Genau die Form, die `read_load` liefert, wenn der Schluessel fehlt.
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": 0, "num_waiting_reqs": None})
+        state = collector.tick()
+        self.assertTrue(state["server"]["connected"])
+        self.assertIsNone(state["queue"]["waiting"])
+        self.assertEqual(state["slot"]["state"], "unknown")
+        self.assertIn("verbunden mit Server: ja", state["slot"]["reason"])
+
+    def test_reason_says_not_connected_only_when_it_is_not(self):
+        """Die andere Seite derselben Behauptung."""
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: Sample(None, None, "down")
+        state = collector.tick()
+        self.assertFalse(state["server"]["connected"])
+        self.assertIn("verbunden mit Server: nein", state["slot"]["reason"])
 
 
 class TestBannerRecognition(CollectorCase):
@@ -1221,6 +1301,34 @@ class TestBannerRecognition(CollectorCase):
         self.append(received(rid="fresh", at=boundary + 5))
         collector.tick()
         self.assertEqual(sorted(collector.reader.state["open"]), ["fresh"])
+
+    def test_purge_also_keeps_a_rid_from_the_banner_second(self):
+        """**Luecke gefunden durch den Mutanten N1e.**
+
+        `test_received_in_the_same_second_as_the_banner_is_kept` deckt nur den
+        `_apply`-Weg ab: der rid kommt **nach** dem Banner im selben Poll. Der
+        zweite Weg - der Purge in `_collect()`, `if since >= generation_start` -
+        war ungetestet, und genau dort liegt die zweite Grenzentscheidung.
+
+        Gemessen: `>=` laesst den rid stehen, `>` wirft ihn weg. Der Mutant
+        blieb gruen, also unterschied ihn kein Test.
+
+        Die beiden Wege muessen **dieselbe** Grenze ziehen: `_apply` verwirft
+        bei `event.at < generation_start`, der Purge bei `since >=`. Ein rid in
+        der Banner-Sekunde bleibt also nach beiden. Ein `>` im Purge wuerde ihn
+        fallen lassen, waehrend `_apply` ihn behalten haette - die beiden Wege
+        widerspruechen sich dann, und das faellt nur auf, wenn beide getestet
+        werden.
+        """
+        collector = self.make()
+        boundary = RECEIVED_AT
+        self.append(received(rid="edge", at=boundary))
+        collector.tick()
+        self.assertEqual(sorted(collector.reader.state["open"]), ["edge"])
+        # Der Banner kommt erst jetzt, in derselben Sekunde wie der rid.
+        self.append(banner(boundary))
+        collector.tick()
+        self.assertEqual(sorted(collector.reader.state["open"]), ["edge"])
 
     def test_only_the_last_banner_counts(self):
         """Drei Generationen im Log: die Grenze ist die **letzte**, sonst
@@ -1403,6 +1511,34 @@ class TestAfterTruncate(CollectorCase):
         reason = collector.tick()["slot"]["reason"]
         self.assertIsNotNone(reason)
         self.assertIn("truncat", reason.lower())
+
+    def test_the_truncating_tick_itself_has_a_reason(self):
+        """**Luecke gefunden durch den Mutanten I3d.**
+
+        `test_reason_names_the_truncate` liest den **Folge**-Tick. Der
+        kuerzende Tick selbst war ungetestet - und im Folge-Tick wird
+        `BLIND_REASON` ueber `elif self._blind` neu gesetzt, wodurch eine
+        fehlende Zuweisung im Truncate-Zweig nicht auffaellt. Genau das hat der
+        Mutant ausgenutzt: `reason = None` statt `BLIND_REASON`, und kein Test
+        wurde rot.
+
+        Gemessen: im kuerzenden Tick ist `reason` mit der Mutation `None`, ohne
+        Mutation der Truncate-Text. Der `_blind`-Zweig ist eine **Folge**
+        reparieren, keine eigene Begruendung - die Behauptung muss im Tick
+        stehen, der sie begruendet.
+        """
+        collector = self.make(cfg=self.truncating_cfg())
+        filler = "noise " * 100 + "\n"
+        with open(self.log, "a", encoding="utf-8") as handle:
+            for _ in range(2100):
+                handle.write(filler)
+        self.stderr_of(collector.tick)
+        # `state()` ist der Zustand **dieses** Ticks - der naechste `tick()`
+        # kuerzt nicht mehr und wuerde den Zweig gar nicht mehr nehmen.
+        truncating = collector.state()
+        self.assertTrue(truncating["log"]["truncated"])
+        self.assertIsNotNone(truncating["slot"]["reason"])
+        self.assertIn("truncat", truncating["slot"]["reason"].lower())
 
     def test_running_metrics_do_not_make_it_free(self):
         """Der widerspruechliche Befund aus dem Brief: `queue.running=1` und
@@ -1680,6 +1816,320 @@ class TestClosedFlagRemoved(CollectorCase):
         collector.tick()
         collector.close()
         self.assertIn("slot", collector.state())
+
+
+# ======================================================================
+# Fix-Runde 3
+# ======================================================================
+#
+# N5: der `num_reqs`-Waechter muss wieder arbeiten.
+#
+# In Runde 2 wurde er auf `generation_start is None` verengt. Das rettet N2,
+# macht die Gegenprobe aber fuer die gesamte Prozesslebenszeit inert, sobald ein
+# Banner existiert. Ein rid, der NACH dem Banner empfangen wurde und nie fertig
+# wird - Client bricht ab, Server mitten im Request gestoppt -, wird als lebender
+# Halter gemeldet:
+#
+#     state='busy'  rid='stale'  duration_s=36100.0
+#
+# Der Unterschied zum Geist aus Runde 1/2: er ist nicht ueber die
+# Generationsgrenze zu erkennen, denn er gehoert zur laufenden Generation. Nur
+# der Scheduler kann ihn widerlegen: `num_reqs == 0` heisst, der Server kennt
+# keine Request.
+#
+# Damit die Gegenprobe nicht wieder N2 bricht (ein frisch eingetroffener rid ist
+# im Log, aber noch nicht im Scheduler gezaehlt), haengt sie an einem **Alter**:
+# nur rids, die laenger offen sind als ein Poll-Intervall, gelten als nicht
+# belegbar. Frische rids bleiben unangetastet, mit ihrer Startzeit.
+
+
+class TestNumReqsWitness(CollectorCase):
+    """N5 - `num_reqs == 0` widerlegt offene rids, die aelter als ein Poll sind."""
+
+    BANNER_AT = RECEIVED_AT - 5000.0
+
+    def with_banner(self, rid, age_s, num_reqs):
+        """Ein rid, der seit `age_s` Sekunden offen ist, bei `num_reqs`.
+
+        Das Alter ist der Abstand zwischen `received` und der eingestellten
+        Uhr - nicht zu `RECEIVED_AT` verschoben, damit die Grenze genau
+        steuerbar ist.
+        """
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": num_reqs, "num_waiting_reqs": 0})
+        self.append(banner(self.BANNER_AT))
+        self.append(received(rid=rid, at=self.now - age_s))
+        return collector
+
+    # --- Fall 1: alt, num_reqs == 0 -> Phantom ----------------------
+
+    def test_old_rid_with_num_reqs_zero_is_unknown(self):
+        """Der Kernfall aus dem Brief."""
+        collector = self.with_banner("stale", age_s=3600.0, num_reqs=0)
+        state = collector.tick()
+        self.assertEqual(state["slot"]["state"], "unknown")
+        self.assertIsNone(state["slot"]["rid"])
+
+    def test_phantom_has_no_invented_duration(self):
+        """Die erfundene Zahl ist `duration_s=36100.0`. Sie darf nicht
+        erscheinen - auch nicht als Restposten."""
+        collector = self.with_banner("stale", age_s=3600.0, num_reqs=0)
+        state = collector.tick()
+        self.assertIsNone(state["slot"]["duration_s"])
+        self.assertIsNone(state["slot"]["started_at"])
+
+    def test_phantom_is_named_in_the_reason(self):
+        collector = self.with_banner("stale", age_s=3600.0, num_reqs=0)
+        reason = collector.tick()["slot"]["reason"]
+        self.assertIsNotNone(reason)
+        self.assertIn("num_reqs", reason)
+
+    def test_phantom_is_removed_from_the_open_dict(self):
+        """Nicht nur versteckt: weg aus `received_at`, sonst kehrt er beim
+        naechsten Abschluss zurueck."""
+        collector = self.with_banner("stale", age_s=3600.0, num_reqs=0)
+        collector.tick()
+        self.assertNotIn("stale", collector.received_at)
+
+    # --- Fall 2: frisch, num_reqs == 0 -> bleibt Halter (N2) ----------
+
+    def test_fresh_rid_with_num_reqs_zero_stays_holder(self):
+        """N2-Regression. `read_load` laeuft **vor** `_drain_events()`: ein
+        Request, der zwischen zwei `/get_load`-Abfragen eintrifft, steht im Log
+        und ist noch nicht gezaehlt. Genau das darf die Regel nicht loeschen."""
+        collector = self.with_banner("fresh", age_s=1.0, num_reqs=0)
+        state = collector.tick()
+        self.assertEqual(state["slot"]["rid"], "fresh")
+        self.assertEqual(state["slot"]["state"], "busy")
+
+    def test_fresh_rid_keeps_its_start_time(self):
+        collector = self.with_banner("fresh", age_s=1.0, num_reqs=0)
+        collector.tick()
+        self.assertIn("fresh", collector.received_at)
+        self.assertEqual(collector.received_at["fresh"], self.now - 1.0)
+
+    def test_fresh_rid_history_has_a_duration(self):
+        """N2 in Zahlen: `duration_s` ist eine Zahl, nicht `None`."""
+        collector = self.with_banner("fresh", age_s=1.0, num_reqs=0)
+        collector.tick()
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": 1, "num_waiting_reqs": 0})
+        self.append(finished(rid="fresh", at=self.now + 16.0),
+                    access(at=self.now + 16.0))
+        entry = collector.tick()["history"][0]
+        self.assertIsNotNone(entry["duration_s"])
+        self.assertAlmostEqual(entry["duration_s"], 17.0, delta=0.001)
+
+    # --- Fall 3: alt, num_reqs > 0 -> bleibt Halter -----------------
+
+    def test_old_rid_with_num_reqs_one_stays_holder(self):
+        """Der Server kennt den Request. Die Altersregel darf **nicht**
+        greifen, wenn ein Zeuge da ist - sonst wuerde sie laufende
+        Requests mit hohem Kontext (Minuten Laufzeit) kuenstlich beenden."""
+        collector = self.with_banner("long", age_s=3600.0, num_reqs=1)
+        state = collector.tick()
+        self.assertEqual(state["slot"]["rid"], "long")
+        self.assertEqual(state["slot"]["state"], "busy")
+
+    def test_old_rid_with_num_reqs_one_has_no_reason(self):
+        collector = self.with_banner("long", age_s=3600.0, num_reqs=1)
+        self.assertIsNone(collector.tick()["slot"]["reason"])
+
+    # --- Fall 4: kein Banner, num_reqs == 0 (Ruling 15) -------------
+
+    def test_no_banner_and_num_reqs_zero_is_still_unknown(self):
+        """Ruling 15 bleibt: ohne Banner ist die Altersregel der einzige
+        Beleg, und sie muss allein greifen."""
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": 0, "num_waiting_reqs": 0})
+        self.append(received(rid="stale", at=self.now - 3600.0))
+        state = collector.tick()
+        self.assertEqual(state["slot"]["state"], "unknown")
+        self.assertIsNone(state["slot"]["rid"])
+        self.assertIsNotNone(state["slot"]["reason"])
+
+    def test_no_banner_fresh_rid_still_survives(self):
+        """Ohne Banner **und** jung: kein Beleg, also kein Eingriff."""
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": 0, "num_waiting_reqs": 0})
+        self.append(received(rid="fresh", at=self.now - 1.0))
+        state = collector.tick()
+        self.assertEqual(state["slot"]["rid"], "fresh")
+
+    # --- Fall 5: unknown immer mit reason ---------------------------
+
+    def test_unknown_never_without_a_reason(self):
+        """`unknown` ohne `reason` ist verboten: das war der Phantom-Halter, der
+        geglaubt wurde. In **jedem** der obigen Faelle."""
+        cases = [
+            ("banner+alt+num_reqs0", self.with_banner("a", 3600.0, 0)),
+            ("banner+frisch+num_reqs0", self.with_banner("b", 0.5, 0)),
+            ("banner+alt+num_reqs1", self.with_banner("c", 3600.0, 1)),
+        ]
+        for label, collector in cases:
+            with self.subTest(case=label):
+                state = collector.tick()
+                if state["slot"]["state"] == "unknown":
+                    self.assertIsNotNone(state["slot"]["reason"],
+                                         f"{label}: unknown ohne reason")
+
+    def test_unknown_from_the_truncate_path_has_a_reason(self):
+        """Der andere `unknown`-Weg muss dasselbe liefern."""
+        from slotmon.config import load_config as lc
+        cfg = lc({
+            "SERVER_LOG": self.log,
+            "MONITOR_LOG": self.monitor_log,
+            "HISTORY": self.history_path,
+            "MAX_LOG_MB": "1",
+        })
+        collector = self.make(cfg=cfg)
+        filler = "noise " * 100 + "\n"
+        with open(self.log, "a", encoding="utf-8") as handle:
+            for _ in range(2100):
+                handle.write(filler)
+        self.stderr_of(collector.tick)
+        state = collector.tick()
+        self.assertEqual(state["slot"]["state"], "unknown")
+        self.assertIsNotNone(state["slot"]["reason"])
+
+    def test_unknown_from_a_dead_server_has_a_reason(self):
+        """Und der dritte: `/get_load` tot, kein Halter bestimmbar."""
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: Sample(None, None, "down")
+        state = collector.tick()
+        self.assertEqual(state["slot"]["state"], "unknown")
+        self.assertIsNotNone(state["slot"]["reason"])
+
+    # --- Die Schwelle selbst -----------------------------------------
+
+    def test_threshold_comes_from_poll_interval(self):
+        """Keine eigene Env-Variable, kein Magic Number: die Schwelle ist
+        `POLL_INTERVAL`. Mit 10 s ist ein 5 s alter rid noch frisch."""
+        from slotmon.config import load_config as lc
+        cfg = lc({
+            "SERVER_LOG": self.log,
+            "MONITOR_LOG": self.monitor_log,
+            "HISTORY": self.history_path,
+            "MAX_LOG_MB": "1024",
+            "POLL_INTERVAL": "10",
+        })
+        collector = self.make(cfg=cfg)
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": 0, "num_waiting_reqs": 0})
+        self.append(banner(self.BANNER_AT))
+        self.append(received(rid="mid", at=self.now - 5.0))
+        self.assertEqual(collector.tick()["slot"]["rid"], "mid")
+
+    def test_threshold_boundary_is_exclusive(self):
+        """Genau ein Poll-Intervall alt ist noch nicht aelter als eins. `<`
+        statt `<=`: sonst waere ein rid, der im selben Takt wie der Load-Sample
+        eintrifft, sofort faellig."""
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": 0, "num_waiting_reqs": 0})
+        self.append(banner(self.BANNER_AT))
+        self.append(received(rid="edge", at=self.now - self.cfg.poll_interval))
+        self.assertEqual(collector.tick()["slot"]["rid"], "edge")
+
+    def test_one_second_past_the_boundary_is_a_phantom(self):
+        """**Umbenannt (Runde 3):** der Test hiess einmal
+        `test_one_millisecond_past_the_boundary_is_a_phantom` und behauptete
+        damit eine Praezision, die er nicht hat. Gemessen: `LogReader._collect`
+        parst `stamp[:19]` und schneidet Mikrosekunden ab, ein Fixture mit
+        `- 0.001` landet dadurch **eine ganze Sekunde** tiefer (3 s statt
+        2,001 s) - der Name war eine Lub, die Assertion nicht.
+        """
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": 0, "num_waiting_reqs": 0})
+        self.append(banner(self.BANNER_AT))
+        self.append(received(rid="edge", at=self.now - self.cfg.poll_interval - 1.0))
+        self.assertIsNone(collector.tick()["slot"]["rid"])
+
+    def test_the_reader_truncates_microseconds(self):
+        """Belegt die Grenze, an der die beiden Tests oben stehen.
+
+        Das echte Log schreibt Mikrosekunden, der Reader nimmt aber nur die
+        ersten 19 Zeichen. `LogEvent.at` ist deshalb auf Sekunden genau - fuer
+        eine Altersgrenze in der Groessenordnung `POLL_INTERVAL` (2 s) ist das
+        eine Nachkommastelle, aber ein Fixture, das `1700000099.5` behauptet,
+        wuerde hier immer `1700000099.0` bekommen.
+        """
+        self.append(received(rid="sub", at=RECEIVED_AT + 0.75))
+        collector = self.make()
+        collector.tick()
+        self.assertEqual(collector.received_at["sub"], RECEIVED_AT)
+        # Der Log-Text selbst traegt die Mikrosekunden.
+        self.assertIn(".750000", received(rid="sub", at=RECEIVED_AT + 0.75))
+
+    def test_unknown_num_reqs_drops_nothing_at_any_age(self):
+        """`num_reqs` ist `None` (Quelle tot oder Feld fehlt). Dann gilt
+        ueberhaupt nichts - eine kaputte Quelle ist kein Beweis, in keinem
+        Alter."""
+        for age in (1.0, 3600.0):
+            with self.subTest(age=age):
+                self.setUp()
+                collector = self.make()
+                collector.sources.read_load = lambda **kw: Sample(
+                    None, None, "down")
+                self.append(banner(self.BANNER_AT))
+                self.append(received(rid="aaa", at=self.now - age))
+                state = collector.tick()
+                self.assertEqual(state["slot"]["open_count"], 1)
+                self.assertIn("aaa", collector.reader.state["open"])
+
+    def test_a_phantom_does_not_survive_a_later_busy_tick(self):
+        """**Der** Beweis fuer Aufgabe 3: zwei Ticks, dazwischen `num_reqs > 0`.
+
+        Der erste Tick verwirft den Phantom. Der zweite laeuft mit
+        `num_reqs == 1`, greift der Waechter also **nicht** - und `evaluate()`
+        nimmt den aeltesten offenen rid. Waere das Phantom nur aus dem lokalen
+        `open_rids` entfernt worden, stuende es im `reader.state["open"]` noch
+        und waere genau hier wieder der Halter: 3600 s erfundene Laufzeit.
+        """
+        collector = self.with_banner("stale", age_s=3600.0, num_reqs=0)
+        first = collector.tick()
+        self.assertEqual(first["slot"]["state"], "unknown")
+
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": 1, "num_waiting_reqs": 0})
+        second = collector.tick()
+        self.assertIsNone(second["slot"]["rid"])
+        self.assertEqual(second["slot"]["open_count"], 0)
+        self.assertIsNone(second["slot"]["duration_s"])
+
+    def test_a_phantom_is_gone_from_the_reader_not_only_the_copy(self):
+        """Der Leser-Zustand muss stimmen, das lokale Dict ist nur die
+        Arbeitskopie. Genau das war der Defekt: `del open_rids[rid]` raeumt nur
+        die Kopie."""
+        collector = self.with_banner("stale", age_s=3600.0, num_reqs=0)
+        collector.tick()
+        self.assertNotIn("stale", collector.reader.state["open"])
+
+    def test_the_reader_still_remembers_seen_rids_after_a_purge(self):
+        """Nach dem Entfernen bleibt der rid in `seen`. Sonst wuerde er bei
+        einem spaeteren `request.received` wieder eingetragen - ein Log kann
+        sich wiederholen, der Weg muss trotzdem bleiben."""
+        collector = self.with_banner("stale", age_s=3600.0, num_reqs=0)
+        collector.tick()
+        self.assertIn("stale", collector.reader.state["seen"])
+
+    def test_mixed_open_rids_split_by_age(self):
+        """Ein alter Geist und ein frischer echter rid gleichzeitig: nur der
+        Geist faellt. Der echte bleibt Halter."""
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": 0, "num_waiting_reqs": 0})
+        self.append(banner(self.BANNER_AT))
+        self.append(received(rid="stale", at=self.now - 3600.0))
+        self.append(received(rid="fresh", at=self.now - 1.0))
+        state = collector.tick()
+        self.assertEqual(state["slot"]["rid"], "fresh")
+        self.assertEqual(state["slot"]["open_count"], 1)
+        self.assertNotIn("stale", collector.received_at)
 
 
 if __name__ == "__main__":

@@ -197,6 +197,32 @@ class LogReader:
         self._failed_access = []
         self._decoder.reset()
 
+    def drop_open(self, rids):
+        """Rids aus dem offenen Satz entfernen. Die Entscheidung liegt beim Aufrufer.
+
+        Das ist die oeffentliche Fassung dessen, was der Banner-Fall in
+        `_collect()` macht. Der Unterschied ist entscheidend: dort wird
+        `self.state["open"]` **selbst** gefiltert, hier muss es der Aufrufer
+        tun, weil er eine Kopie davon baut.
+
+        Verstecken genuegt nicht. Ein Aufrufer, der nur sein Arbeits-Dict
+        bereinigt, laesst den rid in `state["open"]` stehen; beim naechsten
+        `poll()` ist er wieder da und wird vom naechsten Takt erneut
+        ausgewertet. Genau so kam der Phantom-Halter zurueck: mit
+        `max_running_requests 1` nimmt `evaluate()` den **aeltesten** offenen
+        rid.
+
+        `seen` bleibt unberuehrt: der rid ist gesehen worden und wird nicht
+        erneut eingetragen. Genau das macht das Entfernen dauerhaft.
+        """
+        if not rids:
+            return 0
+        dropped = 0
+        for rid in rids:
+            if self.state["open"].pop(rid, None) is not None:
+                dropped += 1
+        return dropped
+
     def _read_raw(self, limit):
         """Bis zu `limit` rohe Bytes ab self.offset. None bei Lesefehler."""
         try:
