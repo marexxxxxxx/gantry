@@ -1880,10 +1880,19 @@ class TestNumReqsWitness(CollectorCase):
         self.assertIsNone(state["slot"]["started_at"])
 
     def test_phantom_is_named_in_the_reason(self):
+        """Auch die **Zahl** gehoert in den Grund (Runde 4).
+
+        `assertIn("num_reqs", reason)` allein hat einen Mutanten durchgewunken,
+        der einen verworfenen Geist mitzaehlt und trotzdem `0 rid(s)` meldet:
+        der Grund waere dann sachlich falsch, ohne dass ein einziges Wort der
+        bisherigen Assertion falsch wird. Die Zahl ist kein Beiwerk - sie sagt
+        dem Leser, **wie viele** rids der Server nicht kennt.
+        """
         collector = self.with_banner("stale", age_s=3600.0, num_reqs=0)
         reason = collector.tick()["slot"]["reason"]
         self.assertIsNotNone(reason)
         self.assertIn("num_reqs", reason)
+        self.assertIn("1 rid(s)", reason)
 
     def test_phantom_is_removed_from_the_open_dict(self):
         """Nicht nur versteckt: weg aus `received_at`, sonst kehrt er beim
@@ -2130,6 +2139,252 @@ class TestNumReqsWitness(CollectorCase):
         self.assertEqual(state["slot"]["rid"], "fresh")
         self.assertEqual(state["slot"]["open_count"], 1)
         self.assertNotIn("stale", collector.received_at)
+
+    def test_the_ghost_count_is_the_number_actually_discarded(self):
+        """Runde 4, Befund 3: die Zahl im Grund ist bisher ungeprueft.
+
+        `assertIn("1 rid(s)")` allein ist schwach: ein Mutant, der die Zahl
+        **konstant** einsetzt, waere mit genau einem Geist nicht zu fangen,
+        und einer, der `ghosts` vor dem `del` zaehlt, auch nicht - denn die
+        Zahl der verworfenen rids ist hier dieselbe wie die der offenen. Erst
+        ein Takt mit **mehreren** Geisten trennt die beiden Fehler von der
+        Wahrheit:
+
+          - `ghosts = 0`               (N5t)  -> `0 rid(s)`
+          - `ghosts = 1`               (hart) -> `1 rid(s)`
+          - `ghosts = len(open_rids)`  (vor dem `del`) -> hier zwar richtig,
+            aber bei einem *gemischten* Takt falsch (siehe den nächsten Test).
+
+        Die Behauptung ist bewusst stark: der Grund nennt genau die Zahl der
+        rids, die dieser Tick verworfen hat.
+        """
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": 0, "num_waiting_reqs": 0})
+        self.append(banner(self.BANNER_AT))
+        for rid in ("g1", "g2", "g3"):
+            self.append(received(rid=rid, at=self.now - 3600.0))
+        state = collector.tick()
+        reason = state["slot"]["reason"]
+        self.assertIn("3 rid(s)", reason)
+        # Und die Gegenprobe: die drei sind wirklich weg, nicht nur benannt.
+        self.assertEqual(state["slot"]["open_count"], 0)
+        for rid in ("g1", "g2", "g3"):
+            self.assertNotIn(rid, collector.received_at)
+            self.assertNotIn(rid, collector.reader.state["open"])
+
+    def test_the_ghost_count_excludes_the_surviving_request(self):
+        """Der Zaehlpunkt ist der Punkt **nach** dem Alterstest.
+
+        Drei offene rids, davon zwei zu alt: `ghosts` ist 2, nicht 3. Ein
+        Zaehler an der falschen Stelle - etwa `len(open_rids)` am Anfang des
+        Blocks - meldet hier 3 und behauptet damit, auch der frische rid sei
+        dem Server unbekannt. Genau das ist der Fehler, den der frische rid
+        im naechsten Testfall als Halter sichtbar macht.
+        """
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": 0, "num_waiting_reqs": 0})
+        self.append(banner(self.BANNER_AT))
+        self.append(received(rid="old1", at=self.now - 3600.0))
+        self.append(received(rid="old2", at=self.now - 3600.0))
+        self.append(received(rid="fresh", at=self.now - 1.0))
+        state = collector.tick()
+        self.assertIn("2 rid(s)", state["slot"]["reason"])
+        self.assertNotIn("3 rid(s)", state["slot"]["reason"])
+        # Der ueberlebende rid ist weiterhin der Halter - die Zahl im Grund
+        # und der Zustand muessen dieselbe Wirklichkeit beschreiben.
+        self.assertEqual(state["slot"]["rid"], "fresh")
+
+
+# ======================================================================
+# Fix-Runde 4
+# ======================================================================
+#
+# Der `unknown`-reason-Block nach `waiting is None` (`collector.py:662-681`)
+# war bis hierher **vollstaendig ungepinnt**. Runde 3 hat die harte
+# Constraint "unknown nie ohne reason" ueber den Zustand *als solchen*
+# abgesichert - aber nicht ueber die drei Zweige, die diesen Zustand
+# ueberhaupt erst erzeugen.
+#
+# Der Re-Reviewer hat zu Runde 3 die Behauptung "der `else`-Zweig ist toter
+# Code" widerlegt. Sie stuetzte sich auf `slot.py:35`
+# `legacy = max(0, waiting - open_count)`: der Clamp mache `legacy == 0`
+# unmoeglich, und damit den Fallback unerreichbar.
+#
+# Der Clamp haelt aber nur `waiting >= open_count >= 0` fest. Ein **negatives**
+# `num_waiting_reqs` umgeht ihn: `max(0, -1 - 0) == 0`, `complete` ist wahr,
+# `open_rids` ist leer, also `label == "free"` waere... nein, `waiting == 0`
+# gilt nicht, also greift der `else`-Zweig in `collector.py:642` und setzt
+# `unknown`. Gemessen:
+#
+#     waiting=-1   state='unknown' legacy=0 reason='Halter nicht bestimmbar'
+#
+# Der Fallback ist damit erreichbar, und sein `reason` steht unter derselben
+# harten Constraint wie jeder andere. Ein `reason = None` dort (N4c) liefert
+# genau das verbotene `unknown` ohne Grund.
+#
+# Und derselbe Block, eine Zeile hoeher: der `legacy`-Zweig nennt den
+# Altbestand, und kein einziger Test suchte je nach dem Wort "Altbestand". Der
+# Zweig konnte ausfallen, ohne dass ein Test es merkte - der Grund degradiert
+# dann still zu einem generischen String (N4d).
+
+
+class TestUnknownReasonIsNamed(CollectorCase):
+    """Runde 4 - jeder `unknown` aus dem Warteschlangenblock nennt seinen
+    Grund, und zwar den **richtigen**."""
+
+    def with_load(self, **load):
+        """Collector mit einer beliebigen `/get_load`-Antwort."""
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: self.sample(load)
+        return collector
+
+    # --- Befund 1: der `else`-Fallback ist erreichbar ------------------
+
+    def test_negative_waiting_reaches_the_fallback(self):
+        """Der Pfad, den Runde 3 fuer unmoeglich hielt.
+
+        `slot.py:35` klemmt `waiting - open_count` auf 0 - aber nur nach oben.
+        `num_waiting_reqs = -1` ergibt `legacy = 0` bei einem *negativen*
+        Eingang, und `waiting == 0` trifft nicht zu. Der Slot ist damit
+        `unknown` **mit** `legacy == 0`, also genau der Fall, fuer den der
+        `else`-Zweig bei `collector.py:680` geschrieben wurde.
+        """
+        collector = self.with_load(num_reqs=0, num_waiting_reqs=-1)
+        state = collector.tick()
+        self.assertEqual(state["slot"]["state"], "unknown")
+        self.assertEqual(state["slot"]["legacy"], 0)
+
+    def test_negative_waiting_never_reports_unknown_without_a_reason(self):
+        """Die harte Constraint, an dem Fall 2 aus Runde 2 durchkam.
+
+        Der Zustand ist hier erreichbar (siehe den Test darüber), also muss
+        hier derselbe Grund gelten wie ueberall: `unknown` wird nie ohne
+        `reason` gemeldet. Ein `reason = None` an `collector.py:681` (N4c)
+        faellt an dieser Zeile.
+        """
+        collector = self.with_load(num_reqs=0, num_waiting_reqs=-1)
+        state = collector.tick()
+        self.assertEqual(state["slot"]["state"], "unknown")
+        self.assertIsNotNone(state["slot"]["reason"],
+                             "unknown ohne reason - verboten")
+
+    def test_negative_waiting_gets_the_fallback_reason_not_a_neighbour(self):
+        """Nicht *irgendein* Grund, sondern der dieses Falls.
+
+        Die drei Zweige des Blocks nennen drei verschiedene Ursachen. Hier ist
+        weder die Warteschlange unbekannt (`waiting` ist eine Zahl) noch gibt
+        es Altbestand (`legacy == 0`). Also der generische Fallback - und
+        **nicht** der Altbestand-Text, der sonst still degradeert.
+        """
+        collector = self.with_load(num_reqs=0, num_waiting_reqs=-1)
+        reason = collector.tick()["slot"]["reason"]
+        self.assertIn("bestimmbar", reason)
+        self.assertNotIn("Altbestand", reason)
+        self.assertNotIn("Warteschlange unbekannt", reason)
+
+    def test_a_fractional_negative_waiting_behaves_the_same(self):
+        """`num_waiting_reqs` ist untypisiert gelesen. Auch `-0.5` umgeht den
+        Clamp auf dieselbe Weise - und wird nicht etwa durch eine
+        Ganzzahligkeitsannahme vorher still zu `0`."""
+        collector = self.with_load(num_reqs=0, num_waiting_reqs=-0.5)
+        state = collector.tick()
+        self.assertEqual(state["slot"]["state"], "unknown")
+        self.assertIsNotNone(state["slot"]["reason"])
+
+    def test_zero_waiting_without_open_rids_is_free_and_not_unknown(self):
+        """Die Gegenprobe, damit der Test oben nicht aus einem `free`-Fall ein
+        `unknown` macht: `waiting == 0` ohne offene rids ist ein **freier**
+        Slot. Kein Grund noetig, weil `unknown` gar nicht gemeldet wird."""
+        collector = self.with_load(num_reqs=0, num_waiting_reqs=0)
+        state = collector.tick()
+        self.assertEqual(state["slot"]["state"], "free")
+        self.assertIsNone(state["slot"]["reason"])
+
+    # --- Befund 2: der Altbestand-Text ---------------------------------
+
+    def test_legacy_queue_names_the_altbestand(self):
+        """Kein Test suchte je nach "Altbestand" - der Zweig konnte ausfallen,
+        ohne dass etwas auffiel (N4d).
+
+        Fuenf wartende Requests, keiner davon im Log sichtbar: das ist der
+        Altbestand aus der Zeit vor dem Request-Logging. Der Grund muss das
+        sagen, sonst bleibt nur ein generischer String und der Leser weiss
+        nicht, ob der Slot besetzt ist.
+        """
+        collector = self.with_load(num_reqs=5, num_waiting_reqs=5)
+        state = collector.tick()
+        self.assertEqual(state["slot"]["legacy"], 5)
+        self.assertEqual(state["slot"]["state"], "unknown")
+        self.assertIn("Altbestand", state["slot"]["reason"])
+
+    def test_legacy_reason_carries_the_number(self):
+        """Der Altbestand ist eine **Zahl**, und sie ist beobachtbar. Ein
+        Mutanten, der einen konstanten Wert einsetzt, waere ueber den blossen
+        Textnachweis nicht zu fangen."""
+        collector = self.with_load(num_reqs=7, num_waiting_reqs=7)
+        reason = collector.tick()["slot"]["reason"]
+        self.assertIn("Altbestand: 7 Request(s)", reason)
+
+    def test_legacy_zero_does_not_claim_an_altbestand(self):
+        """Die andere Richtung: `legacy == 0` darf keinen Altbestand behaupten.
+
+        Es gibt keinen Altbestand, der nach der Anzeige plötzlich auftaucht.
+        Der Weg dahin ist derselbe `else`-Zweig wie in Befund 1 - der Fallback
+        nennt keine Zahl, weil keine da ist.
+        """
+        collector = self.with_load(num_reqs=0, num_waiting_reqs=-1)
+        state = collector.tick()
+        self.assertEqual(state["slot"]["legacy"], 0)
+        self.assertNotIn("Altbestand", state["slot"]["reason"])
+
+    def test_a_waiting_server_with_a_visible_request_is_not_altbestand(self):
+        """`legacy` ist `waiting - open_count`: eine wartende Queue **mit** einem
+        sichtbaren Halter ist kein Altbestand. Der Slot ist belegt, die Zahl der
+        Wartenden ist aber echt - das gehoert in den Grund, damit der
+        Alteste-vs.-Halter-Unterschied sichtbar bleibt."""
+        collector = self.with_load(num_reqs=1, num_waiting_reqs=1)
+        self.append(received(rid="aaa"))
+        state = collector.tick()
+        # legacy == 0 (1 wartend, 1 offen) -> kein Altbestand.
+        self.assertEqual(state["slot"]["legacy"], 0)
+        self.assertEqual(state["slot"]["rid"], "aaa")
+        self.assertEqual(state["slot"]["state"], "busy")
+        self.assertIsNone(state["slot"]["reason"])
+
+    def test_unknown_waiting_does_not_claim_an_altbestand(self):
+        """Auch der dritte Zweig des Blocks: bei unbekannter Warteschlange ist
+        `legacy` gar nicht berechenbar (`None`). Ein Altbestand-Text waere hier
+        eine erfundene Zahl - er kommt aus einem anderen Grund."""
+        collector = self.with_load(num_reqs=None, num_waiting_reqs=None)
+        state = collector.tick()
+        self.assertEqual(state["slot"]["state"], "unknown")
+        self.assertIsNotNone(state["slot"]["reason"])
+        self.assertNotIn("Altbestand", state["slot"]["reason"])
+
+    # --- Die Regel ueber alle drei Zweige ------------------------------
+
+    def test_every_unknown_from_this_block_names_its_own_cause(self):
+        """Die Regel in einer Schleife, statt dreimal dieselbe Assertion.
+
+        Geprueft wird pro Fall **welcher** Grund, nicht bloss dass einer da
+        ist: genau daran ist der `legacy`-Zweig still gescheitert.
+        """
+        cases = [
+            ("queue unknown", {"num_reqs": None, "num_waiting_reqs": None},
+             "Warteschlange unbekannt"),
+            ("legacy queue", {"num_reqs": 5, "num_waiting_reqs": 5},
+             "Altbestand"),
+            ("negative waiting", {"num_reqs": 0, "num_waiting_reqs": -1},
+             "bestimmbar"),
+        ]
+        for label, load, expected in cases:
+            with self.subTest(case=label):
+                state = self.with_load(**load).tick()
+                self.assertEqual(state["slot"]["state"], "unknown")
+                self.assertIsNotNone(state["slot"]["reason"])
+                self.assertIn(expected, state["slot"]["reason"])
 
 
 if __name__ == "__main__":
