@@ -56,6 +56,30 @@ ACCESS_RE = re.compile(
     r"(?P<status>\d{3})"
 )
 
+#: Pro Serverstart schreibt sglang genau eine Zeile in dieses Muster. Sie ist
+#: die **Generationsgrenze**: alles, was davor in `request.received` auftaucht,
+#: gehoert zu einem Server, der nicht mehr laeuft.
+#:
+#: Das ist keine Heuristik ueber Zeitabstaende, sondern eine Aussage ueber den
+#: Log. Ein rid, dessen `received` **vor** dem letzten Banner liegt, hat keinen
+#: Abschluss, weil sein Server nie wieder einen geschrieben hat - die Datei
+#: ueberlebt den Neustart, der Loginhalt nicht. Ohne diese Grenze bleiben
+#: solche rids dauerhaft in `state["open"]` stehen und werden vom naechsten
+#: Collector als Halter gewaehlt, weil `evaluate()` den **aeltesten** rid nimmt.
+#:
+#: `^...$` auf die volle Zeile, nicht `search` auf ein Substring: eine
+#: Request-Zeile, die den Satz im Prompt enthaelt, ist kein Serverstart.
+#: Gemessen am echten Log: 4 Banner in 73 MB.
+#:
+#: Die Grenze ist der **Zeitstempel** des Banners, nicht die Zeile danach. Im
+#: echten Log stehen Zeile 329328 (Banner, `2026-10-08 14:58:55`) und ein
+#: `request.received` mit derselben Sekunde nur 20 Zeilen auseinander - das
+#: gehoert noch zur laufenden Generation. Deshalb `>=`, nicht `>`.
+BANNER_RE = re.compile(
+    r"^\[(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s+"
+    r"The server is fired up and ready to roll!\s*$"
+)
+
 
 @dataclass
 class LogEvent:
@@ -107,6 +131,12 @@ class LogReader:
         self.partial = ""
         self.state = {"open": {}, "seen": set()}
         self._identity = None
+        #: Unix-Zeit des **letzten** Serverstart-Banners im Log, oder None, wenn
+        #: keiner gesehen wurde. Generationsgrenze fuer `state["open"]`: ein rid,
+        #: dessen `received` davor liegt, gehoert zu einem abgeschalteten Server.
+        self.generation_start = None
+        #: Wie viele Bannerzeilen gesehen wurden. Nur fuer Tests und Diagnose.
+        self.banners_seen = 0
         #: Letzter Lesefehler als Text, sonst None. "Kein neues Byte" und
         #: "konnte nicht lesen" sind verschiedene Zustaende und werden nicht
         #: mehr beide als leeres Ergebnis gemeldet.
@@ -212,6 +242,22 @@ class LogReader:
         return self._decoder.decode(data)
 
     def _collect(self, line):
+        banner = BANNER_RE.match(line)
+        if banner:
+            # Generationsgrenze setzen. Wird sie hier erkannt, bevor die
+            # Access-/JSON-Zweige folgen, kann eine Bannerzeile nie als
+            # Access-Zeile missverstanden werden - sie hat keine.
+            self.generation_start = _parse_access_ts(banner.group("ts"))
+            self.banners_seen += 1
+            # Was aus der alten Generation schon in `open` liegt, ist jetzt
+            # widerlegt. Zurueck ist der richtige Weg: die rids werden nicht
+            # nur versteckt, sondern entfernt, damit sie nicht zurueckkehren.
+            self.state["open"] = {
+                rid: since for rid, since in self.state["open"].items()
+                if since >= self.generation_start
+            }
+            return None
+
         access = ACCESS_RE.search(line)
         if access:
             # Nur Modell-Requests ueberhaupt vormerken. Im echten Log sind 92k
@@ -357,6 +403,15 @@ class LogReader:
                     # Unix-Zeit, NICHT meta["received_time"]: Task 8 rechnet
                     # now - open[rid] und wuerste sonst ~1,79 Mrd. Sekunden
                     # bekommen. Die received_time bleibt in meta fuer Orden.
+                    if (self.generation_start is not None
+                            and event.at < self.generation_start):
+                        # Ghost einer frueheren Servergeneration. Wird
+                        # **nicht** in `open` aufgenommen - Verstecken genuegt
+                        # nicht, weil der naechste poll() das Dict neu aus dem
+                        # Log aufbaut und `evaluate()` den aeltesten rid
+                        # waehlt. `seen` ist trotzdem gesetzt: derselbe rid
+                        # soll nicht bei jedem Poll neu geprueft werden.
+                        continue
                     self.state["open"][event.rid] = event.at
             else:
                 self.state["seen"].add(event.rid)

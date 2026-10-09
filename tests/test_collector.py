@@ -159,13 +159,29 @@ class TestEmptyState(CollectorCase):
 
     def test_state_shape_is_complete(self):
         state = self.make().tick()
+        self.assert_slot_shape(state)
+
+    def test_state_shape_is_complete_before_the_first_tick(self):
+        """`/api/state` liefert `state()`. Ein Client, der vor dem ersten Poll
+        liest, darf keinen `KeyError` bekommen - die Kacheln existieren dann
+        zwar mit "unbekannt", aber sie existieren."""
+        self.assert_slot_shape(self.make().state())
+
+    def assert_slot_shape(self, state):
         for key in ("at", "server", "slot", "queue", "speed", "gpu", "log", "history"):
             self.assertIn(key, state)
         for key in ("connected", "load_error", "age_s"):
             self.assertIn(key, state["server"])
         for key in ("state", "rid", "system", "ip_port", "started_at",
-                    "duration_s", "legacy", "open_count", "complete"):
-            self.assertIn(key, state["slot"])
+                    "duration_s", "legacy", "open_count", "complete", "reason"):
+            self.assertIn(key, state["slot"], f"slot[{key!r}] fehlt")
+        for key in ("size_mb", "warn", "truncated", "history_error"):
+            self.assertIn(key, state["log"], f"log[{key!r}] fehlt")
+
+    def test_reason_reads_as_none_before_any_tick(self):
+        """Nicht `KeyError`, sondern `None`: es gibt noch keinen Befund, also
+        gibt es auch keinen Grund."""
+        self.assertIsNone(self.make().state()["slot"]["reason"])
 
     def test_state_does_no_io(self):
         """`state()` liefert den letzten Tick ohne I/O - der SSE-Pfad pollt
@@ -998,6 +1014,355 @@ class TestGhostRids(CollectorCase):
     def test_reason_is_none_in_the_normal_case(self):
         state = self.make().tick()
         self.assertIsNone(state["slot"]["reason"])
+
+
+# ======================================================================
+# Fix-Runde 2
+# ======================================================================
+#
+# N1 und N2 haben eine Wurzel: Geister-rids wurden in einem lokalen Dict
+# versteckt statt aus `LogReader.state["open"]` entfernt. Sie kamen also
+# unveraendert zurueck, sobald `num_reqs > 0` wurde.
+#
+# Das Log traegt pro Serverstart genau eine Zeile
+# `[YYYY-MM-DD HH:MM:SS] The server is fired up and ready to roll!`
+# Am echten Log gemessen: 4 Banner, davon sind die letzten drei
+# 2026-10-08 14:53:27, 2026-10-08 14:58:55, 2026-10-09 09:36:21.
+
+
+def banner(at, text="The server is fired up and ready to roll!"):
+    return f"[{stamp(at, iso=False)}] {text}"
+
+
+class TestGenerationBoundary(CollectorCase):
+    """N1 - der Phantom-Halter kehrt zurueck, sobald der Server busy wird."""
+
+    OLD_BANNER = RECEIVED_AT - 5000.0
+    NEW_BANNER = RECEIVED_AT + 50.0
+
+    def two_generations(self, num_reqs_seq):
+        """Ein Log mit zwei Servergenerationen.
+
+        `aaa` ist ein Geist aus der alten (received vor dem neuen Banner, kein
+        finished). `fresh` ist ein Request der laufenden Generation.
+        """
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": num_reqs_seq.pop(0), "num_waiting_reqs": 0})
+        self.append(banner(self.OLD_BANNER))
+        self.append(received(rid="aaa", at=self.OLD_BANNER + 1))
+        self.append(finished(rid="closed", at=self.OLD_BANNER + 2))
+        self.append(banner(self.NEW_BANNER))
+        return collector
+
+    def test_ghost_does_not_return_when_the_server_becomes_busy(self):
+        """**Der** Regressionstest fuer N1.
+
+        Im idle-Tick wird der Geist von `num_reqs == 0` unterdrueckt. Sobald
+        ein echter Request laeuft, ist `num_reqs == 1` - und `evaluate()`
+        waehlt den **aeltesten** offenen rid. Das ist der Geist, 10 Stunden
+        alt. Genau das war die Live-Beobachtung:
+
+            idle tick : unknown  rid: None
+            busy tick : busy     rid: GHOST  duration_s: 36100.0
+        """
+        collector = self.two_generations([0, 1])
+        idle = collector.tick()
+        self.assertEqual(idle["slot"]["open_count"], 0)
+        self.assertIsNone(idle["slot"]["rid"])
+
+        self.append(received(rid="fresh", at=self.NEW_BANNER + 1))
+        busy = collector.tick()
+        self.assertEqual(busy["slot"]["rid"], "fresh")
+        self.assertEqual(busy["slot"]["open_count"], 1)
+        self.assertNotEqual(busy["slot"]["rid"], "aaa")
+
+    def test_ghost_never_reaches_the_open_dict_at_all(self):
+        """Die eigentliche Ursache: der Geist steht in `LogReader.state["open"]`.
+        Der Collector filtert ihn nur weg, der Leser kennt ihn nicht."""
+        collector = self.two_generations([0])
+        collector.tick()
+        self.assertNotIn("aaa", collector.reader.state["open"])
+
+    def test_reader_keeps_only_the_current_generation(self):
+        """Direkt am Leser, unabhaengig vom `num_reqs`-Wächter."""
+        collector = self.two_generations([0])
+        collector.tick()
+        self.assertEqual(sorted(collector.reader.state["open"]), [])
+
+    def test_a_fresh_rid_survives_the_num_reqs_transition(self):
+        """**Der** Regressionstest fuer N2.
+
+        Ein `request.received`, das **vor** dem Zaehlen des Schedulers einfliesst,
+        wird bei `num_reqs == 0` nicht verworfen - und verliert dabei nicht seine
+        Startzeit. Im Folgetick bei `num_reqs == 1` ist er der Halter, mit
+        Startzeit.
+        """
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": 0, "num_waiting_reqs": 0})
+        self.append(banner(self.OLD_BANNER))
+        self.append(banner(self.NEW_BANNER))
+        self.append(received(rid="fresh", at=self.NEW_BANNER + 1))
+        first = collector.tick()
+        self.assertEqual(first["slot"]["open_count"], 1)
+        self.assertEqual(first["slot"]["rid"], "fresh")
+        self.assertIn("fresh", collector.received_at)
+
+    def test_start_time_survives_into_the_history(self):
+        """N2 in Zahlen: die Historienzeile bekommt ein `duration_s`, nicht
+        `None`. Der Verlust der Startzeit war der eigentliche Datenschaden."""
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": 0, "num_waiting_reqs": 0})
+        self.append(banner(self.OLD_BANNER))
+        self.append(banner(self.NEW_BANNER))
+        self.append(received(rid="fresh", at=self.NEW_BANNER + 1))
+        collector.tick()
+        # Jetzt zaehlt der Scheduler den Request, und er endet.
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": 1, "num_waiting_reqs": 0})
+        self.append(finished(rid="fresh", at=self.NEW_BANNER + 18),
+                    access(at=self.NEW_BANNER + 18))
+        state = collector.tick()
+        self.assertEqual(len(state["history"]), 1)
+        entry = state["history"][0]
+        self.assertEqual(entry["started_at"], self.NEW_BANNER + 1)
+        self.assertAlmostEqual(entry["duration_s"], 17.0, delta=0.001)
+
+    def test_num_reqs_guard_still_works_without_a_banner(self):
+        """Ruling 15 bleibt: ohne Banner im Log ist der `num_reqs == 0`-Wächter
+        der einzige Beleg, und er muss allein greifen."""
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": 0, "num_waiting_reqs": 0})
+        self.append(received(rid="aaa", at=RECEIVED_AT))
+        state = collector.tick()
+        self.assertEqual(state["slot"]["open_count"], 0)
+        self.assertIsNone(state["slot"]["rid"])
+
+    def test_both_guards_together(self):
+        """Kein Banner **und** `num_reqs` unbekannt: es wird nichts verworfen.
+
+        Eine kaputte Quelle ist kein Beweis, und ohne Generationsgrenze im Log
+        gibt es auch keinen. Der rid bleibt offen - und wird trotzdem nicht zum
+        Halter, weil `waiting` unbekannt ist und `evaluate()` dann keinen
+        bestimmt. Genau das ist der Unterschied zwischen "nicht belegbar" und
+        "weg".
+        """
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: Sample(None, None, "down")
+        self.append(received(rid="aaa", at=RECEIVED_AT))
+        state = collector.tick()
+        self.assertEqual(state["slot"]["open_count"], 1)
+        self.assertIn("aaa", collector.reader.state["open"])
+        self.assertIsNone(state["slot"]["rid"])
+        self.assertIsNone(state["slot"]["reason"])
+
+
+class TestBannerRecognition(CollectorCase):
+    """Die Banner-Erkennung selbst, mit den echten Logzeilen."""
+
+    BANNER_LINE = ("[2026-10-08 14:58:55] The server is fired up and ready to roll!\n")
+
+    def test_a_real_banner_line_is_recognised(self):
+        from slotmon.logreader import LogReader
+        with open(self.log, "w", encoding="utf-8") as handle:
+            handle.write(self.BANNER_LINE)
+        reader = LogReader(self.log)
+        reader.poll()
+        self.assertIsNotNone(reader.generation_start)
+
+    def test_a_lookalike_line_is_not_a_banner(self):
+        """Der Ausdruck darf nicht auf every-match-Muster beruhen: eine Zeile,
+        die das Wort `fired up` im Request-Text enthaelt, ist kein Serverstart."""
+        from slotmon.logreader import LogReader
+        lookalike = ('[2026-10-08 14:58:55] INFO: request says '
+                     '"the server is fired up and ready to roll!" 200 OK\n')
+        with open(self.log, "w", encoding="utf-8") as handle:
+            handle.write(lookalike)
+        reader = LogReader(self.log)
+        reader.poll()
+        self.assertIsNone(reader.generation_start)
+
+    def test_a_banner_does_not_damage_the_json_events(self        ):
+        """Der Banner steht mitten im Log. Die JSON-Zeilen danach muessen
+        unveraendert gelesen werden."""
+        collector = self.make()
+        self.append(banner(RECEIVED_AT - 100.0))
+        self.append(received(rid="aaa", at=RECEIVED_AT))
+        state = collector.tick()
+        self.assertEqual(state["slot"]["rid"], "aaa")
+        self.assertEqual(state["slot"]["open_count"], 1)
+
+    def test_received_in_the_same_second_as_the_banner_is_kept(self):
+        """**Grenzfall, real im Log vorhanden.**
+
+        Gemessen: Zeile 329328 traegt das Banner `2026-10-08 14:58:55`, und
+        20 Zeilen darunter steht ein `request.received` mit **derselben**
+        Sekunde. Das gehoert noch zur laufenden Generation. Die Grenze ist
+        deshalb der Zeitstempel des Banners mit `>=` - nicht die naechste
+        Zeile danach, und nicht `>`.
+        """
+        collector = self.make()
+        boundary = RECEIVED_AT
+        self.append(received(rid="ghost", at=boundary - 1))
+        self.append(banner(boundary))
+        self.append(received(rid="same", at=boundary))
+        state = collector.tick()
+        self.assertEqual(sorted(collector.reader.state["open"]), ["same"])
+        self.assertEqual(state["slot"]["rid"], "same")
+
+    def test_received_one_second_before_the_banner_is_a_ghost(self):
+        collector = self.make()
+        boundary = RECEIVED_AT
+        self.append(received(rid="ghost", at=boundary - 1))
+        self.append(banner(boundary))
+        self.append(received(rid="fresh", at=boundary + 5))
+        collector.tick()
+        self.assertEqual(sorted(collector.reader.state["open"]), ["fresh"])
+
+    def test_only_the_last_banner_counts(self):
+        """Drei Generationen im Log: die Grenze ist die **letzte**, sonst
+        kaeme ein Request der zweiten Generation als Geist durch."""
+        collector = self.make()
+        self.append(banner(RECEIVED_AT - 9000.0))
+        self.append(received(rid="g1", at=RECEIVED_AT - 8000.0))
+        self.append(banner(RECEIVED_AT - 5000.0))
+        self.append(received(rid="g2", at=RECEIVED_AT - 4000.0))
+        self.append(banner(RECEIVED_AT))
+        self.append(received(rid="g3", at=RECEIVED_AT + 1))
+        collector.tick()
+        self.assertEqual(sorted(collector.reader.state["open"]), ["g3"])
+
+    def test_no_banner_means_no_boundary(self):
+        from slotmon.logreader import LogReader
+        with open(self.log, "w", encoding="utf-8") as handle:
+            handle.write(received(rid="aaa") + "\n")
+        reader = LogReader(self.log)
+        reader.poll()
+        self.assertIsNone(reader.generation_start)
+        self.assertIn("aaa", reader.state["open"])
+
+    def test_banner_in_a_later_poll_purges_what_is_already_open(self):
+        """Der Fall, den der `_apply`-Filter allein nicht erwischt.
+
+        Ein Neustart passiert, **während der Monitor laeuft**: Poll 1 liest ein
+        `request.received` einer alten Generation, Poll 2 erst das Banner.
+        `_apply` kann den rid dann nicht mehr ablehnen - er steht schon in
+        `open`, und `seen` verhindert jede erneute Pruefung. Ohne das Leeren
+        bei Bannerempfang bleibt der Geist liegen.
+
+        Gemessen mit deaktiviertem Purge:
+            after poll1 open: {'aaa': 1700000000.0} | generation_start: None
+            after poll2 open: {'aaa': 1700000000.0}   <- Geist ueberlebt
+        """
+        collector = self.make()
+        self.append(received(rid="ghost", at=RECEIVED_AT))
+        collector.tick()
+        self.assertIn("ghost", collector.reader.state["open"])
+
+        # Der Neustart. Das Banner kommt erst jetzt im Log an.
+        self.append(banner(RECEIVED_AT + 60.0))
+        collector.tick()
+        self.assertEqual(sorted(collector.reader.state["open"]), [])
+
+    def test_purge_keeps_rids_from_the_new_generation(self):
+        """Das Leeren darf nicht zu viel loeschen: ein rid, der nach dem Banner
+        empfangen wurde, gehoert zur laufenden Generation."""
+        collector = self.make()
+        self.append(received(rid="fresh", at=RECEIVED_AT + 5.0))
+        self.append(banner(RECEIVED_AT))
+        collector.tick()
+        self.assertEqual(sorted(collector.reader.state["open"]), ["fresh"])
+
+
+class TestHistoryErrorChannel(CollectorCase):
+    """N3 - der Fehlerkanal darf nicht im selben Tick übertönt werden.
+
+    `_compact_history` laeuft nach `_flush_finished` im selben Tick. Ein
+    erfolgreiches Compact setzt `_history_error` auf `None` - aber es hat den
+    fehlgeschlagenen Eintrag **nicht ersetzt**. Damit verstummt der Kanal
+    genau dann, wenn es ihn braucht.
+    """
+
+    def fail_then_succeed(self, collector):
+        """Ein `append`, der beim ersten Versuch scheitert."""
+        calls = []
+        real = collector.history.append
+
+        def flaky(entry):
+            calls.append(entry["rid"])
+            if len(calls) == 1:
+                raise OSError(28, "No space left on device")
+            return real(entry)
+
+        collector.history.append = flaky
+        return calls
+
+    def test_failed_append_is_not_silenced_by_a_successful_compact(self):
+        collector = self.make()
+        # compact() laeuft in diesem Tick und wird erfolgreich sein.
+        collector.compact_every_s = 0.0
+        with open(self.history_path, "w", encoding="utf-8") as handle:
+            handle.write('{"rid": "old", "ended_at": %r}\n' % (self.now - 10.0))
+        self.fail_then_succeed(collector)
+        self.append(finished(rid="lost"))
+        state = collector.tick()
+        self.assertIsNotNone(state["log"]["history_error"])
+        self.assertIn("No space left", state["log"]["history_error"])
+
+    def test_the_lost_entry_is_actually_missing(self):
+        """Der Fehler muss echt sein: der Eintrag darf nicht doch noch in der
+        Datei sein."""
+        collector = self.make()
+        collector.compact_every_s = 0.0
+        self.fail_then_succeed(collector)
+        self.append(finished(rid="lost"))
+        collector.tick()
+        self.assertNotIn("lost", [e["rid"] for e in self.history_lines()])
+
+    def test_mixed_tick_reports_the_error(self):
+        """Append A scheitert, Append B gelingt. Der Kanal meldet weiterhin
+        Fehler - im selben Tick erfolgreich geschrieben zu haben, heisst
+        nicht, dass nichts fehlgeschlagen ist."""
+        collector = self.make()
+        real = collector.history.append
+        seen = []
+
+        def flaky(entry):
+            seen.append(entry["rid"])
+            if len(seen) == 1:
+                raise OSError(28, "No space left on device")
+            return real(entry)
+
+        collector.history.append = flaky
+        self.append(finished(rid="lost"), finished(rid="kept"))
+        state = collector.tick()
+        self.assertIsNotNone(state["log"]["history_error"])
+        rids = [e["rid"] for e in self.history_lines()]
+        self.assertNotIn("lost", rids)
+        self.assertIn("kept", rids)
+
+    def test_the_channel_clears_only_when_a_later_tick_is_fully_clean(self):
+        collector = self.make()
+        collector.compact_every_s = 0.0
+        self.fail_then_succeed(collector)
+        self.append(finished(rid="lost"))
+        self.assertIsNotNone(collector.tick()["log"]["history_error"])
+        # Der naechste Tick schreibt wieder sauber.
+        state = collector.tick()
+        self.assertIsNone(state["log"]["history_error"])
+
+    def test_a_compact_failure_alone_still_reports(self):
+        """Umgekehrt: scheitert nur `compact`, muss der Kanal ebenfalls
+        antworten."""
+        import unittest.mock as mock
+        collector = self.make()
+        with mock.patch.object(collector.history, "compact",
+                               side_effect=OSError(13, "Permission denied")):
+            state = collector.tick()
+        self.assertIn("Permission denied", state["log"]["history_error"])
 
 
 class TestAfterTruncate(CollectorCase):

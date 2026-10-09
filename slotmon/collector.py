@@ -143,6 +143,12 @@ class Collector:
         self._recorded = None
         #: Letzter Schreibfehler der Historie, fuer den `log`-Teil des Zustands.
         self._history_error = None
+        #: Im laufenden Tick ist mindestens ein Schreibvorgang gescheitert.
+        #: Nur am **Ende** des Ticks, und nur wenn das Flag nicht gesetzt ist,
+        #: wird `_history_error` zurueckgesetzt. Ein erfolgreiches `compact`
+        #: allein raeumt nichts auf - es hat den verlorenen Eintrag nicht
+        #: ersetzt (N3).
+        self._write_failed = False
         #: Nach einer Log-Truncate ist der Blick auf die offenen rids zerstoert.
         #: Bis wieder etwas im Log steht, ist der Slot `unknown`, nicht `free`.
         self._blind = False
@@ -178,6 +184,11 @@ class Collector:
                 "state": "unknown", "rid": None, "system": None, "ip_port": None,
                 "started_at": None, "duration_s": None, "legacy": None,
                 "open_count": 0, "complete": False,
+                # `reason` existiert auch vor dem ersten Tick. `/api/state`
+                # liefert `state()`, und ein Client, der vor dem ersten Poll
+                # liest, darf keinen `KeyError` bekommen. Es gibt dann noch
+                # keinen Befund - also auch keinen Grund.
+                "reason": None,
             },
             "queue": {"waiting": None, "running": None},
             "speed": {"tok_per_s": None, "ctx_tokens": None,
@@ -357,6 +368,14 @@ class Collector:
             del self.finished[rid]
         return written
 
+    def _note_history_error(self, message, label):
+        """Fehler festhalten, mit Text, der **einmal** in der Logdatei landet."""
+        text = message
+        if text != self._last_rotate_error.get(label):
+            self._log(f"{label} {text}")
+            self._last_rotate_error[label] = text
+        self._history_error = message
+
     def _append(self, record):
         """Ein Historieneintrag, mit Fehlerkanal.
 
@@ -375,14 +394,10 @@ class Collector:
         try:
             self.history.append(record)
         except OSError as exc:
-            self._history_error = f"{type(exc).__name__}: {exc}"
-            self._log(f"history-write-error {self._history_error}")
+            self._write_failed = True
+            self._note_history_error(f"{type(exc).__name__}: {exc}",
+                                     "history-write-error")
             return False
-        if self._history_error is not None:
-            # Einmal gemeldet ist gemeldet: der Fehler war sichtbar, jetzt ist
-            # der Schreibpfag wieder in Ordnung. Ohne das bliebe die Meldung
-            # stehen, obwohl `append` laeuft.
-            self._history_error = None
         return True
 
     @staticmethod
@@ -421,7 +436,15 @@ class Collector:
         return self.max_req_input_len
 
     def _compact_history(self, now):
-        """Die Historie periodisch auf das Aufbewahrungsfenster kuerzen."""
+        """Die Historie periodisch auf das Aufbewahrungsfenster kuerzen.
+
+        Ein erfolgreiches `compact` setzt `_history_error` **nicht** auf `None`.
+        `compact` laeuft nach `_flush_finished` im selben Tick und laesst einen
+        fehlgeschlagenen `append` unberuehrt: es schreibt die Datei neu, aber
+        es hat den verlorenen Eintrag nicht ersetzt. Ein Kanal, der hier
+        aufgeräumt wird, verstummt genau dann, wenn es ihn braucht -
+        temporaeres `ENOSPC`, Remount, `chmod`-Race.
+        """
         if (self._last_compact is not None
                 and now - self._last_compact < self.compact_every_s):
             return
@@ -432,11 +455,10 @@ class Collector:
             # schreibgeschuetzter Datei, `IsADirectoryError` bei einem
             # Verzeichnis als Pfad. Der Fehler darf `tick()` nicht verlassen,
             # und er gehoert in denselben Kanal wie der Schreibfehler.
-            self._history_error = f"{type(exc).__name__}: {exc}"
-            self._log(f"history-compact-error {self._history_error}")
+            self._write_failed = True
+            self._note_history_error(f"compact: {type(exc).__name__}: {exc}",
+                                     "history-compact-error")
             return
-        if self._history_error is not None:
-            self._history_error = None
         self._last_compact = now
         # Mit der Datei mitwachsen: was `compact` weggeworfen hat, muss auch aus
         # dem Filter raus, sonst waechst er ohne Ende.
@@ -491,6 +513,9 @@ class Collector:
 
     def tick(self):
         now = self.now_fn()
+        # Am Anfang des Ticks, nicht am Ende: sonst wuerde ein Fehler, der in
+        # `_compact_history` entsteht, im selben Durchlauf wieder verschwinden.
+        self._write_failed = False
         load = self._source("read_load")
         metrics = self._source("read_metrics")
         gpu = self._source("read_gpu")
@@ -522,30 +547,38 @@ class Collector:
         if metrics.fresh:
             running = metrics.value.get("num_running_reqs")
 
-        # C2 - Geister-rids. `num_reqs` zaehlt laufende **und** wartende
-        # Request. Steht dort 0, kann der Scheduler keine Request kennen, und
-        # offene rids im Log sind dann zwingend einer frueheren Servergeneration
-        # zuzurechnen: nach einem Neustart bleiben die `request.received` ohne
-        # zugehoeriges `finished` stehen. Live gemessen waren das drei rids,
-        # der aelteste 39,7 Stunden alt, bei `num_reqs=0` - das Dashboard
-        # haette einen laufenden Request behauptet, den es nicht gibt.
+        # C2 - Geister-rids, **zweiter** und unabhaengiger Beleg.
         #
-        # Nur der Fall `num_reqs == 0` wird angefasst. Ein kleiner, aber nicht
-        # nuller Wert zaehlt schliesslich wartende Request mit und beweist
-        # nichts; und ist `num_reqs` unbekannt (Quelle tot), gilt ueberhaupt
-        # nichts. Der Fehler geht in die sichere Richtung: ein gerade
-        # eingetroffener Request, den der Scheduler noch nicht gezaehlt hat,
-        # liefert `unknown` statt einer erfundenen Laufzeit.
+        # Der erste Beleg ist die Generationsgrenze im Leser: ein rid, dessen
+        # `request.received` vor dem letzten Serverstart-Banner liegt, kommt
+        # dort gar nicht erst in `open` an. Der ist dauerhaft und von `num_reqs`
+        # unabhaengig.
+        #
+        # Dieser Wächter greift nur, wenn die Generationsgrenze **nichts** weiss,
+        # also wenn im Log noch kein Banner gesehen wurde. Sonst wuerde er das
+        # Falsche loeschen: ein Request, dessen `received` zwischen zwei
+        # `/get_load`-Abfragen eintrifft, ist genau dann schon im Log, aber noch
+        # nicht im Scheduler gezahlt (`num_reqs == 0`). Genau dieser Request
+        # verliert hier seine Startzeit - der rid kehrt im naechsten Tick als
+        # Halter zurueck, aber ohne `received_at`, und seine Historienzeile
+        # bekommt `duration_s = None` (N2).
+        #
+        # Steht `num_reqs == 0` und zugleich ein Banner im Log, ist der Widerspruch
+        # zugunsten des Requests aufgeloest: der Leser hat seine Herkunft geprueft.
+        # Ein kleiner, aber nicht nuller Wert zaehlt wartende Request mit und
+        # beweist ohnehin nichts; ist `num_reqs` unbekannt (Quelle tot), gilt
+        # ueberhaupt nichts - eine kaputte Quelle ist kein Beweis.
         num_reqs = load.value.get("num_reqs") if load.fresh else None
         ghosts = 0
         reason = None
-        if num_reqs == 0 and open_rids:
+        if (num_reqs == 0 and open_rids
+                and self.reader.generation_start is None):
             ghosts = len(open_rids)
             for rid in open_rids:
                 self.received_at.pop(rid, None)
             open_rids = {}
-            reason = (f"num_reqs=0, aber {ghosts} offene rid(s) im Log - "
-                      "sie gehoeren zu einer frueheren Servergeneration")
+            reason = (f"num_reqs=0, aber {ghosts} offene rid(s) im Log ohne "
+                      "Serverstart-Grenze - sie sind nicht belegbar")
 
         self._flush_finished(open_rids, now)
 
@@ -616,6 +649,15 @@ class Collector:
                     reason = BLIND_REASON
 
         self._compact_history(now)
+
+        # Der Kanal wird nur zurueckgesetzt, wenn in diesem Tick **kein**
+        # einziger Schreibvorgang gescheitert ist. `compact` laeuft vorher und
+        # darf den Kanal nicht uebertuenen: es hat den fehlgeschlagenen Eintrag
+        # nicht ersetzt (N3).
+        if not self._write_failed and self._history_error is not None:
+            self._history_error = None
+            self._last_rotate_error.pop("history-write-error", None)
+            self._last_rotate_error.pop("history-compact-error", None)
 
         state = self._empty_state()
         state["at"] = now
