@@ -750,5 +750,572 @@ class TestGuard(CollectorCase):
         self.assertNotIn("shutil", source)
 
 
+# ======================================================================
+# Fix-Runde 1
+# ======================================================================
+#
+# Die globale Randbedingung: **keine Quelle darf werfen, und `tick()` gibt
+# niemals eine Exception nach aussen.** Die Poll-Schleife stirbt sonst
+# still, waehrend `/api/state` weiter den letzten guten Tick ausliefert.
+
+
+def unreadable_history(self, kind="readonly"):
+    """history.jsonl so herrichten, dass `append`/`compact` scheitern.
+
+    `kind="dir"`: der Pfad ist ein Verzeichnis -> `IsADirectoryError`.
+    `kind="readonly"`: die Datei existiert, ist aber nicht beschreibbar ->
+    `PermissionError`. Ohne root (uid 1000) greift das chmod wirklich.
+    """
+    if os.path.exists(self.history_path):
+        os.unlink(self.history_path)
+    if kind == "dir":
+        os.mkdir(self.history_path)
+        return
+    with open(self.history_path, "w", encoding="utf-8"):
+        pass
+    os.chmod(self.history_path, 0o444)
+    self.addCleanup(os.chmod, self.history_path, 0o644)
+
+
+class TestTickNeverRaises(CollectorCase):
+    """C1 - kein Ausnahme-Pfad verlässt `tick()`."""
+
+    def test_history_append_permission_error_does_not_escape(self):
+        unreadable_history(self, "readonly")
+        collector = self.make()
+        self.append(received())
+        collector.tick()
+        self.append(finished(), access())
+        state = collector.tick()  # darf nicht werfen
+        self.assertEqual(state["slot"]["state"], "free")
+
+    def test_history_append_isdirerror_does_not_escape(self):
+        unreadable_history(self, "dir")
+        collector = self.make()
+        self.append(received())
+        collector.tick()
+        self.append(finished(), access())
+        state = collector.tick()
+        self.assertEqual(state["slot"]["state"], "free")
+
+    def test_history_compact_permission_error_does_not_escape(self):
+        unreadable_history(self, "readonly")
+        collector = self.make()
+        collector.compact_every_s = 0.0
+        state = collector.tick()  # compact() schlaegt hier fehl
+        self.assertEqual(state["slot"]["state"], "free")
+
+    def test_a_raising_source_does_not_escape(self):
+        """`sources` wirft per Konstruktion nicht - aber ein Bug in Task 5, ein
+        unerwarteter Fehlertyp aus `httpx` oder ein `KeyboardInterrupt-artiger
+        Ausreißer darf die Schleife nicht toeten. Der Fehler wird als Sample
+        gefuehrt, nicht verschluckt."""
+        collector = self.make()
+        for name in ("read_load", "read_metrics", "read_gpu", "read_server_info"):
+            def boom(**kwargs):
+                raise RuntimeError("Quelle explodiert")
+            setattr(collector.sources, name, boom)
+        state = collector.tick()
+        self.assertFalse(state["server"]["connected"])
+        self.assertEqual(state["queue"]["waiting"], None)
+
+    def test_history_error_is_visible_in_the_state(self):
+        """`/api/state` liefert `collector.state()`. Ein Schreibfehler, der nur
+        im Logfile landet, ist fuer den Leser des Dashboards unsichtbar -
+        und `/api/state` friert auf dem letzten guten Tick ein, wenn `tick()`
+        wirft. Also ein Kanal im Zustand."""
+        unreadable_history(self, "readonly")
+        collector = self.make()
+        self.append(received())
+        collector.tick()
+        self.append(finished(), access())
+        state = collector.tick()
+        self.assertIsNotNone(state["log"]["history_error"])
+        self.assertIn("PermissionError", state["log"]["history_error"])
+
+    def test_history_error_is_none_when_writing_works(self):
+        state = self.make().tick()
+        self.assertIsNone(state["log"]["history_error"])
+
+    def test_history_error_is_cleared_after_recovery(self):
+        """Ein einmaliger Fehler darf nicht ewig im Zustand stehen."""
+        unreadable_history(self, "readonly")
+        collector = self.make()
+        self.append(received())
+        collector.tick()
+        self.append(finished(), access())
+        self.assertIsNotNone(collector.tick()["log"]["history_error"])
+        os.chmod(self.history_path, 0o644)
+        self.assertIsNone(collector.tick()["log"]["history_error"])
+
+    def test_a_successful_write_clears_the_error_by_itself(self):
+        """Der Fehler muss auch **ohne** mitlaufenden `compact` verschwinden.
+
+        `compact` laeuft nur einmal pro Stunde. War es zum Zeitpunkt des
+        Schreibfehlers bereits erfolgreich, ist der Kanal danach eine Stunde
+        lang allein - und `/api/state` wuerde die reparierte Historie weiter
+        als fehlerhaft ausweisen. Der Erfolg des naechsten `append` raeumt ihn
+        selbst auf.
+
+        Ohne dieses `compact` laeuft der Test auch gruen, wenn die Aufraeumung
+        fehlt: der erste Fehlschlag setzt `_last_compact` nicht, also
+        wiederholt `compact` im Folgetick und loescht den Kanal.
+        """
+        unreadable_history(self, "readonly")
+        collector = self.make()
+        # `compact` hat in diesem Durchlauf bereits stattgefunden.
+        collector._last_compact = self.now - 10.0
+        collector._history_error = None
+        self.append(finished(rid="broken"))
+        self.assertIsNotNone(collector.tick()["log"]["history_error"])
+        os.chmod(self.history_path, 0o644)
+        self.append(finished(rid="repaired"))
+        state = collector.tick()
+        self.assertIsNone(state["log"]["history_error"])
+        self.assertIn("repaired", [e["rid"] for e in self.history_lines()])
+
+    def test_compact_clears_the_error_on_its_own(self):
+        """Umgekehrt: ein reparierter `compact`-Pfad raeumt den Kanal auf, auch
+        wenn gar nicht geschrieben wird."""
+        unreadable_history(self, "readonly")
+        collector = self.make()
+        self.assertIsNotNone(collector.tick()["log"]["history_error"])
+        os.chmod(self.history_path, 0o644)
+        self.assertIsNone(collector.tick()["log"]["history_error"])
+
+    def test_history_error_does_not_stop_the_rest_of_the_state(self):
+        """Der Schreibfehler darf nur den Schreibpfad betreffen. Die uebrigen
+        Kacheln - Server, GPU, Durchsatz, Historie - muessen weiterlaufen,
+        sonst sieht ein Schreibfehler aus wie ein Serverausfall."""
+        unreadable_history(self, "readonly")
+        collector = self.make()
+        self.append(received())
+        collector.tick()
+        self.append(finished(), access())
+        state = collector.tick()
+        self.assertTrue(state["server"]["connected"])
+        self.assertEqual(state["gpu"]["util"], 95)
+        self.assertEqual(state["speed"]["tok_per_s"], 49.0)
+        self.assertFalse(state["log"]["truncated"])
+        # Die Historie laesst sich weiter lesen - nur schreiben geht nicht.
+        self.assertIsInstance(state["history"], list)
+
+    def test_a_failed_write_is_not_counted_as_written(self):
+        """Wird der Eintrag als geschrieben gemerkt, obwohl `append` scheiterte,
+        geht er bei einem spaeteren `compact` verloren - der rid waere aus
+        `_recorded` gestrichen, aber nie in der Datei gelandet."""
+        unreadable_history(self, "readonly")
+        collector = self.make()
+        self.append(received())
+        collector.tick()
+        self.append(finished(), access())
+        collector.tick()
+        self.assertNotIn("aaa", collector._recorded)
+        os.chmod(self.history_path, 0o644)
+        self.append(finished(), access())
+        collector.tick()
+        self.assertIn("aaa", [e["rid"] for e in self.history_lines()])
+
+
+class TestGhostRids(CollectorCase):
+    """C2 - Geister-rids nach einem Server-Neustart.
+
+    Live reproduziert: `open_count=3`, `duration_s=142773` (39,7 h), während
+    `num_reqs=0`. Der Server kann keine Request kennen, also sind die rids einer
+    frueheren Servergeneration.
+    """
+
+    def GHOST_LOAD(self, **kwargs):
+        return self.sample({"num_reqs": 0, "num_waiting_reqs": 0})
+
+    def test_num_reqs_zero_drops_ghost_rids(self):
+        collector = self.make()
+        collector.sources.read_load = self.GHOST_LOAD
+        self.append(received(rid="aaa", at=RECEIVED_AT))
+        state = collector.tick()
+        self.assertEqual(state["slot"]["open_count"], 0)
+        self.assertIsNone(state["slot"]["rid"])
+        self.assertEqual(state["slot"]["state"], "unknown")
+        self.assertIsNotNone(state["slot"]["reason"])
+
+    def test_num_reqs_zero_is_unknown_not_free(self):
+        """`free` ist eine **positive** Behauptung. Hier ist der Zustand
+        unbestimmt, nicht leer."""
+        collector = self.make()
+        collector.sources.read_load = self.GHOST_LOAD
+        self.append(received(rid="aaa"))
+        state = collector.tick()
+        self.assertNotEqual(state["slot"]["state"], "free")
+
+    def test_reason_names_the_contradiction(self):
+        collector = self.make()
+        collector.sources.read_load = self.GHOST_LOAD
+        self.append(received(rid="aaa"))
+        reason = collector.tick()["slot"]["reason"]
+        self.assertIn("num_reqs", reason)
+
+    def test_num_reqs_one_keeps_the_holder(self):
+        """Der Fall, den der Brief ausdruecklich NICHT blind verwerfen will:
+        `num_reqs` zaehlt laufende *und* wartende. Ein laufender Request
+        erhaelt seinen Halter zurueck."""
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": 1, "num_waiting_reqs": 0})
+        self.append(received(rid="aaa"))
+        state = collector.tick()
+        self.assertEqual(state["slot"]["rid"], "aaa")
+        self.assertEqual(state["slot"]["state"], "busy")
+        self.assertIsNone(state["slot"]["reason"])
+
+    def test_ghosts_are_dropped_not_just_hidden(self):
+        """Die Geister muessen aus `received_at` raus, sonst tauchen sie beim
+        naechsten Abschluss wieder auf."""
+        collector = self.make()
+        collector.sources.read_load = self.GHOST_LOAD
+        self.append(received(rid="aaa"))
+        collector.tick()
+        self.assertNotIn("aaa", collector.received_at)
+
+    def test_unknown_load_does_not_drop_anything(self):
+        """Faellt /get_load aus, ist `num_reqs` unbekannt. Dann wird nichts
+        verworfen - eine kaputte Quelle ist kein Beweis fuer einen Geist."""
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: Sample(None, None, "down")
+        self.append(received(rid="aaa"))
+        state = collector.tick()
+        self.assertEqual(state["slot"]["open_count"], 1)
+        self.assertIsNone(state["slot"]["reason"])
+
+    def test_num_reqs_none_does_not_drop_anything(self):
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": None, "num_waiting_reqs": None})
+        self.append(received(rid="aaa"))
+        state = collector.tick()
+        self.assertEqual(state["slot"]["open_count"], 1)
+        self.assertIsNone(state["slot"]["reason"])
+
+    def test_reason_is_none_in_the_normal_case(self):
+        state = self.make().tick()
+        self.assertIsNone(state["slot"]["reason"])
+
+
+class TestAfterTruncate(CollectorCase):
+    """I3 - nach einer Truncate ist der Slot `unknown`, nicht `free`.
+
+    `reader.reset()` leert das `open`-Dict, der naechste Tick bewertet gegen
+    ein leeres Dict und meldet `free` - waehrend `/metrics` direkt daneben
+    `num_running_reqs=1` und die GPU 100 % sagt.
+    """
+
+    def truncating_cfg(self):
+        from slotmon.config import load_config as lc
+        return lc({
+            "SERVER_LOG": self.log,
+            "MONITOR_LOG": self.monitor_log,
+            "HISTORY": self.history_path,
+            "MAX_LOG_MB": "1",
+        })
+
+    def test_slot_is_unknown_after_a_truncate(self):
+        collector = self.make(cfg=self.truncating_cfg())
+        filler = "noise " * 100 + "\n"
+        with open(self.log, "a", encoding="utf-8") as handle:
+            for _ in range(2100):
+                handle.write(filler)
+        first = self.stderr_of(collector.tick)
+        self.assertTrue(collector.state()["log"]["truncated"], first)
+        second = collector.tick()
+        self.assertEqual(second["slot"]["state"], "unknown")
+
+    def test_reason_names_the_truncate(self):
+        collector = self.make(cfg=self.truncating_cfg())
+        filler = "noise " * 100 + "\n"
+        with open(self.log, "a", encoding="utf-8") as handle:
+            for _ in range(2100):
+                handle.write(filler)
+        self.stderr_of(collector.tick)
+        reason = collector.tick()["slot"]["reason"]
+        self.assertIsNotNone(reason)
+        self.assertIn("truncat", reason.lower())
+
+    def test_running_metrics_do_not_make_it_free(self):
+        """Der widerspruechliche Befund aus dem Brief: `queue.running=1` und
+        `gpu.util=100`, trotzdem `free`."""
+        collector = self.make(cfg=self.truncating_cfg())
+        filler = "noise " * 100 + "\n"
+        with open(self.log, "a", encoding="utf-8") as handle:
+            for _ in range(2100):
+                handle.write(filler)
+        self.stderr_of(collector.tick)
+        state = collector.tick()
+        self.assertEqual(state["slot"]["state"], "unknown")
+        self.assertEqual(state["queue"]["running"], 1)
+        self.assertEqual(state["gpu"]["util"], 95)
+
+    def test_unknown_clears_on_the_next_request(self):
+        collector = self.make(cfg=self.truncating_cfg())
+        filler = "noise " * 100 + "\n"
+        with open(self.log, "a", encoding="utf-8") as handle:
+            for _ in range(2100):
+                handle.write(filler)
+        self.stderr_of(collector.tick)
+        collector.tick()
+        self.append(received(rid="new"))
+        state = collector.tick()
+        self.assertEqual(state["slot"]["rid"], "new")
+        self.assertEqual(state["slot"]["state"], "busy")
+        self.assertIsNone(state["slot"]["reason"])
+
+    def test_a_tick_without_truncate_is_unaffected(self):
+        state = self.make().tick()
+        self.assertEqual(state["slot"]["state"], "free")
+        self.assertIsNone(state["slot"]["reason"])
+
+    def truncating_idle_collector(self):
+        """Ein Log, das die Schwelle reisst, **während nichts laeuft**.
+
+        Das ist der Alltagsfall: der Log waechst allein durch die
+        `/metrics`-Access-Zeilen, der Slot ist frei. Der Tick, der kuerzt,
+        bewertet gegen ein leeres `open`-Dict und haette `free` gemeldet - eine
+        positive Behauptung ueber einen Zustand, den der Monitor nicht mehr
+        sehen kann.
+        """
+        cfg = self.truncating_cfg()
+        collector = self.make(cfg=cfg)
+        filler = "noise " * 100 + "\n"
+        with open(self.log, "a", encoding="utf-8") as handle:
+            for _ in range(2100):
+                handle.write(filler)
+        self.stderr_of(collector.tick)
+        self.assertTrue(collector.state()["log"]["truncated"])
+        return collector
+
+    def test_truncating_tick_of_an_idle_slot_is_not_free(self):
+        """Ohne diese Pruefung meldet der kuerzende Tick `free`, weil er gegen
+        das leere `open`-Dict bewertet, das die Truncate gerade abgeraeumt hat.
+        Genau das war der Befund im Brief."""
+        collector = self.truncating_idle_collector()
+        state = collector.state()
+        self.assertEqual(state["slot"]["state"], "unknown")
+
+    def test_blind_flag_is_cleared_after_the_request_ends(self):
+        """`self._blind = False` muss observable sein.
+
+        Bleibt das Flag dauerhaft gesetzt, ist **jeder** spaetere Tick mit
+        leerem `open`-Dict `unknown` - der Slot meldet nie wieder `free`, auch
+        nicht, nachdem der frische Request sauber beendet wurde. Das ist kein
+        konservatives Verhalten, sondern ein Zustand, der sich nicht mehr
+        erholt.
+        """
+        collector = self.truncating_idle_collector()
+        self.append(received(rid="aaa"))
+        busy = collector.tick()
+        self.assertEqual(busy["slot"]["state"], "busy")
+        self.append(finished(rid="aaa"), access())
+        idle = collector.tick()
+        self.assertEqual(idle["slot"]["open_count"], 0)
+        self.assertEqual(idle["slot"]["state"], "free")
+        self.assertIsNone(idle["slot"]["reason"])
+
+    def test_flag_cleared_only_when_something_is_in_the_log(self):
+        """Leerer Log ist kein Grund, den Blick zurueckzugeben: solange nichts
+        im Log steht, bleibt die Aussage `unknown`."""
+        collector = self.truncating_idle_collector()
+        state = collector.tick()
+        self.assertEqual(state["slot"]["state"], "unknown")
+
+
+class TestRetentionBeforeAppend(CollectorCase):
+    """I4 - `finished`-Events vor dem `append` gegen das Fenster filtern."""
+
+    def old_finished(self, rid="old"):
+        return finished(rid=rid, at=self.now - 2 * 24 * 3600)
+
+    def counting(self, collector):
+        """Zaehlt die `append`-Aufrufe.
+
+        Der blosse Dateiinhalt beweist I4 nicht: `compact()` verwirft
+        Altbestand sowieso, die Datei ist also auch ohne Vorfilter am Ende
+        korrekt und leer. Der Unterschied ist die **Arbeit** - 1 849 Appends und
+        6,9 s bei einem 74 000-Events-Log. Genau die zaehlt dieses Fixture.
+        """
+        calls = []
+        real = collector.history.append
+        collector.history.append = lambda entry: (calls.append(entry["rid"]),
+                                                 real(entry))[1]
+        return calls
+
+    def test_stale_finished_is_not_appended(self):
+        collector = self.make()
+        calls = self.counting(collector)
+        self.append(self.old_finished())
+        state = collector.tick()
+        self.assertEqual(calls, [])
+        self.assertEqual(state["history"], [])
+        self.assertEqual(self.history_lines(), [])
+
+    def test_fresh_finished_is_still_appended(self):
+        collector = self.make()
+        calls = self.counting(collector)
+        self.append(finished(rid="fresh"))
+        collector.tick()
+        self.assertEqual(calls, ["fresh"])
+        self.assertEqual(len(self.history_lines()), 1)
+
+    def test_the_window_edge_is_inclusive(self):
+        """Genau am Fensterrand wird noch behalten - `History._fresh` benutzt
+        `<=`, und der Vorfilter muss das gleiche tun, sonst verschwindet ein
+        Eintrag genau in dem Tick, in dem er faellig wird."""
+        collector = self.make()
+        calls = self.counting(collector)
+        self.append(finished(rid="edge", at=self.now - 24 * 3600))
+        collector.tick()
+        self.assertEqual(calls, ["edge"])
+
+    def test_one_second_past_the_edge_is_dropped(self):
+        collector = self.make()
+        calls = self.counting(collector)
+        self.append(finished(rid="edge", at=self.now - 24 * 3600 - 1))
+        collector.tick()
+        self.assertEqual(calls, [])
+
+    def test_filter_survives_a_missing_ended_at(self):
+        """`ended_at` ist `LogEvent.at` und damit immer eine Zahl - der Reader
+        faellt auf `time.time()` zurueck, wenn der Timestamp unlesbar ist. Der
+        Vorfilter darf darauf trotzdem nicht mit einem Vergleich auf `None`
+        antworten, sondern haelt den Eintrag: wegwerfen ist die Entscheidung,
+        die ein Fehler falsch trifft.
+        """
+        collector = self.make()
+        calls = self.counting(collector)
+        collector.finished["nostamp"] = {"rid": "nostamp", "ip_port": None,
+                                         "started_at": None, "ended_at": None}
+        collector.tick()
+        self.assertEqual(calls, ["nostamp"])
+
+    def test_the_write_happens_once_not_twice(self):
+        """Ohne Vorfilter wird der Altbestand angehaengt und im selben Tick von
+        `compact()` wieder verworfen - zwei Schreibvorgaenge fuer nichts."""
+        collector = self.make()
+        collector.compact_every_s = 0.0
+        calls = self.counting(collector)
+        for index in range(20):
+            self.append(finished(rid=f"old{index}", at=self.now - 2 * 24 * 3600))
+        state = collector.tick()
+        self.assertEqual(calls, [])
+        self.assertEqual(state["history"], [])
+        self.assertEqual(self.history_lines(), [])
+
+
+class TestNonStringRid(CollectorCase):
+    """I5 - `is_reserved()` stuerzt auf einer Nicht-String-rid ab.
+
+    `logreader._collect` akzeptiert jede truthy rid; `"rid": 12345` oder eine
+    Liste fuehren dann zu `AttributeError` bzw. `TypeError: unhashable type`,
+    und beides verlaesst `tick()`.
+    """
+
+    def test_is_reserved_rejects_non_strings(self):
+        from slotmon.collector import is_reserved
+        for bad in (12345, 1.5, ["a"], {"a": 1}, None, True, object()):
+            with self.subTest(rid=bad):
+                self.assertIs(is_reserved(bad), False)
+
+    def test_is_reserved_still_matches_the_real_prefix(self):
+        """Der reservierte rid traegt im echten Log einen Suffix:
+        `HEALTH_CHECK_1791471536.2288644`. Der Praefix-Filter bleibt."""
+        from slotmon.collector import is_reserved
+        self.assertIs(is_reserved("HEALTH_CHECK_1791471536.2288644"), True)
+        self.assertIs(is_reserved("HEALTH_CHECK"), True)
+        self.assertIs(is_reserved("aaa"), False)
+
+    def _log_with_rid(self, raw_rid):
+        line = ('{"timestamp": "2026-10-07T17:19:07.000000", '
+                '"event": "request.received", "rid": %s, "obj": {"rid": %s}}'
+                % (raw_rid, raw_rid))
+        self.append(line)
+        return self.make()
+
+    def test_numeric_rid_does_not_escape_tick(self):
+        for raw in ("12345", "1.5"):
+            with self.subTest(rid=raw):
+                self.setUp()
+                collector = self._log_with_rid(raw)
+                state = collector.tick()
+                self.assertIsInstance(state["slot"]["open_count"], int)
+
+    def test_unhashable_rid_does_not_escape_tick(self):
+        for raw in ('["a"]', '{"a": 1}'):
+            with self.subTest(rid=raw):
+                self.setUp()
+                collector = self._log_with_rid(raw)
+                state = collector.tick()
+                self.assertIsInstance(state["slot"]["open_count"], int)
+
+    def test_null_rid_does_not_escape_tick(self):
+        collector = self._log_with_rid("null")
+        state = collector.tick()
+        self.assertIsInstance(state["slot"]["open_count"], int)
+
+    def test_a_malformed_rid_never_becomes_the_holder(self):
+        """Ein rid, der keine Zeichenkette ist, kann kein Slot-Halter sein."""
+        collector = self._log_with_rid("12345")
+        state = collector.tick()
+        self.assertIsNone(state["slot"]["rid"])
+
+    def test_a_malformed_rid_never_enters_received_at(self):
+        """Der Wächter sitzt an **beiden** Schranken, und jede braucht ihren
+        eigenen Beleg.
+
+        Der `open_rids`-Filter allein lässt einen numerischen rid in
+        `received_at` landen - als Integer-Schlüssel. Kein Absturz, aber ein
+        Zustand, in dem eine Nicht-Zeichenkette als rid gefuehrt wird und bei
+        einem spaeteren `request.finished` als Schluessel wieder auftaucht
+        (`finished[12345]`, JSON-Schluessel `"12345"`).
+        """
+        collector = self._log_with_rid("12345")
+        collector.tick()
+        self.assertEqual(collector.received_at, {})
+
+    def test_a_malformed_rid_never_enters_finished(self):
+        """Dieselbe Schranke fuer den Abschluss: ein Integer-rid im
+        `finished`-Dict wuerde als JSON-Schluessel `"12345"` in die Historie
+        geschrieben, und `json.dumps` sortiert gemischte Schluesseltypen
+        nicht mehr."""
+        collector = self.make()
+        self.append(received(rid="aaa"))
+        collector.tick()
+        line = ('{"timestamp": "2026-10-07T17:19:24.000000", '
+                '"event": "request.finished", "rid": 12345, '
+                '"obj": {"rid": 12345}, "out": {"meta_info": {"id": "x", '
+                '"prompt_tokens": 1, "completion_tokens": 2, '
+                '"cached_tokens": 0}}}')
+        self.append(line)
+        collector.tick()
+        self.assertNotIn(12345, collector.finished)
+        for entry in self.history_lines():
+            self.assertIsInstance(entry["rid"], str)
+
+
+class TestClosedFlagRemoved(CollectorCase):
+    """M6 - `_closed` wurde geschrieben und nie gelesen."""
+
+    def test_no_closed_attribute_exists(self):
+        collector = self.make()
+        self.assertFalse(hasattr(collector, "_closed"))
+
+    def test_close_still_returns_none_and_is_repeatable(self):
+        collector = self.make()
+        self.assertIsNone(collector.close())
+        self.assertIsNone(collector.close())
+
+    def test_state_after_close_is_still_readable(self):
+        collector = self.make()
+        collector.tick()
+        collector.close()
+        self.assertIn("slot", collector.state())
+
+
 if __name__ == "__main__":
     unittest.main()

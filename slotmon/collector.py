@@ -68,6 +68,12 @@ BATCH_TAIL_BYTES = 16384
 #: einem frueheren Betrieb nicht unbegrenzt weiterwaechst.
 COMPACT_EVERY_S = 3600.0
 
+#: Begruendung fuer `slot.state == "unknown"` nach einer Log-Truncate. Der Wort
+#: Teil `truncated` ist derselbe wie in der Protokollzeile, damit der Operator
+#: die Begruendung im Dashboard mit der Zeile im Log zusammenfuehren kann.
+BLIND_REASON = ("log-truncated: die offenen rid(s) sind nicht mehr beobachtbar, "
+                "bis wieder ein request.received im Log steht")
+
 #: `#full token: 41997` aus `Decode batch, ...`. Nicht `full token usage` - der
 #: Ausdruck verlangt das Doppelpunkt direkt hinter "token".
 BATCH_TOKENS = re.compile(r"#full token:\s*(\d+)")
@@ -92,8 +98,22 @@ def host_of(ip_port):
 
 
 def is_reserved(rid):
-    """Eigenverkehr des Servers, kein Nutzer-Request."""
+    """Eigenverkehr des Servers, kein Nutzer-Request.
+
+    Der Typ wird zuerst geprueft, weil `logreader._collect` jede truthy rid
+    akzeptiert: `"rid": 12345` ergibt `AttributeError`, eine Liste ergibt
+    zusaetzlich `TypeError: unhashable type`, wenn sie als Dict-Schluessel in
+    `received_at` landet. Beides verlaesst `tick()`. Ein rid, der keine
+    Zeichenkette ist, kann kein Health-Check und kein Slot-Halter sein.
+    """
+    if not isinstance(rid, str):
+        return False
     return any(rid.startswith(prefix) for prefix in RESERVED_RID_PREFIXES)
+
+
+def usable_rid(rid):
+    """Nur eine nichtleere Zeichenkette ist als Dict-Schluessel brauchbar."""
+    return isinstance(rid, str) and bool(rid)
 
 
 class Collector:
@@ -121,16 +141,22 @@ class Collector:
         self._last_rotate_error = {}
         #: rids aus history.jsonl, damit ein Neustart sie nicht doppelt schreibt.
         self._recorded = None
-        self._closed = False
+        #: Letzter Schreibfehler der Historie, fuer den `log`-Teil des Zustands.
+        self._history_error = None
+        #: Nach einer Log-Truncate ist der Blick auf die offenen rids zerstoert.
+        #: Bis wieder etwas im Log steht, ist der Slot `unknown`, nicht `free`.
+        self._blind = False
         self._state = self._empty_state()
 
     def close(self):
         """Der Reader laeuft in keinem Thread - es gibt nichts zu stoppen.
 
         Der Aufrufer ruft das deterministisch am Ende (Test-`addCleanup`,
-        Serve-Shutdown); danach wird nur noch `state()` benutzt.
+        Serve-Shutdown); danach wird nur noch `state()` benutzt. Ein Flag
+        `_closed` waere hier toter Code: `logreader` hat weder Thread noch
+        Queue noch async, und `tick()` darf nach `close()` weiterlaufen
+        duerfen, damit ein Test-`addCleanup` keinen späten Fehler einwirft.
         """
-        self._closed = True
         return None
 
     def state(self):
@@ -158,7 +184,8 @@ class Collector:
                       "max_req_input_len": self.max_req_input_len,
                       "output_pct": None},
             "gpu": {"util": None, "used_mb": None, "total_mb": None},
-            "log": {"size_mb": None, "warn": False, "truncated": False},
+            "log": {"size_mb": None, "warn": False, "truncated": False,
+                    "history_error": None},
             "history": [],
         }
 
@@ -216,7 +243,23 @@ class Collector:
 
     def _drain_events(self):
         """Log-Events des Polls in `received_at` und `finished` ueberfuehren."""
-        for event in self.reader.poll():
+        try:
+            events = self.reader.poll()
+        except Exception as exc:  # noqa: BLE001 - siehe Docstring
+            # Der Reader ist eine Fremdeinheit, und eine kaputte Logzeile kann
+            # ihn mitnehmen: `_apply` legt jede truthy rid in ein Set, und
+            # `"rid": ["a"]` scheitert dort mit `TypeError: unhashable type`,
+            # noch bevor der Collector die Zeile sehen kann. Der Aufruf von
+            # `tick()` darf daran nicht hängen bleiben.
+            self._log(f"log-read-error {type(exc).__name__}: {exc}")
+            return
+        for event in events:
+            if not usable_rid(event.rid):
+                # `"rid": 12345`, `["a"]`, `{"a": 1}` - der Reader laesst jede
+                # truthy rid durch, und beide scheitern als Dict-Schluessel
+                # (`unhashable type`) bzw. schon in `is_reserved`. Solche rids
+                # koennen weder Halter sein noch einen Schluessel liefern.
+                continue
             if is_reserved(event.rid):
                 continue
             if event.kind == RECEIVED:
@@ -256,6 +299,27 @@ class Collector:
                               for entry in self.history.load(now)}
         return self._recorded
 
+    def _retained(self, entry, now):
+        """Liegt der Abschluss noch im Aufbewahrungsfenster?
+
+        Ein neu startender Collector liest das Log ab Offset 0 und sieht daher
+        **jedes** `request.finished`, auch die von vor dem letzten Start. Ohne
+        diesen Vorfilter haengt er den gesamten Altbestand an - bei
+        `MAX_LOG_MB=1024` gemessen 27 735 Appends und 1,4 s, bei einem
+        dreifach groesseren Log 73 960 Appends und 6,9 s - und `compact()`
+        verwirft die Arbeit im selben Tick wieder. Die Datei endet richtig, die
+        Arbeit war nur umsonst.
+
+        Ein `ended_at`, das keine Zahl ist, wird **behalten**: `History._fresh`
+        wuerde ihn verwerfen, aber ein fehlender Zeitstempel ist kein Alter von
+        ueber 24 Stunden, sondern ein Loch in der Angabe. Wegwerfen ist die
+        Entscheidung, die ein Fehler falsch trifft.
+        """
+        ended = entry.get("ended_at")
+        if not isinstance(ended, (int, float)):
+            return True
+        return (now - ended) <= self.history.retention_s
+
     def _flush_finished(self, open_rids, now):
         """Abgeschlossene Requests in die Historie schreiben.
 
@@ -272,17 +336,54 @@ class Collector:
                 self.received_at.pop(rid, None)
                 del self.finished[rid]
                 continue
+            if not self._retained(entry, now):
+                # Ausserhalb des Fensters: nicht schreiben. `recorded` bleibt
+                # unberuehrt - der rid ist nie in der Datei gelandet, und wenn
+                # das Fenster sich verschiebt, soll er nicht als "geschrieben"
+                # gelten.
+                self.received_at.pop(rid, None)
+                del self.finished[rid]
+                continue
             record = dict(entry)
             started = record.get("started_at")
             ended = record.get("ended_at")
             record["duration_s"] = self._duration(started, ended, now)
             record["system"] = resolve(self.names, host_of(record.get("ip_port")))
-            self.history.append(record)
-            written.append(record)
-            recorded.add(rid)
+            self._append(record)
+            if self._history_error is None:
+                written.append(record)
+                recorded.add(rid)
             self.received_at.pop(rid, None)
             del self.finished[rid]
         return written
+
+    def _append(self, record):
+        """Ein Historieneintrag, mit Fehlerkanal.
+
+        `History.append` wirft `PermissionError` bei nicht beschreibbarer Datei
+        und `IsADirectoryError`, wenn der Pfad ein Verzeichnis ist. Beides
+        verlaesst `tick()` und damit die Poll-Schleife. Der Fehler wandert in
+        `log.history_error`, damit `/api/state` ihn ausliefert - ein Fehler,
+        der nur in der Logdatei steht, ist fuer den Leser des Dashboards
+        unsichtbar, und `/api/state` friert auf dem letzten guten Tick ein,
+        waehrend `/api/stream` Fehlerrahmen schickt.
+
+        Wird der Eintrag nicht als geschrieben gemerkt, kann er nach einer
+        Reparatur der Datei noch geschrieben werden; das ist der Grund, warum
+        `recorded.add` hinter dem Aufruf steht.
+        """
+        try:
+            self.history.append(record)
+        except OSError as exc:
+            self._history_error = f"{type(exc).__name__}: {exc}"
+            self._log(f"history-write-error {self._history_error}")
+            return False
+        if self._history_error is not None:
+            # Einmal gemeldet ist gemeldet: der Fehler war sichtbar, jetzt ist
+            # der Schreibpfag wieder in Ordnung. Ohne das bliebe die Meldung
+            # stehen, obwohl `append` laeuft.
+            self._history_error = None
+        return True
 
     @staticmethod
     def _duration(started, ended, now):
@@ -312,7 +413,7 @@ class Collector:
         """
         if self.max_req_input_len is not None:
             return self.max_req_input_len
-        info = self.sources.read_server_info()
+        info = self._source("read_server_info")
         if info.fresh:
             value = info.value.get("max_req_input_len")
             if value:
@@ -324,7 +425,18 @@ class Collector:
         if (self._last_compact is not None
                 and now - self._last_compact < self.compact_every_s):
             return
-        self.history.compact(now)
+        try:
+            self.history.compact(now)
+        except OSError as exc:
+            # `compact` schreibt die Datei neu: `PermissionError` bei
+            # schreibgeschuetzter Datei, `IsADirectoryError` bei einem
+            # Verzeichnis als Pfad. Der Fehler darf `tick()` nicht verlassen,
+            # und er gehoert in denselben Kanal wie der Schreibfehler.
+            self._history_error = f"{type(exc).__name__}: {exc}"
+            self._log(f"history-compact-error {self._history_error}")
+            return
+        if self._history_error is not None:
+            self._history_error = None
         self._last_compact = now
         # Mit der Datei mitwachsen: was `compact` weggeworfen hat, muss auch aus
         # dem Filter raus, sonst waechst er ohne Ende.
@@ -355,14 +467,33 @@ class Collector:
         self._last_rotate_error[name] = rotate.error
         return rotate
 
+    def _source(self, name, **kwargs):
+        """Eine Quelle lesen, ohne dass sie `tick()` killen kann.
+
+        `ServerSources` wirft per Konstruktion nicht - jede Methode gibt ein
+        `Sample` mit `error` zurueck. Das ist die Zusage von Task 5, keine
+        Tatsache ueber die Laufzeit: ein Tippfehler in `API`, ein
+        `KeyboardInterrupt`, ein `SystemExit` aus einer
+        KeyboardInterrupt-Kette, ein Bug in einer spaeteren Quelle. Die
+        Randbedingung lautet "kein Fehler darf als Signal erscheinen", also
+        faengt dieser Aufruf alles ab und fuehrt es als `Sample` mit `error`
+        weiter - derselbe Kanal, den `sources` selbst benutzt. So ist die
+        Störung im Zustand sichtbar statt nur im Log.
+        """
+        from slotmon.sources import Sample
+        try:
+            return getattr(self.sources, name)(**kwargs)
+        except Exception as exc:  # noqa: BLE001 - siehe Docstring
+            return Sample(None, None, f"{type(exc).__name__}: {exc}")
+
     # ------------------------------------------------------------------
     # Takt
 
     def tick(self):
         now = self.now_fn()
-        load = self.sources.read_load()
-        metrics = self.sources.read_metrics()
-        gpu = self.sources.read_gpu()
+        load = self._source("read_load")
+        metrics = self._source("read_metrics")
+        gpu = self._source("read_gpu")
         max_req_input_len = self._max_req_input_len()
 
         self._drain_events()
@@ -370,8 +501,7 @@ class Collector:
         # **bevor** `evaluate()` sie sieht - sonst wuerde der Health-Check des
         # Servers den Slot als dauerhaft belegt ausweisen.
         open_rids = {rid: since for rid, since in self.reader.state["open"].items()
-                     if not is_reserved(rid)}
-        self._flush_finished(open_rids, now)
+                     if usable_rid(rid) and not is_reserved(rid)}
 
         # `num_waiting_reqs` aus /get_load ist die einzige belastbare
         # Queue-Zahl (Spec). Faellt /get_load aus, ist `waiting` unbekannt und
@@ -392,6 +522,33 @@ class Collector:
         if metrics.fresh:
             running = metrics.value.get("num_running_reqs")
 
+        # C2 - Geister-rids. `num_reqs` zaehlt laufende **und** wartende
+        # Request. Steht dort 0, kann der Scheduler keine Request kennen, und
+        # offene rids im Log sind dann zwingend einer frueheren Servergeneration
+        # zuzurechnen: nach einem Neustart bleiben die `request.received` ohne
+        # zugehoeriges `finished` stehen. Live gemessen waren das drei rids,
+        # der aelteste 39,7 Stunden alt, bei `num_reqs=0` - das Dashboard
+        # haette einen laufenden Request behauptet, den es nicht gibt.
+        #
+        # Nur der Fall `num_reqs == 0` wird angefasst. Ein kleiner, aber nicht
+        # nuller Wert zaehlt schliesslich wartende Request mit und beweist
+        # nichts; und ist `num_reqs` unbekannt (Quelle tot), gilt ueberhaupt
+        # nichts. Der Fehler geht in die sichere Richtung: ein gerade
+        # eingetroffener Request, den der Scheduler noch nicht gezaehlt hat,
+        # liefert `unknown` statt einer erfundenen Laufzeit.
+        num_reqs = load.value.get("num_reqs") if load.fresh else None
+        ghosts = 0
+        reason = None
+        if num_reqs == 0 and open_rids:
+            ghosts = len(open_rids)
+            for rid in open_rids:
+                self.received_at.pop(rid, None)
+            open_rids = {}
+            reason = (f"num_reqs=0, aber {ghosts} offene rid(s) im Log - "
+                      "sie gehoeren zu einer frueheren Servergeneration")
+
+        self._flush_finished(open_rids, now)
+
         slot_state = evaluate(open_rids, waiting)
 
         started_at = None
@@ -402,6 +559,13 @@ class Collector:
 
         if slot_state.holder_rid and slot_state.complete:
             label = "busy"
+        elif ghosts:
+            # Die offenen rids wurden als Geister verworfen. `evaluate()` sieht
+            # jetzt ein leeres Dict und wuerde `free` melden - das waere eine
+            # **positive** Behauptung aus einem Widerspruch heraus: der
+            # Scheduler kennt null Request, das Log nennt welche. Der Zustand
+            # ist unbestimmt, nicht leer.
+            label = "unknown"
         elif slot_state.complete and not open_rids and waiting == 0:
             # `waiting == 0` ist durch `complete` bei leerem `open_rids` bereits
             # impliziert (legacy = waiting - 0). Es steht trotzdem da: die drei
@@ -424,11 +588,32 @@ class Collector:
 
         rotate = self._rotate("server_log", self.rotator)
         self._rotate("monitor_log", self.monitor_rotator)
-        if rotate.truncated:
+        truncated = rotate.truncated
+        if truncated:
             # Die Datei ist leer; der Reader beginnt dort von vorn. Die
             # `received_at` bleiben stehen: ihre Unix-Zeiten sind gueltig,
             # unabhaengig davon, dass die Zeile im Log nicht mehr existiert.
             self.reader.reset()
+            # I3 - der naechste Tick bewertet gegen ein leeres `open`-Dict und
+            # wuerde `free` melden. Das ist eine **positive** Behauptung ueber
+            # einen Zustand, den der Monitor nicht mehr sehen kann: die
+            # `request.received`-Zeilen des laufenden Requests sind mit der
+            # Datei verschwunden. `/metrics` und die GPU koennen direkt
+            # daneben `num_running_reqs=1` und 100 % Auslastung sagen. Also
+            # `unknown`, bis wieder etwas im Log steht.
+            self._blind = True
+            # Der Zustand oben wurde noch gegen das gefuellte `open`-Dict
+            # bewertet, das die Truncate gerade abgeraeumt hat.
+            label = "unknown" if label == "free" else label
+            reason = BLIND_REASON
+        elif self._blind:
+            if open_rids:
+                # Wieder etwas im Log gesehen - der Blick ist zurueck.
+                self._blind = False
+            else:
+                label = "unknown"
+                if reason is None:
+                    reason = BLIND_REASON
 
         self._compact_history(now)
 
@@ -450,6 +635,7 @@ class Collector:
             "legacy": slot_state.legacy,
             "open_count": slot_state.open_count,
             "complete": slot_state.complete,
+            "reason": reason,
         }
         state["queue"] = {"waiting": waiting, "running": running}
         state["speed"] = {
@@ -465,9 +651,13 @@ class Collector:
                 "total_mb": gpu.value.get("total_mb"),
             }
         # `size_mb` wird durchgereicht, auch wenn es None ist: None heisst
-        # "nicht gemessen", nicht 0.
+        # "nicht gemessen", nicht 0. `history_error` ist der Kanal, ueber den
+        # ein fehlgeschlagener Historie-Schreibvorgang auf `/api/state`
+        # landet - sonst faellt er nur im Logfile auf und `/api/state` friert
+        # bei einer Exception in `tick()` auf dem letzten guten Tick ein.
         state["log"] = {
-            "size_mb": rotate.size_mb, "warn": rotate.warn, "truncated": rotate.truncated
+            "size_mb": rotate.size_mb, "warn": rotate.warn,
+            "truncated": truncated, "history_error": self._history_error,
         }
         state["history"] = self.history.load(now)
 
