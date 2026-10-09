@@ -1375,7 +1375,10 @@ git commit -m "feat: JSONL-Historie mit Zeitfenster"
 - Produces: `slotmon.logrotate.LogRotator(max_mb: int = 1024, warn_mb: int = 900, every: int = 60)` mit:
   - `check(path: str) -> RotateResult` — `RotateResult` ist ein Dataclass mit `size_mb: float | None`, `truncated: bool`, `warn: bool`, `error: str | None`
   - Zähler intern: `check` gibt bei jedem 60. Aufruf `stat` zurück. Das `every` wird über einen internen Zähler gesteuert und `force=True` erzwingt eine Prüfung
-- Produces: `slotmon.logrotate.should_check(path, every, counter) -> bool` — Hilfsfunktion für den Collector
+  - `check(path)` ist die **einzige** Taktungsautorität. Der Collector ruft sie **jeden Poll**; sie self-gated intern und kostet in den übersprungenen Ticks **null** Syscalls. Es gibt **keine** zweite Taktungsfunktion und keinen vom Aufrufer gepflegten Zähler.
+  - `is_allowed(path: str) -> bool` — Basename `^(escha_server.*\.log|slotmon\.log)$` **und** `realpath` unter `/tmp`
+  - `every` bleibt **60** (`60 × poll_interval 2.0 s` = exakt 2 Minuten). Nicht aus `poll_interval` ableiten — das ergäbe 120 und verdoppelte das Intervall.
+  - **`size_mb` ist `None` auf einem übersprungenen Tick.** Das ist „nicht gemessen", nicht „Größe 0".
 
 **Der entscheidende Test** ist der letzte: eine offene Datei, `truncate`, weiter schreiben, Inhalt muss da sein.
 
