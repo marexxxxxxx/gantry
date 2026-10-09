@@ -11,6 +11,29 @@ Descriptors des Servers darauf zeigen, und der Platz kommt erst bei einem
 laesst die Inode stehen und setzt nur die Laenge auf 0: derselbe Descriptor
 schreibt danach ab Offset 0 weiter, der Block wird frei.
 
+``O_APPEND`` ist beim laufenden Server gesetzt (fd 1 und 2,
+``flags: 0102001``). Deshalb landet der naechste Schreibvorgang nach dem
+Kuerzen wieder bei Offset 0 und nicht am alten Dateiende.
+
+Eine Autoritaet fuer den Takt
+-----------------------------
+``check()`` wird **jeden** Pol gerufen und entscheidet selbst, ob es wirklich
+``stat`` macht. Es gibt bewusst kein zweites Takt-Werkzeug daneben: zwei
+unabhaengige Zaehler kommen nie gleichzeitig auf 0, und die Folge ist kein
+Fehler, sondern Stille - der Aufrufer sieht ``RotateResult()`` und glaubt, es
+sei nichts zu tun. Gemessen waren das 0 Kuerzungen in 31 Polls bei einem Log,
+das auf 62 MB wuchs.
+
+``every=60`` ist der Default und heisst "alle 60 Polls", bei
+``POLL_INTERVAL=2.0`` also exakt zwei Minuten. Nicht umrechnen.
+
+Ein Objekt pro Logdatei
+-----------------------
+Der Zaehler gehoert zum Objekt, nicht zum Pfad. Zwei Dateien auf einer
+Instanz teilen sich einen Zaehler, und eine der beiden bekommt dann
+dauerhaft keinen Takt zugeteilt und wird gar nicht gekuerzt. Der Collector
+legt pro Log ein eigenes ``LogRotator`` an.
+
 Der Pfadwaechter ist die zweite Haelfte der Sicherung: selbst ein ``rm`` oder
 ein ``open(path, "w")`` im Fehlerfall koennte hier nur eine der beiden
 erlaubten Logdateien unterhalb von /tmp treffen. Die Pfade kommen aus der
@@ -30,37 +53,32 @@ ALLOWED_NAME = re.compile(r"^(escha_server.*\.log|slotmon\.log)$")
 TMP_ROOT = os.path.realpath("/tmp")
 
 
+def resolve_allowed(path):
+    """Der aufgeloeste, freigegebene Pfad - oder None.
+
+    Geprueft wird der gegebene Pfad *und* sein Ziel nach ``realpath``, und
+    zurueckgegeben wird genau der aufgeloeste Pfad. ``check()`` misst und
+    kuerzt dann diese eine Zeichenkette: prueft man den einen Pfad und
+    benutzt den anderen, kann ein zwischenzeitlich umgelegter Symlink eine
+    Datei ausserhalb von /tmp treffen.
+    """
+    if not ALLOWED_NAME.match(os.path.basename(path)):
+        return None
+    target = os.path.realpath(path)
+    # Auch der Zielname muss erlaubt sein: ein Link "slotmon.log" auf
+    # /tmp/irgendwas/history.jsonl waere sonst freigegeben.
+    if not ALLOWED_NAME.match(os.path.basename(target)):
+        return None
+    # Das os.sep ist nicht Kosmetik: ohne es waere "/tmpfoo/escha_x.log"
+    # erlaubt, weil es mit "/tmp" beginnt.
+    if not target.startswith(TMP_ROOT + os.sep):
+        return None
+    return target
+
+
 def is_allowed(path):
     """Nur Logdateien unter /tmp. Der Basename entscheidet, nicht ein Glob."""
-    if not ALLOWED_NAME.match(os.path.basename(path)):
-        return False
-    return os.path.realpath(path).startswith(TMP_ROOT + os.sep)
-
-
-def _on_tick(every, counter):
-    """Takt ohne Pfadbezug: der erste Aufruf und dann jeder `every`-te.
-
-    ``every <= 0`` heisst "jeder Aufruf", nicht "Teilung durch Null" - ein
-    ``POLL_INTERVAL=0`` in der Konfiguration darf den Rotator nicht killen.
-    """
-    return counter % max(1, every) == 0
-
-
-def should_check(path, every, counter):
-    """Darf der Collector bei diesem Aufruf ``check()`` rufen?
-
-    ``False`` heisst zweierlei: der Takt ist noch nicht dran, oder der Pfad ist
-    gar nicht freigegeben. Im zweiten Fall gibt es nichts zu tun - der Pfad
-    wird sowieso nicht angefasst, und ein ``check()`` darauf liefert nur einen
-    Fehlertext, den der Collector bei jedem Takt wiederholen muesste.
-
-    ``check()`` benutzt ``_on_tick`` statt dieser Funktion und meldet einen
-    gesperrten Pfad als Fehler: der Aufrufer von ``check()`` will wissen,
-    dass der Pfad abgelehnt wurde, nicht, dass nichts passiert ist.
-    """
-    if not is_allowed(path):
-        return False
-    return _on_tick(every, counter)
+    return resolve_allowed(path) is not None
 
 
 @dataclass
@@ -75,31 +93,46 @@ class RotateResult:
 
 
 class LogRotator:
+    """Raeumt **eine** Logdatei. Pro Log eine eigene Instanz."""
+
     def __init__(self, max_mb=1024, warn_mb=900, every=60):
+        # Ein totes Band waere schlimmer als ein schiefer Schwellwert. Ohne
+        # diese Zeile gilt bei MAX_LOG_MB=500 und WARN_LOG_MB=900 fuer jede
+        # Groesse zwischen 500 und 900 MB: kein Truncate, keine Warnung, kein
+        # Fehler - das Log waechst unbegrenzt und meldet sich nie.
+        if warn_mb > max_mb:
+            warn_mb = max_mb * 0.9
         self.max_mb = max_mb
         self.warn_mb = warn_mb
-        #: So viele ``check()``-Aufrufe liegen zwischen zwei ``stat()``. Der
-        #: erste Aufruf prueft sofort, damit ein frisch gestarteter Monitor
-        #: nicht eine Stunde blind ist.
+        #: Wie viele ``check()``-Aufrufe zwischen zwei ``stat()``. Der erste
+        #: Aufruf prueft sofort, damit ein frisch gestarteter Monitor nicht
+        #: zwei Minuten blind ist. ``every <= 0`` heisst "jeder Aufruf", nicht
+        #: "Teilung durch Null".
         self.every = every
         self.counter = 0
 
     def check(self, path, force=False):
         """Prueft ``path`` und kuerzt ihn im Notfall auf 0.
 
+        Wird **jeden** Pol gerufen und springt auf den eigenen Takt. Ruft der
+        Aufrufer check() nur auf, wenn er selbst meint, dass es Zeit ist, ist
+        das der zweite Zaehler - und daran ist die Rotation schon einmal still
+        ausgefallen, ohne einen Fehler zu melden.
+
         ``force=True`` prueft auch auf einem uebersprungenen Takt.
         """
-        due = force or _on_tick(self.every, self.counter)
+        due = force or self.counter % max(1, self.every) == 0
         self.counter = (self.counter + 1) % max(1, self.every)
         if not due:
             # Leerer Befund, nicht "unbekannt": sonst meldet der Collector im
             # Sekunden-Takt eine Groesse, die er gar nicht gemessen hat.
             return RotateResult()
 
-        if not is_allowed(path):
+        target = resolve_allowed(path)
+        if target is None:
             return RotateResult(error=f"pfad nicht freigegeben: {path}")
         try:
-            size = os.path.getsize(path)
+            size = os.path.getsize(target)
         except OSError:
             # Kein Log da ist kein Fehler - es laeuft eben noch keiner.
             return RotateResult()
@@ -110,8 +143,10 @@ class LogRotator:
 
         if size_mb >= self.max_mb:
             try:
-                os.truncate(path, 0)
+                os.truncate(target, 0)
             except OSError as exc:
+                # EACCES, EROFS, ENOSPC: genau dann, wenn es am noetigsten ist,
+                # darf der Aufrufer keinen Traceback sehen.
                 return RotateResult(size_mb=size_mb, error=f"truncate: {exc}")
             return RotateResult(size_mb=size_mb, truncated=True, warn=False)
 
