@@ -25,6 +25,10 @@ DEFAULTS = {
     "RETENTION_H": ("retention_h", int, 24),
     "MAX_LOG_MB": ("max_log_mb", int, 1024),
     "WARN_LOG_MB": ("warn_log_mb", int, 900),
+    # Eigenes Schwelle fuer das Monitor-Log, nicht die des Server-Logs.
+    # Spec Z. 324: das Monitor-Log rotiert bei 5 MB. Wer darin nach einem
+    # Fehler sucht, findet die Antwort sonst erst nach einem Gigabyte.
+    "MAX_MONITOR_LOG_MB": ("max_monitor_log_mb", int, 5),
     "POLL_INTERVAL": ("poll_interval", float, 2.0),
     "LOG_PAIR_WINDOW_S": ("log_pair_window_s", float, 30.0),
 }

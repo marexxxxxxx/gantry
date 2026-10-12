@@ -601,6 +601,28 @@ class TestRotation(CollectorCase):
         self.assertEqual(seen, [(id(collector.rotator), self.log),
                                 (id(collector.monitor_rotator), self.monitor_log)])
 
+    def test_monitor_log_rotates_at_five_megabytes(self):
+        """Das eigene Monitor-Log hat eine eigene, viel niedrigere Schwelle.
+
+        Spec Z. 324: "Eigenes Monitor-Log rotiert bei 5 MB." Mit derselben
+        Schwelle wie das Server-Log (Standard 1024 MB) waere dasMonitor-Log
+        bei einem Fehler, der im Sekundentakt schreibt, ein GB gross, bevor
+        jemand etwas sieht - und es ist genau das Log, in dem man danach
+        sucht. Der Ausfall ist also genau dann am teuersten, wenn er
+        sichtbar sein muesste.
+
+        Live bemerkt, nicht durch die Tests: beide Rotatoren bekamen
+        `max_log_mb`, die 5 MB der Spec gab es im Code nicht.
+        """
+        collector = self.make()
+        self.assertEqual(collector.monitor_rotator.max_mb, 5)
+
+    def test_the_two_thresholds_stay_independent(self):
+        """Kuerzt das Monitor-Log, darf das Server-Log unberuehrt bleiben."""
+        collector = self.make()
+        self.assertNotEqual(collector.rotator.max_mb,
+                            collector.monitor_rotator.max_mb)
+
     def test_measured_size_on_the_first_tick(self):
         collector = self.make()
         state = collector.tick()

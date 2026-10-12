@@ -128,8 +128,15 @@ class Collector:
         self.history = History(self.cfg.history, self.cfg.retention_h)
         # Zwei Logdateien, zwei Instanzen, zwei Takte. `every` ist der Default
         # des Rotators (60 Polls) und wird nicht aus poll_interval abgeleitet.
+        #
+        # Die Schwellen sind **verschieden**: das Server-Log haelt die 1 GB
+        # aus `MAX_LOG_MB`, das eigene Monitor-Log die 5 MB aus der Spec
+        # (Z. 324). Der Warnwert folgt als 90 % davon - `LogRotator` zieht
+        # ihn selbst nach, wenn jemand `MAX_MONITOR_LOG_MB` unter
+        # `WARN_LOG_MB` setzt und so ein totes Band erzeugt haette.
         self.rotator = LogRotator(self.cfg.max_log_mb, self.cfg.warn_log_mb)
-        self.monitor_rotator = LogRotator(self.cfg.max_log_mb, self.cfg.warn_log_mb)
+        self.monitor_rotator = LogRotator(self.cfg.max_monitor_log_mb,
+                                          self.cfg.max_monitor_log_mb * 0.9)
         self.compact_every_s = COMPACT_EVERY_S
         self.max_req_input_len = None
         self.finished = {}
