@@ -1027,15 +1027,26 @@ class TestSparklineWindow(unittest.TestCase):
 
     def test_values_outside_sixty_seconds_fall_out(self):
         base = 1791795000.0
+        # Zeitpunkte 0, 40, 75, 80 s. Beim dritten Aufruf ist der erste Wert
+        # 75 s alt und faellt raus; 40, 75 und 80 s bleiben stehen.
         html = self.window(base, base + 40, base + 75, base + 80)
-        # 0 s und 40 s sind zu weit weg, 75 s und 80 s bleiben.
-        self.assertEqual(html.count(self.BARS), 2)
+        self.assertEqual(html.count(self.BARS), 3)
 
     def test_values_inside_sixty_seconds_stay(self):
         base = 1791795000.0
-        html = self.window(base, base + 59, base + 60)
         # Genau 60 s ist "innerhalb" - die Grenze gehoert zum Fenster.
-        self.assertEqual(html.count(self.BARS), 2)
+        html = self.window(base, base + 59, base + 60)
+        self.assertEqual(html.count(self.BARS), 3)
+
+    def test_a_gap_longer_than_the_window_empties_the_history(self):
+        """Ein Sprung von 61 s raedt alles, auch den Wert von eben.
+
+        Genau das, was ein zaehlender Puffer nicht kann: er wuerde den alten
+        Wert behalten, weil er erst sechzig Eintraege verwerfen muss.
+        """
+        base = 1791795000.0
+        html = self.window(base, base + 61)
+        self.assertEqual(html.count(self.BARS), 1)
 
     def test_an_empty_buffer_shows_a_dash_not_an_empty_box(self):
         dom = render(sample_state(speed={"tok_per_s": None}))

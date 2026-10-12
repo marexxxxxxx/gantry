@@ -117,6 +117,12 @@
 </section>
 
 <script>
+// Der Sparkline-Puffer traegt `{at, v}` mit `at = data.at`, nicht nur den Wert.
+// Ein Puffer, der nur zaehlt, haelt 60 **Werte** - und ein Wert je Poll
+// bedeutet 60 * `POLL_INTERVAL`, also 120 s bei einem Default von 2 s. Die
+// Beschriftung "letzte 60 Sekunden" waere dann gelogen. Zeitbasiert ist sie
+// wahr.
+const SPARK_WINDOW_S = 60;
 const sparkline = [];
 const DASH = "-";
 const fmt = (v, suffix = "") =>
@@ -424,12 +430,20 @@ function render(data) {
   document.getElementById("h-queue").textContent = queue.waiting === null ? "-" : queue.waiting;
 
   // Sparkline
-  if (speed.tok_per_s !== null) sparkline.push(speed.tok_per_s);
-  if (sparkline.length > 60) sparkline.shift();
-  const peak = Math.max(1, ...sparkline);
-  document.getElementById("spark").innerHTML = sparkline
-    .map(v => `<div style="display:inline-block;width:3px;height:${v / peak * 100}%;
-                background:var(--ok);vertical-align:bottom;margin-right:1px"></div>`).join("");
+  // `at` aus dem Zustand. Fehlt er (der allererste Aufruf aus einem Zustand
+  // ohne Zeitstempel), wird die Uhr des Browsers genommen - geraten wird die
+  // Zahl des Durchsatzes, nicht der Zeitpunkt des Messwerts.
+  const sparkNow = typeof data.at === "number" ? data.at : Date.now() / 1000;
+  if (speed.tok_per_s !== null) sparkline.push({ at: sparkNow, v: speed.tok_per_s });
+  while (sparkline.length > 0 && sparkNow - sparkline[0].at > SPARK_WINDOW_S) {
+    sparkline.shift();
+  }
+  const peak = Math.max(1, ...sparkline.map(point => point.v));
+  document.getElementById("spark").innerHTML = sparkline.length === 0
+    ? '<span class="unknown">-</span>'
+    : sparkline.map(point =>
+        `<div style="display:inline-block;width:3px;height:${point.v / peak * 100}%;`
+        + `background:var(--ok);vertical-align:bottom;margin-right:1px"></div>`).join("");
 
   // Zeitstrahl
   document.getElementById("timeline").innerHTML = timeline(data);
