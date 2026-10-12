@@ -38,11 +38,6 @@
   .bar > div { height: 100%; background: var(--ok); transition: width .4s; }
   .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
   .tl-entry { padding: 6px 0 6px 10px; margin-bottom: 6px; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
-  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
-  td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  tr.now td { color: var(--ok); }
   .muted { color: var(--muted); }
   .hidden { display: none; }
 </style>
@@ -89,11 +84,6 @@
   </div>
 
   <div class="card">
-    <table>
-      <thead><tr><th>System</th><th class="num">Dauer</th><th class="num">Prompt</th>
-        <th class="num">Antwort</th><th class="num">Cache</th><th>Ende</th></tr></thead>
-      <tbody id="history-rows"></tbody>
-    </table>
     <div class="note" id="queue-note"></div>
   </div>
 </section>
@@ -263,12 +253,6 @@ function renderLogNotices(logState, slot) {
       : `Historie nicht geschrieben: ${logState.history_error}`);
 }
 
-// Spec Z. 245-246 und 252-253: "Der Halter-Wechsel wird erst erkannt, wenn
-// der naechste Halter tatsaechlich sendet. Im Extremfall steht der alte Name
-// wenige Sekunden zu lang." - der dritte Punkt der Grenzenliste als Fussnote
-// an der WARTEND-Kachel. Der Satz steht an beiden Orten: der `title` erscheint
-// nur mit der Maus, und gerade in diesem Zustand schaut niemand auf die
-// Kachel.
 // Der Pflichtsatz zur Nicht-Zuordenbarkeit (Spec Z. 294-296). Die alte
 // Fassung begruendete ihn mit der Zahl offener Verbindungen - die gibt es
 // seit `36840ab` nicht mehr, und eine Begruendung, die auf etwas nicht
@@ -279,6 +263,12 @@ const QUEUE_NOTE = "Einzelne Wartende lassen sich keinem System zuordnen - "
   + "angezeigt wird deshalb nur die Zahl aus /get_load, eine Zuordnung wird "
   + "nicht behauptet. Es stehen hier nur Token-Zahlen, kein Prompt-Text.";
 
+// Spec Z. 245-246 und 252-253: "Der Halter-Wechsel wird erst erkannt, wenn
+// der naechste Halter tatsaechlich sendet. Im Extremfall steht der alte Name
+// wenige Sekunden zu lang." - der dritte Punkt der Grenzenliste als Fussnote
+// an der WARTEND-Kachel. Der Satz steht an beiden Orten: der `title` erscheint
+// nur mit der Maus, und gerade in diesem Zustand schaut niemand auf die
+// Kachel.
 const HOLD_SWITCH_NOTE =
   "Der Halter-Wechsel wird erst erkannt, wenn der naechste Halter "
   + "tatsaechlich sendet - im Extremfall steht der alte Name wenige "
@@ -462,19 +452,6 @@ function render(data) {
 
   // Logzeilen
   renderLogNotices(data.log, slot);
-
-  // Verlaufstabelle
-  const rows = data.history.slice().reverse().map(entry => `
-    <tr>
-      <td>${entry.system || entry.ip_port || "unbekannt"}</td>
-      <td class="num">${duration(entry.duration_s) || "-"}</td>
-      <td class="num">${fmt(entry.prompt_tokens)}</td>
-      <td class="num">${fmt(entry.completion_tokens)}</td>
-      <td class="num">${fmt(entry.cached_tokens)}</td>
-      <td class="muted">${new Date(entry.ended_at * 1000).toLocaleTimeString("de-DE")}</td>
-    </tr>`).join("");
-  document.getElementById("history-rows").innerHTML = rows ||
-    '<tr><td colspan="6" class="muted">Noch keine abgeschlossenen Slots.</td></tr>';
 
   // Summen
   document.getElementById("h-count").textContent = data.history.length;

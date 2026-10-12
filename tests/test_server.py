@@ -1135,6 +1135,57 @@ class TestStreamError(unittest.TestCase):
         self.assertIn("erster Poll", after["source-age"]["text"])
 
 
+@unittest.skipUnless(NODE, "kein node/nodejs im PATH - render() wird nicht ausgefuehrt")
+class TestNoTableInNow(unittest.TestCase):
+    """Reiter "Jetzt" fuehrt keine Tabelle.
+
+    Spec Z. 294-296: "**Keine Wartelisten-Tabelle.** Sie ist durch den
+    Altbestand-Banner und die WARTEND-Kachel ersetzt. Das Dashboard sagt **in
+    einem Satz**, dass sich einzelne Wartende keinem System zuordnen lassen."
+    Z. 279-296 zaehlt fuer "Jetzt" kein Table auf.
+
+    Die Tabelle listete abgeschlossene Slots - inhaltlich keine Warteliste,
+    aber sie stand an einer Stelle, die die Spec nicht auffuehrt, sie speiste
+    sich aus derselben Quelle wie der Zeitstrahl (dieselben Eintraege zweimal)
+    und der Pflichtsatz haeng genau an ihr.
+    """
+
+    def test_there_is_no_table_and_no_history_rows_in_the_markup(self):
+        html = read_dashboard()
+        self.assertNotIn("history-rows", html)
+        now = html.split('id="tab-now"')[1].split('id="tab-history"')[0]
+        self.assertNotIn("<table", now)
+        self.assertNotIn("<tbody", now)
+        self.assertNotIn("<th", now)
+
+    def test_render_does_not_write_a_history_table(self):
+        dom = render(sample_state(history=[entry(system="Laptop")]))
+        self.assertNotIn("history-rows", dom)
+        self.assertNotIn("Noch keine abgeschlossenen Slots", read_dashboard())
+
+    def test_the_token_numbers_survive_in_the_timeline(self):
+        """Sie sind nicht verloren: der Zeitstrahl zeigt prompt, tok und cache.
+
+        Sonst waere die Tabellenspalte einfach weg - und die Spec verlangt
+        genau diese Zahlen fuer abgeschlossene Eintraege (Z. 265-267).
+        """
+        dom = render(sample_state(slot={"state": "free", "complete": True},
+                                  history=[entry(prompt_tokens=400,
+                                                 completion_tokens=20,
+                                                 cached_tokens=12,
+                                                 duration_s=4.0)]))
+        meta = meta_of(entry_with(dom, "FERTIG")[2])
+        self.assertIn("ctx 400", meta)
+        self.assertIn("20 tok", meta)
+        self.assertIn("12 cache", meta)
+
+    def test_the_queue_footnote_stands_where_the_table_was(self):
+        """Der Pflichtsatz zur Nicht-Zuordenbarkeit bleibt im Reiter "Jetzt"."""
+        html = read_dashboard()
+        now = html.split('id="tab-now"')[1].split('id="tab-history"')[0]
+        self.assertIn('id="queue-note"', now)
+
+
 class TestOpenCount(unittest.TestCase):
     """`open_count` wird nicht angezeigt.
 
