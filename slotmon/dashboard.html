@@ -37,6 +37,7 @@
   .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin-top: 8px; }
   .bar > div { height: 100%; background: var(--ok); transition: width .4s; }
   .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .tl-entry { padding: 6px 0 6px 10px; margin-bottom: 6px; }
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
   th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
@@ -116,14 +117,92 @@
 
 <script>
 const sparkline = [];
+const DASH = "-";
 const fmt = (v, suffix = "") =>
   (v === null || v === undefined) ? '<span class="unknown">-</span>' : v + suffix;
 
+// Zahlen fuer den Zeitstrahl. `num` gibt die Zahl unveraendert wieder und
+// `dec` rundet - beide liefern den Strich, wenn der Wert keine Zahl ist. Ein
+// `assertIn("2", ...)` waere bei "182" erfuellt; der Test vergleicht deshalb
+// exakt, und genau dafuer muss der Wert unveraendert dastehen.
+function num(value) {
+  return (typeof value === "number" && isFinite(value)) ? String(value) : DASH;
+}
+
+function dec(value, digits) {
+  return (typeof value === "number" && isFinite(value)) ? value.toFixed(digits) : DASH;
+}
+
 function duration(seconds) {
-  if (seconds === null || seconds === undefined) return null;
+  if (typeof seconds !== "number" || !isFinite(seconds)) return DASH;
   const s = Math.floor(seconds);
   const m = Math.floor(s / 60), h = Math.floor(m / 60);
   return h > 0 ? `${h}h ${m % 60}m` : m > 0 ? `${m}m ${s % 60}s` : `${s}s`;
+}
+
+// Durchsatz eines abgeschlossenen Eintrags: Mittel ueber die Lebensdauer
+// (Spec Z. 271-272). Ohne Dauer oder bei Dauer 0 gibt es keinen Quotienten -
+// `0/0` waere `NaN`, `20/0` waere `Infinity`, und beides ist keine Aussage.
+function meanRate(tokens, seconds) {
+  if (typeof tokens !== "number" || typeof seconds !== "number") return null;
+  if (!(seconds > 0)) return null;
+  return tokens / seconds;
+}
+
+// Der Hinweis, dass der Name erst durch den Abschluss bekannt wurde. Die
+// Bedingung wird in F3 korrigiert - sie ist hier noch die alte.
+function nameHint(record) {
+  return record.system === null && record.ip_port === null
+    ? '<span class="muted">Name nachtraeglich</span>' : "";
+}
+
+// Ein Zeitstrahl-Eintrag. `color` ist eine der vorhandenen Variablen
+// (`--ok` gruen, `--idle` grau, `--warn` orange); es gibt keine neue Farbe.
+function tlEntry(cls, color, head, meta, tail) {
+  return `<div class="tl-entry ${cls}" style="border-left:3px solid ${color}">`
+    + `<strong>${head}</strong> <span class="muted">${meta}</span>`
+    + (tail ? ` <span class="rid">${tail}</span>` : "")
+    + `</div>`;
+}
+
+// Der Zeitstrahl (Spec Z. 297-304): oben der aktuelle Zustand, darunter die
+// abgeschlossenen Eintraege, neuester zuerst.
+function timeline(data) {
+  const slot = data.slot, speed = data.speed;
+  const rows = [];
+  if (slot.state === "busy") {
+    // LAEUFT, gruen. `ctx` kommt aus `#full token` des Server-Logs, weil
+    // `completion_tokens` im laufenden Slot noch nicht existiert (Spec
+    // Z. 268-269).
+    rows.push(tlEntry("running", "var(--ok)",
+      slot.system || slot.ip_port || "unbekannt",
+      `LAEUFT - ${duration(slot.duration_s)} - ctx ${num(speed.ctx_tokens)}`
+      + ` - ${dec(speed.tok_per_s, 1)} tok/s`
+      + ` - ${dec(speed.output_pct, 2)} % Ausgabe`,
+      slot.rid ? `rid ${slot.rid}` : ""));
+  } else if (slot.state === "free") {
+    // Spec Z. 262-264: `BEREIT FUER NAECHSTEN` **ohne Namen**. Die Wartenden
+    // lassen sich keinem System zuordnen; jeder Name waere geraten.
+    rows.push(`<div class="tl-entry ready" style="border-left:3px solid var(--idle)">`
+      + `<span class="muted">BEREIT FUER NAECHSTEN</span></div>`);
+  } else {
+    // `unknown`: **kein** LAEUFT-Eintrag. Der Halter ist nicht bestimmbar,
+    // und ein gruener Balken waere eine Behauptung. Benannt wird der Zustand.
+    rows.push(tlEntry("undetermined", "var(--warn)", "UNBEKANNT",
+      typeof slot.reason === "string" && slot.reason !== ""
+        ? slot.reason : "Halter nicht bestimmbar", ""));
+  }
+  // FERTIG, grau. `prompt_tokens` entspricht in etwa der
+  // Vorverarbeitungslaenge und steht daher als `ctx` (Spec Z. 265-267).
+  return rows.concat(data.history.slice().reverse().map(record => tlEntry(
+    "done", "var(--idle)",
+    record.system || record.ip_port || "unbekannt",
+    `FERTIG - ${duration(record.duration_s)}`
+    + ` - ctx ${num(record.prompt_tokens)}`
+    + ` - ${dec(meanRate(record.completion_tokens, record.duration_s), 1)} tok/s`
+    + ` - ${num(record.completion_tokens)} tok`
+    + ` - ${num(record.cached_tokens)} cache`,
+    (record.rid ? `rid ${record.rid}` : "") + nameHint(record)))).join("");
 }
 
 let lastState = null;
@@ -181,7 +260,7 @@ function render(data) {
   document.getElementById("slot-ip").textContent = slot.ip_port
     ? slot.ip_port : (slot.state === "busy" ? "IP noch nicht abgeschlossen" : "");
   document.getElementById("slot-rid").textContent = slot.rid ? "rid " + slot.rid : "";
-  document.getElementById("s-dur").textContent = duration(slot.duration_s) || "-";
+  document.getElementById("s-dur").textContent = duration(slot.duration_s);
   document.getElementById("s-tps").textContent = speed.tok_per_s === null ? "-"
     : speed.tok_per_s.toFixed(1);
   document.getElementById("s-ctx").textContent = speed.ctx_tokens === null ? "-"
@@ -221,7 +300,7 @@ function render(data) {
 
   // Summen
   document.getElementById("h-count").textContent = data.history.length;
-  document.getElementById("h-avg").textContent = duration(avgDur) || "-";
+  document.getElementById("h-avg").textContent = duration(avgDur);
   document.getElementById("h-queue").textContent = queue.waiting === null ? "-" : queue.waiting;
   document.getElementById("h-tps").textContent = speed.tok_per_s === null ? "-"
     : speed.tok_per_s.toFixed(1);
@@ -235,15 +314,7 @@ function render(data) {
                 background:var(--ok);vertical-align:bottom;margin-right:1px"></div>`).join("");
 
   // Zeitstrahl
-  document.getElementById("timeline").innerHTML = data.history.slice().reverse().map(entry => `
-    <div style="border-left:3px solid var(--idle);padding:6px 0 6px 10px;margin-bottom:6px">
-      <strong>${entry.system || "unbekannt"}</strong>
-      <span class="muted"> - ${duration(entry.duration_s) || "-"}
-      - ${fmt(entry.completion_tokens)} tok
-      - ${new Date(entry.ended_at * 1000).toLocaleTimeString("de-DE")}</span>
-      ${entry.system === null && entry.ip_port === null
-        ? '<span class="muted"> - Name nachtraeglich</span>' : ""}
-    </div>`).join("");
+  document.getElementById("timeline").innerHTML = timeline(data);
 }
 
 document.querySelectorAll(".tab").forEach(tab => {

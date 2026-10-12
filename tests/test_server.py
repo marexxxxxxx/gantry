@@ -423,6 +423,23 @@ def render(state):
     return json.loads(done.stdout)
 
 
+def entry(**overrides):
+    """Ein abgeschlossener Eintrag aus `history.jsonl`, alle Felder bekannt.
+
+    Wie `sample_state`: der Test soll an dem einen Feld liegen, an dem er
+    gerade etwas prueft. `ended_at` ist eine Unix-Zeit, weil der Zeitstrahl
+    daraus einen Zeitstempel macht.
+    """
+    record = {
+        "rid": "rid-x", "ip_port": "192.168.9.2:44444", "system": "Laptop",
+        "started_at": 1791794900.0, "ended_at": 1791795000.0, "duration_s": 100.0,
+        "prompt_tokens": 1000, "completion_tokens": 500, "cached_tokens": 50,
+        "finish_reason": "stop", "status": 200, "received_time": 4711.0,
+    }
+    record.update(overrides)
+    return record
+
+
 def sample_state(**overrides):
     """Ein vollstaendiger Zustand wie `Collector.state()`, alle Werte bekannt.
 
@@ -498,6 +515,156 @@ class TestRenderedSlotNote(unittest.TestCase):
         """`complete` und kein `reason`: nichts behaupten, was nicht belegt ist."""
         self.assertEqual(self.note(slot={"state": "free", "complete": True,
                                          "reason": None}), "")
+
+
+#: Ein Zeitstrahl-Eintrag. Die Farbe steht im `style`, damit der Test sie am
+#: fertigen Element sieht und nicht an einer Quelltext-Zeile.
+TL_ENTRY = re.compile(
+    r'<div class="tl-entry ([^"]*)" style="border-left:3px solid ([^"]*)">(.*?)</div>',
+    re.DOTALL)
+
+
+def timeline(dom):
+    """Die Zeitstrahl-Eintraege als (klasse, farbe, html), in Reihenfolge."""
+    return TL_ENTRY.findall(dom["timeline"]["html"])
+
+
+def meta_of(entry_html):
+    """Der graue Mittelteil eines Eintrags - die Zahlenaussage, exakt."""
+    found = re.search(r'<span class="muted">(.*?)</span>', entry_html, re.DOTALL)
+    if found is None:
+        raise AssertionError(f"der Eintrag hat keinen <span class=muted>: {entry_html}")
+    return found.group(1)
+
+
+def entry_with(dom, needle):
+    """Der eine Zeitstrahl-Eintrag, der `needle` enthaelt."""
+    found = [entry for entry in timeline(dom) if needle in entry[2]]
+    if len(found) != 1:
+        raise AssertionError(
+            f"{len(found)} Eintraege mit {needle!r}, erwartet genau einer: "
+            f"{[entry[2] for entry in timeline(dom)]}")
+    return found[0]
+
+
+@unittest.skipUnless(NODE, "kein node/nodejs im PATH - render() wird nicht ausgefuehrt")
+class TestTimeline(unittest.TestCase):
+    """Der Zeitstrahl fuehrt den laufenden Slot mit - nicht nur die Historie.
+
+    Spec Z. 297-304: "Zeitstrahl der Slot-Uebergaben: LAEUFT (gruen), FERTIG
+    (grau) mit Dauer, ctx, tok/s und Tokenzahlen je Eintrag", und Z. 262-264:
+    bei freiem Slot `BEREIT FUER NAECHSTEN` **ohne Namen**.
+
+    Geprueft wird exakt, nicht mit `assertIn` auf eine Zahl: `"2" in "182"` ist
+    erfuellt, und ein gruener Test, der eine Beimischung nicht sieht, ist
+    schlimmer als keiner.
+    """
+
+    BUSY = {"state": "busy", "rid": "rid-busy", "system": "Laptop",
+            "ip_port": "192.168.9.2:44444", "duration_s": 63.0, "complete": False}
+
+    def test_busy_slot_gets_a_running_entry_in_green(self):
+        dom = render(sample_state(slot=self.BUSY))
+        cls, colour, html = entry_with(dom, "LAEUFT")
+        self.assertIn("running", cls)
+        # Die gruene Farbe ist die vorhandene `--ok`, nicht eine neue.
+        self.assertEqual(colour, "var(--ok)")
+        self.assertIn("Laptop", html)
+        self.assertEqual(meta_of(html),
+                         "LAEUFT - 1m 3s - ctx 42000 - 42.5 tok/s - 50.00 % Ausgabe")
+        self.assertIn("rid rid-busy", html)
+
+    def test_busy_slot_without_a_name_falls_back_to_the_ip(self):
+        """Ohne Namen ist die IP die einzige belegte Zuordnung."""
+        dom = render(sample_state(slot={**self.BUSY, "system": None}))
+        _, _, html = entry_with(dom, "LAEUFT")
+        self.assertIn("192.168.9.2:44444", html)
+
+    def test_free_slot_shows_beret_ready_without_any_name(self):
+        """`BEREIT FUER NAECHSTEN` - und sonst nichts, was einen Namen traegt.
+
+        Der Zustand traegt hier absichtlich einen Namen **und** eine IP. Beide
+        duerfen im Eintrag nicht auftauchen: die Wartenden lassen sich keinem
+        System zuordnen, und jeder Name waere geraten.
+        """
+        dom = render(sample_state(slot={"state": "free", "complete": True,
+                                        "system": "Phantom", "rid": "rid-frei",
+                                        "ip_port": "192.168.9.2:44444",
+                                        "duration_s": None}))
+        entries = timeline(dom)
+        self.assertEqual(len(entries), 1)
+        html = entries[0][2]
+        self.assertIn("BEREIT FUER NAECHSTEN", html)
+        self.assertNotIn("Phantom", html)
+        self.assertNotIn("192.168.9.2", html)
+        self.assertNotIn("rid-frei", html)
+
+    def test_unknown_slot_gets_no_running_entry(self):
+        """Bei `unknown` ist der Halter nicht bestimmbar.
+
+        Ein gruener Balken waere eine Behauptung. Stattdessen wird der Zustand
+        benannt - mit `slot.reason`, wenn der Collector einen geliefert hat.
+        """
+        reason = "Halter nicht bestimmbar - kein Befund"
+        dom = render(sample_state(slot={"state": "unknown", "complete": False,
+                                        "reason": reason}))
+        html = timeline(dom)[0][2]
+        self.assertNotIn("LAEUFT", html)
+        self.assertNotIn("BEREIT FUER NAECHSTEN", html)
+        self.assertIn("UNBEKANNT", html)
+        self.assertEqual(meta_of(html), reason)
+
+    def test_finished_entry_carries_its_own_numbers(self):
+        """Jeder Eintrag traegt **seine** Zahlen, exakt."""
+        dom = render(sample_state(slot={"state": "free", "complete": True},
+                                  history=[
+                                      {"rid": "rid-alt", "system": "Alt",
+                                       "ip_port": "192.168.9.1:1", "started_at": 1.0,
+                                       "ended_at": 100.0, "duration_s": 7.0,
+                                       "prompt_tokens": 111, "completion_tokens": 14,
+                                       "cached_tokens": 2, "finish_reason": "stop",
+                                       "status": 200, "received_time": 4711.0},
+                                      {"rid": "rid-neu", "system": "Neu",
+                                       "ip_port": "192.168.9.2:2", "started_at": 2.0,
+                                       "ended_at": 102.0, "duration_s": 4.0,
+                                       "prompt_tokens": 400, "completion_tokens": 20,
+                                       "cached_tokens": 12, "finish_reason": "stop",
+                                       "status": 200, "received_time": 4712.0},
+                                  ]))
+        entries = timeline(dom)
+        # Neuester zuerst, und der laufende Zustand steht darueber.
+        self.assertIn("BEREIT FUER NAECHSTEN", entries[0][2])
+        self.assertEqual(entry_with(dom, "rid-neu")[1], "var(--idle)")
+        self.assertEqual(meta_of(entry_with(dom, "rid-neu")[2]),
+                         "FERTIG - 4s - ctx 400 - 5.0 tok/s - 20 tok - 12 cache")
+        self.assertEqual(meta_of(entry_with(dom, "rid-alt")[2]),
+                         "FERTIG - 7s - ctx 111 - 2.0 tok/s - 14 tok - 2 cache")
+
+    def test_rate_is_the_mean_over_the_lifetime(self):
+        """20 Ausgabetokens in 4 s sind 5.0 tok/s (Spec Z. 271-272)."""
+        dom = render(sample_state(history=[entry(duration_s=4.0,
+                                                completion_tokens=20)]))
+        self.assertEqual(meta_of(entry_with(dom, "FERTIG")[2]),
+                         "FERTIG - 4s - ctx 1000 - 5.0 tok/s - 20 tok - 50 cache")
+
+    def test_zero_duration_gives_a_dash_not_nan(self):
+        """`duration_s === 0`: kein Quotient. `0/0` waere `NaN`, `20/0` `Infinity`."""
+        for duration_s, tokens in ((0.0, 20), (0.0, 0), (None, 20)):
+            dom = render(sample_state(history=[entry(duration_s=duration_s,
+                                                    completion_tokens=tokens)]))
+            meta = meta_of(entry_with(dom, "FERTIG")[2])
+            self.assertEqual(meta.count("- tok/s"), 1,
+                             f"duration_s={duration_s}, tokens={tokens}: {meta}")
+            self.assertNotIn("NaN", dom["timeline"]["html"])
+            self.assertNotIn("Infinity", dom["timeline"]["html"])
+
+    def test_history_entry_without_numbers_shows_dashes(self):
+        dom = render(sample_state(history=[entry(duration_s=None,
+                                                completion_tokens=None,
+                                                prompt_tokens=None,
+                                                cached_tokens=None)]))
+        self.assertEqual(meta_of(entry_with(dom, "FERTIG")[2]),
+                         "FERTIG - - - ctx - - - tok/s - - tok - - cache")
 
 
 class TestOpenCount(unittest.TestCase):
