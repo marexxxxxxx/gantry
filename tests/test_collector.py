@@ -193,10 +193,27 @@ class TestEmptyState(CollectorCase):
         for key in ("size_mb", "warn", "truncated", "history_error"):
             self.assertIn(key, state["log"], f"log[{key!r}] fehlt")
 
-    def test_reason_reads_as_none_before_any_tick(self):
-        """Nicht `KeyError`, sondern `None`: es gibt noch keinen Befund, also
-        gibt es auch keinen Grund."""
-        self.assertIsNone(self.make().state()["slot"]["reason"])
+    def test_reason_names_the_state_before_any_tick(self):
+        """`unknown` ohne `reason` ist verboten - auch vor dem ersten Poll.
+
+        `Collector.tick()` verbietet genau das fuer jeden Weg, der zu einem
+        `unknown` fuehrt. `_empty_state()` verstiess dagegen: dort stand
+        `"reason": None`, und im Dashboard erschien daraufhin der schwache
+        generische Satz, obwohl gar kein Altbestand belegt ist - `legacy` ist
+        `null`, nicht positiv. Sichtbar bei jedem Seitenaufruf und nach jedem
+        Serverstart fuer rund ein Poll-Intervall.
+        """
+        slot = self.make().state()["slot"]
+        self.assertEqual(slot["state"], "unknown")
+        self.assertIsInstance(slot["reason"], str)
+        self.assertNotEqual(slot["reason"].strip(), "")
+
+    def test_the_reason_before_the_first_tick_claims_nothing_about_the_queue(self):
+        """Der erste Poll steht aus - das ist alles, was man sagen kann."""
+        reason = self.make().state()["slot"]["reason"]
+        self.assertIn("Poll", reason)
+        self.assertNotIn("Altbestand", reason)
+        self.assertNotIn("Halter", reason)
 
     def test_state_does_no_io(self):
         """`state()` liefert den letzten Tick ohne I/O - der SSE-Pfad pollt
@@ -272,7 +289,7 @@ class TestHolder(CollectorCase):
         `if started_at:` statt `is not None` liefert hier `None` und das
         Dashboard zeigt fuer einen Slot, der gerade anfing, "keine Laufzeit".
         Unix 0 ist zwar 1970, aber die Bedingung muss trotzdem an `None`
-        hängen, nicht an der Wahrheit der Zahl - das ist der Fehlertyp, der
+        haengen, nicht an der Wahrheit der Zahl - das ist der Fehlertyp, der
         hier schon einmal Schaden angerichtet hat.
         """
         collector = self.make()
@@ -427,7 +444,7 @@ class TestDegradedServer(CollectorCase):
         self.assertFalse(state["server"]["connected"])
         self.assertEqual(state["server"]["load_error"], "ConnectError: down")
         # `num_waiting_reqs` ist die einzige belastbare Queue-Zahl. Fehlt sie,
-        # steht `–` im Dashboard - eine Zahl aus /metrics unter der Bedingung
+        # steht `-` im Dashboard - eine Zahl aus /metrics unter der Bedingung
         # "Server down" waere eine geratene.
         self.assertIsNone(state["queue"]["waiting"])
         self.assertIsNone(state["slot"]["legacy"])
@@ -809,7 +826,7 @@ def unreadable_history(self, kind="readonly"):
 
 
 class TestTickNeverRaises(CollectorCase):
-    """C1 - kein Ausnahme-Pfad verlässt `tick()`."""
+    """C1 - kein Ausnahme-Pfad verlaesst `tick()`."""
 
     def test_history_append_permission_error_does_not_escape(self):
         unreadable_history(self, "readonly")
@@ -839,7 +856,7 @@ class TestTickNeverRaises(CollectorCase):
     def test_a_raising_source_does_not_escape(self):
         """`sources` wirft per Konstruktion nicht - aber ein Bug in Task 5, ein
         unerwarteter Fehlertyp aus `httpx` oder ein `KeyboardInterrupt-artiger
-        Ausreißer darf die Schleife nicht toeten. Der Fehler wird als Sample
+        Ausreisser darf die Schleife nicht toeten. Der Fehler wird als Sample
         gefuehrt, nicht verschluckt."""
         collector = self.make()
         for name in ("read_load", "read_metrics", "read_gpu", "read_server_info"):
@@ -951,7 +968,7 @@ class TestTickNeverRaises(CollectorCase):
 class TestGhostRids(CollectorCase):
     """C2 - Geister-rids nach einem Server-Neustart.
 
-    Live reproduziert: `open_count=3`, `duration_s=142773` (39,7 h), während
+    Live reproduziert: `open_count=3`, `duration_s=142773` (39,7 h), waehrend
     `num_reqs=0`. Der Server kann keine Request kennen, also sind die rids einer
     frueheren Servergeneration.
     """
@@ -1115,7 +1132,7 @@ class TestGenerationBoundary(CollectorCase):
         self.assertNotIn("aaa", collector.reader.state["open"])
 
     def test_reader_keeps_only_the_current_generation(self):
-        """Direkt am Leser, unabhaengig vom `num_reqs`-Wächter."""
+        """Direkt am Leser, unabhaengig vom `num_reqs`-Waechter."""
         collector = self.two_generations([0])
         collector.tick()
         self.assertEqual(sorted(collector.reader.state["open"]), [])
@@ -1173,7 +1190,7 @@ class TestGenerationBoundary(CollectorCase):
         self.assertAlmostEqual(entry["duration_s"], 17.0, delta=0.001)
 
     def test_num_reqs_guard_still_works_without_a_banner(self):
-        """Ruling 15 bleibt: ohne Banner im Log ist der `num_reqs == 0`-Wächter
+        """Ruling 15 bleibt: ohne Banner im Log ist der `num_reqs == 0`-Waechter
         der einzige Beleg, und er muss allein greifen."""
         collector = self.make()
         collector.sources.read_load = lambda **kw: self.sample(
@@ -1355,7 +1372,7 @@ class TestBannerRecognition(CollectorCase):
     def test_banner_in_a_later_poll_purges_what_is_already_open(self):
         """Der Fall, den der `_apply`-Filter allein nicht erwischt.
 
-        Ein Neustart passiert, **während der Monitor laeuft**: Poll 1 liest ein
+        Ein Neustart passiert, **waehrend der Monitor laeuft**: Poll 1 liest ein
         `request.received` einer alten Generation, Poll 2 erst das Banner.
         `_apply` kann den rid dann nicht mehr ablehnen - er steht schon in
         `open`, und `seen` verhindert jede erneute Pruefung. Ohne das Leeren
@@ -1386,7 +1403,7 @@ class TestBannerRecognition(CollectorCase):
 
 
 class TestHistoryErrorChannel(CollectorCase):
-    """N3 - der Fehlerkanal darf nicht im selben Tick übertönt werden.
+    """N3 - der Fehlerkanal darf nicht im selben Tick uebertoent werden.
 
     `_compact_history` laeuft nach `_flush_finished` im selben Tick. Ein
     erfolgreiches Compact setzt `_history_error` auf `None` - aber es hat den
@@ -1574,7 +1591,7 @@ class TestAfterTruncate(CollectorCase):
         self.assertIsNone(state["slot"]["reason"])
 
     def truncating_idle_collector(self):
-        """Ein Log, das die Schwelle reisst, **während nichts laeuft**.
+        """Ein Log, das die Schwelle reisst, **waehrend nichts laeuft**.
 
         Das ist der Alltagsfall: der Log waechst allein durch die
         `/metrics`-Access-Zeilen, der Slot ist frei. Der Tick, der kuerzt,
@@ -1766,11 +1783,11 @@ class TestNonStringRid(CollectorCase):
         self.assertIsNone(state["slot"]["rid"])
 
     def test_a_malformed_rid_never_enters_received_at(self):
-        """Der Wächter sitzt an **beiden** Schranken, und jede braucht ihren
+        """Der Waechter sitzt an **beiden** Schranken, und jede braucht ihren
         eigenen Beleg.
 
-        Der `open_rids`-Filter allein lässt einen numerischen rid in
-        `received_at` landen - als Integer-Schlüssel. Kein Absturz, aber ein
+        Der `open_rids`-Filter allein laesst einen numerischen rid in
+        `received_at` landen - als Integer-Schluessel. Kein Absturz, aber ein
         Zustand, in dem eine Nicht-Zeichenkette als rid gefuehrt wird und bei
         einem spaeteren `request.finished` als Schluessel wieder auftaucht
         (`finished[12345]`, JSON-Schluessel `"12345"`).
@@ -2153,7 +2170,7 @@ class TestNumReqsWitness(CollectorCase):
           - `ghosts = 0`               (N5t)  -> `0 rid(s)`
           - `ghosts = 1`               (hart) -> `1 rid(s)`
           - `ghosts = len(open_rids)`  (vor dem `del`) -> hier zwar richtig,
-            aber bei einem *gemischten* Takt falsch (siehe den nächsten Test).
+            aber bei einem *gemischten* Takt falsch (siehe den naechsten Test).
 
         Die Behauptung ist bewusst stark: der Grund nennt genau die Zahl der
         rids, die dieser Tick verworfen hat.
@@ -2259,7 +2276,7 @@ class TestUnknownReasonIsNamed(CollectorCase):
     def test_negative_waiting_never_reports_unknown_without_a_reason(self):
         """Die harte Constraint, an dem Fall 2 aus Runde 2 durchkam.
 
-        Der Zustand ist hier erreichbar (siehe den Test darüber), also muss
+        Der Zustand ist hier erreichbar (siehe den Test darueber), also muss
         hier derselbe Grund gelten wie ueberall: `unknown` wird nie ohne
         `reason` gemeldet. Ein `reason = None` an `collector.py:681` (N4c)
         faellt an dieser Zeile.
@@ -2330,7 +2347,7 @@ class TestUnknownReasonIsNamed(CollectorCase):
     def test_legacy_zero_does_not_claim_an_altbestand(self):
         """Die andere Richtung: `legacy == 0` darf keinen Altbestand behaupten.
 
-        Es gibt keinen Altbestand, der nach der Anzeige plötzlich auftaucht.
+        Es gibt keinen Altbestand, der nach der Anzeige ploetzlich auftaucht.
         Der Weg dahin ist derselbe `else`-Zweig wie in Befund 1 - der Fallback
         nennt keine Zahl, weil keine da ist.
         """

@@ -161,7 +161,7 @@ class Collector:
         Serve-Shutdown); danach wird nur noch `state()` benutzt. Ein Flag
         `_closed` waere hier toter Code: `logreader` hat weder Thread noch
         Queue noch async, und `tick()` darf nach `close()` weiterlaufen
-        duerfen, damit ein Test-`addCleanup` keinen späten Fehler einwirft.
+        duerfen, damit ein Test-`addCleanup` keinen spaeten Fehler einwirft.
         """
         return None
 
@@ -184,11 +184,16 @@ class Collector:
                 "state": "unknown", "rid": None, "system": None, "ip_port": None,
                 "started_at": None, "duration_s": None, "legacy": None,
                 "open_count": 0, "complete": False,
-                # `reason` existiert auch vor dem ersten Tick. `/api/state`
+                # `reason` existiert auch vor dem ersten Tick - `/api/state`
                 # liefert `state()`, und ein Client, der vor dem ersten Poll
-                # liest, darf keinen `KeyError` bekommen. Es gibt dann noch
-                # keinen Befund - also auch keinen Grund.
-                "reason": None,
+                # liest, darf keinen `KeyError` bekommen. Es ist dort **kein
+                # `None`**: `unknown` ohne `reason` ist verboten (siehe
+                # `tick()`), und der Zustand vor dem ersten Poll war genau
+                # das. Im Dashboard erschien daraufhin der schwache
+                # generische Satz, obwohl gar kein Altbestand belegt ist.
+                # Der Satz hier behauptet nichts ueber die Queue - es hat
+                # noch niemand gefragt.
+                "reason": "noch kein Messwert - der erste Poll steht aus",
             },
             "queue": {"waiting": None, "running": None},
             "speed": {"tok_per_s": None, "ctx_tokens": None,
@@ -261,7 +266,7 @@ class Collector:
             # ihn mitnehmen: `_apply` legt jede truthy rid in ein Set, und
             # `"rid": ["a"]` scheitert dort mit `TypeError: unhashable type`,
             # noch bevor der Collector die Zeile sehen kann. Der Aufruf von
-            # `tick()` darf daran nicht hängen bleiben.
+            # `tick()` darf daran nicht haengen bleiben.
             self._log(f"log-read-error {type(exc).__name__}: {exc}")
             return
         for event in events:
@@ -303,7 +308,7 @@ class Collector:
         ein zweites Mal in die Historie - im Log sind das Tausende Zeilen, in der
         Historie eine pro Request mehrfacher Zeilen. Der Satz wird beim ersten
         Schreiben aufgebaut und bei jedem `compact` erneuert, damit er mit der
-        Datei mitwächst statt unbegrenzt zu werden.
+        Datei mitwaechst statt unbegrenzt zu werden.
         """
         if self._recorded is None:
             self._recorded = {entry.get("rid")
@@ -442,7 +447,7 @@ class Collector:
         `compact` laeuft nach `_flush_finished` im selben Tick und laesst einen
         fehlgeschlagenen `append` unberuehrt: es schreibt die Datei neu, aber
         es hat den verlorenen Eintrag nicht ersetzt. Ein Kanal, der hier
-        aufgeräumt wird, verstummt genau dann, wenn es ihn braucht -
+        aufgeraeumt wird, verstummt genau dann, wenn es ihn braucht -
         temporaeres `ENOSPC`, Remount, `chmod`-Race.
         """
         if (self._last_compact is not None
@@ -500,7 +505,7 @@ class Collector:
         Randbedingung lautet "kein Fehler darf als Signal erscheinen", also
         faengt dieser Aufruf alles ab und fuehrt es als `Sample` mit `error`
         weiter - derselbe Kanal, den `sources` selbst benutzt. So ist die
-        Störung im Zustand sichtbar statt nur im Log.
+        Stoerung im Zustand sichtbar statt nur im Log.
         """
         from slotmon.sources import Sample
         try:

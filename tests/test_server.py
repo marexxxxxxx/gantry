@@ -987,7 +987,7 @@ class TestQueueFootnote(unittest.TestCase):
         self.assertIn("kein Prompt-Text", note)
 
     def test_the_note_does_not_mention_a_connection_count(self):
-        """Die Begründung verweist nicht mehr auf ein gestrichenes Element."""
+        """Die Begruendung verweist nicht mehr auf ein gestrichenes Element."""
         note = render(sample_state())["queue-note"]["text"]
         self.assertNotIn("Verbindung", note)
         self.assertNotIn("1492", note)
@@ -1133,6 +1133,36 @@ class TestStreamError(unittest.TestCase):
         den Aufruf abbrechen."""
         after = render({"error": "RuntimeError: erster Poll"})
         self.assertIn("erster Poll", after["source-age"]["text"])
+
+
+@unittest.skipUnless(NODE, "kein node/nodejs im PATH - render() wird nicht ausgefuehrt")
+@unittest.skipUnless(NODE, "kein node/nodejs im PATH - render() wird nicht ausgefuehrt")
+class TestStateBeforeFirstPoll(CollectorCase):
+    """Der Zustand **vor** dem ersten Poll, gerendert.
+
+    Seit dem Ticker im Lifespan (F12) kann der erste `render()`-Aufruf ganz
+    normal vor dem ersten Poll stattfinden - der Browser fragt `/api/state`,
+    der Server hat noch nicht gepollt. Dieser Zustand ist der haeufigste
+    Zustand des Dashboards und der einzige, der bisher ohne Begruendung
+    auskam.
+    """
+
+    def test_before_the_first_poll_the_altbestand_sentence_stays_away(self):
+        state = self.collector.state()
+        self.assertEqual(state["slot"]["state"], "unknown")
+        self.assertIsNone(state["slot"]["legacy"])
+        dom = render(state)
+        # "Der Halter ist erst bestimmbar, wenn kein Altbestand mehr in der
+        # Queue liegt" waere hier eine Behauptung: es liegt gar kein
+        # Altbestand belegt, und der Halter ist noch gar nicht gemessen.
+        self.assertNotIn("Halter", dom["slot-note"]["text"])
+        self.assertNotIn("Altbestand", now_tab(dom))
+
+    def test_before_the_first_poll_the_reason_is_the_collectors_own(self):
+        dom = render(self.collector.state())
+        self.assertEqual(dom["slot-note"]["text"],
+                         self.collector.state()["slot"]["reason"])
+        self.assertNotIn("Halter", dom["timeline"]["html"])
 
 
 @unittest.skipUnless(NODE, "kein node/nodejs im PATH - render() wird nicht ausgefuehrt")
