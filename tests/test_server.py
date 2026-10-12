@@ -717,6 +717,96 @@ class TestNameHint(unittest.TestCase):
         self.assertNotIn("Name nachtraeglich", timeline(dom)[0][2])
 
 
+def hidden(dom, ident):
+    """`hidden` als Klasse gesetzt? Das Banner ist dann unsichtbar."""
+    return "hidden" in dom[ident]["classes"]
+
+
+#: Die Elemente des Reiters "Jetzt". Die Zeitstrahl-Eintraege stehen im
+#: Reiter "Verlauf" und zaehlen hier **nicht** mit: dort ist der `slot.reason`
+#: unsichtbar, und der `UNBEKANNT`-Eintrag ist die einzige Stelle, an der der
+#: Grund im Dokument steht. Gezaehlt wird, was gleichzeitig sichtbar ist.
+NOW_TAB = ("altbestand", "log-warn", "log-truncated", "log-error",
+           "slot-note", "slot-system", "slot-ip", "slot-rid")
+
+
+def now_tab(dom):
+    """Alle Elemente des Reiters "Jetzt" als ein Text."""
+    return " ".join(dom[ident]["text"] + dom[ident]["html"]
+                    for ident in NOW_TAB if ident in dom)
+
+
+@unittest.skipUnless(NODE, "kein node/nodejs im PATH - render() wird nicht ausgefuehrt")
+class TestLogNotices(unittest.TestCase):
+    """`data.log` wird gelesen. Vorher las niemand davon.
+
+    Spec Z. 337: "**ab 900 MB** -> Warnung im Dashboard 'Log naehert sich 1 GB
+    (912 MB)'". `size_mb`, `warn`, `truncated` und `history_error` waren
+    tote Felder im Zustand.
+    """
+
+    #: Wortlaut aus `collector.py` (`BLIND_REASON`). Der Collector protokolliert
+    #: und begruendet mit demselben Satz - steht er in `slot.reason`, darf das
+    #: Dashboard ihn nicht ein zweites Mal behaupten.
+    BLIND = ("log-truncated: die offenen rid(s) sind nicht mehr beobachtbar, "
+             "bis wieder ein request.received im Log steht")
+
+    def test_warn_shows_the_real_size(self):
+        dom = render(sample_state(log={"warn": True, "size_mb": 912.0}))
+        self.assertEqual(dom["log-warn"]["text"], "Log naehert sich 1 GB (912 MB)")
+        self.assertFalse(hidden(dom, "log-warn"))
+
+    def test_warn_without_a_measured_size_invents_no_number(self):
+        """`warn` ist die belegte Aussage, `size_mb` nur die Beilage.
+
+        `size_mb === null` heisst "nicht gemessen" (uebersprungener Takt oder
+        nicht freigegebener Pfad), nicht "0 MB".
+        """
+        dom = render(sample_state(log={"warn": True, "size_mb": None}))
+        self.assertEqual(dom["log-warn"]["text"], "Log naehert sich 1 GB")
+        self.assertFalse(hidden(dom, "log-warn"))
+
+    def test_without_warning_the_banner_stays_away(self):
+        dom = render(sample_state(log={"warn": False, "size_mb": 12.0}))
+        self.assertTrue(hidden(dom, "log-warn"))
+        self.assertEqual(dom["log-warn"]["text"], "")
+
+    def test_truncated_says_so_when_the_slot_reason_does_not(self):
+        dom = render(sample_state(log={"truncated": True}, slot={"reason": None}))
+        self.assertFalse(hidden(dom, "log-truncated"))
+        self.assertIn("geleert", dom["log-truncated"]["text"])
+        self.assertIn("nicht mehr beobachtbar", dom["log-truncated"]["text"])
+
+    def test_truncated_is_not_repeated_against_the_slot_reason(self):
+        """Dieselbe Aussage zweimal im selben Bild ist ein Fehler, kein Beleg.
+
+        Gezaehlt wird nur der Reiter "Jetzt" - im Reiter "Verlauf" ist der
+        `slot-reason` unsichtbar, und der `UNBEKANNT`-Eintrag dort ist die
+        einzige Stelle, an der der Grund steht.
+        """
+        dom = render(sample_state(log={"truncated": True},
+                                  slot={"state": "unknown", "reason": self.BLIND}))
+        self.assertEqual(dom["slot-note"]["text"], self.BLIND)
+        self.assertTrue(hidden(dom, "log-truncated"))
+        self.assertEqual(dom["log-truncated"]["text"], "")
+        self.assertEqual(now_tab(dom).count("nicht mehr beobachtbar"), 1,
+                         f"{now_tab(dom).count('nicht mehr beobachtbar')}x "
+                         "im Reiter 'Jetzt'")
+
+    def test_history_error_is_shown_with_its_text(self):
+        """Ein Fehler beim Historienschreiben ist ein Fehler und wird gezeigt."""
+        dom = render(sample_state(log={"history_error": "PermissionError: kein Zugriff"}))
+        self.assertFalse(hidden(dom, "log-error"))
+        self.assertIn("PermissionError: kein Zugriff", dom["log-error"]["text"])
+
+    def test_a_healthy_log_shows_nothing(self):
+        dom = render(sample_state(log={"size_mb": 12.0, "warn": False,
+                                       "truncated": False, "history_error": None}))
+        for ident in ("log-warn", "log-truncated", "log-error"):
+            self.assertTrue(hidden(dom, ident), ident)
+            self.assertEqual(dom[ident]["text"], "", ident)
+
+
 class TestOpenCount(unittest.TestCase):
     """`open_count` wird nicht angezeigt.
 

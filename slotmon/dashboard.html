@@ -57,6 +57,9 @@
 
 <section id="tab-now">
   <div id="altbestand" class="banner hidden"></div>
+  <div id="log-warn" class="banner hidden"></div>
+  <div id="log-truncated" class="banner hidden"></div>
+  <div id="log-error" class="banner hidden"></div>
   <div class="grid">
     <div class="kpi"><div class="label">Slot</div><div class="value" id="k-slot">-</div></div>
     <div class="kpi"><div class="label">Wartend</div><div class="value" id="k-wait">-</div></div>
@@ -217,6 +220,45 @@ function timeline(data) {
     record.rid ? `rid ${record.rid}` : "", nameHint(record)))).join("");
 }
 
+// `log-truncated` sagt dasselbe wie `BLIND_REASON` in `collector.py`. Steht
+// diese Begruendung schon in `slot.reason`, waere ein zweiter Satz im Dokument
+// dieselbe Aussage zweimal - kein Beleg, sondern Leseaufwand.
+const TRUNCATION_CLAIM = /log-truncated|nicht mehr beobachtbar/;
+
+// Die drei Zeilen aus `data.log`. Sie sind eigene Elemente, nicht eine
+// Kompaktzeile: Warnung, Truncate und Schreibfehler sind drei verschiedene
+// Tatsachen mit drei verschiedenen Ursachen.
+function showNotice(ident, text) {
+  const el = document.getElementById(ident);
+  el.textContent = text === null ? "" : text;
+  if (text === null) el.classList.add("hidden");
+  else el.classList.remove("hidden");
+}
+
+function renderLogNotices(logState, slot) {
+  // Spec Z. 337: Warnung ab 900 MB. `size_mb` ist die Beilage, `warn` die
+  // belegte Aussage - ohne gemessene Groesse steht keine Zahl im Text.
+  showNotice("log-warn", logState.warn === true
+    ? (logState.size_mb === null || logState.size_mb === undefined
+        ? "Log naehert sich 1 GB"
+        : `Log naehert sich 1 GB (${Math.round(logState.size_mb)} MB)`)
+    : null);
+
+  const reason = (slot && typeof slot.reason === "string") ? slot.reason : "";
+  showNotice("log-truncated",
+    logState.truncated === true && !TRUNCATION_CLAIM.test(reason)
+      ? "Log wurde geleert - die offenen rid(s) sind nicht mehr beobachtbar, "
+        + "bis wieder ein request.received im Log steht"
+      : null);
+
+  // Ein Fehler beim Schreibvorgang steht sonst nur in der Logdatei. Fuer den
+  // Leser des Dashboards ist das ein Fehler, kein Detail.
+  showNotice("log-error",
+    logState.history_error === null || logState.history_error === undefined
+      ? null
+      : `Historie nicht geschrieben: ${logState.history_error}`);
+}
+
 let lastState = null;
 
 function averageDuration(entries) {
@@ -296,6 +338,9 @@ function render(data) {
   } else {
     note.textContent = "";
   }
+
+  // Logzeilen
+  renderLogNotices(data.log, slot);
 
   // Verlaufstabelle
   const rows = data.history.slice().reverse().map(entry => `
