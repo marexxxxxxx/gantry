@@ -560,8 +560,19 @@ class Collector:
             # "WARTEND 180" neben einem Slot-Feld daher, das "Halter nicht
             # bestimmbar" sagt.
             waiting = count_of(load.value.get("num_waiting_reqs"))
-            # `Sample.at` ist die Abrufzeit. Genau darauf beruht dieses Alter.
-            age = max(0.0, now - load.at)
+            # `Sample.at` ist die Abrufzeit, und sie entsteht **nach** dem
+            # HTTP-Roundtrip (`sources.read_load`). `now` stammt dagegen vom
+            # Anfang dieses Ticks und ist damit immer kleiner als `load.at`;
+            # `now - load.at` waere strukturell negativ und `max(0.0, ...)`
+            # klemmte auf 0.0.
+            #
+            # Gemessen: `age_s` war bei jedem Takt 0.0. Die
+            # Veraltungs-Markierung im Dashboard konnte dadurch nie greifen -
+            # ein eingefrorenes Dashboard sah dabei gesund aus.
+            #
+            # Also hier die Uhr neu nehmen. Nicht `now`: die Laufzeiten
+            # weiter unten brauchen die eine Zeit des Tick-Anfangs.
+            age = max(0.0, self.now_fn() - load.at)
         else:
             load_error = load.error
         if metrics.fresh:

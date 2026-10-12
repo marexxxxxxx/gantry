@@ -495,6 +495,40 @@ class TestDegradedServer(CollectorCase):
         state = collector.tick()
         self.assertAlmostEqual(state["server"]["age_s"], 25.0, delta=0.001)
 
+    def test_age_is_positive_with_a_real_round_trip(self):
+        """Der Test oben ist untauglich, und genau deshalb ist er blau.
+
+        `pinned(..., self.now - 5.0)` setzt `Sample.at` von Hand fuenf
+        Sekunden in die Vergangenheit. Das steht in keinem Produktionspfad:
+        `sources.read_load` stempelt **nach** dem HTTP-Roundtrip. Im echten
+        Betrieb ist `now` (am Anfang des Ticks genommen) also immer **kleiner**
+        als `load.at`, und `max(0.0, now - load.at)` klemmt auf `0.0`.
+
+        Das ist kein Rundungsfehler, sondern ein toter Zweig: die
+        Veraltungs-Markierung im Dashboard kann strukturell nie greifen, und
+        ein eingefrorenes Dashboard sieht dabei gesund aus.
+
+        Hier wird der Zeitstempel von der Quelle **selbst** gesetzt, wie im
+        Betrieb.
+        """
+        collector = self.make(now_fn=time.time)
+        real = time.time
+
+        def read_load(timeout=3.0):
+            # Die Verzoegerung steht fuer den Roundtrip. Sie muss auch dann
+            # auftreten, wenn die Quelle einen echten `time.time()`-Stempel
+            # mitgibt - sonst prueft der Test nichts.
+            time.sleep(0.05)
+            return Sample({"num_reqs": 1, "num_waiting_reqs": 0}, real(), None)
+
+        collector.sources.read_load = read_load
+        state = collector.tick()
+        self.assertIsNotNone(state["server"]["age_s"])
+        self.assertGreater(
+            state["server"]["age_s"], 0.0,
+            "age_s ist strukturell 0.0 - die Quelle stempelt nach dem "
+            "Roundtrip, `now` kommt von davor")
+
 
 class TestSpeed(CollectorCase):
     def test_max_req_input_len_gives_output_pct(self):
