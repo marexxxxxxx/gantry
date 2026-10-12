@@ -57,9 +57,11 @@ Für die Halter-Erkennung braucht der Monitor zwei Zeilen im Server-Log:
 Ohne sie gibt es keine `request.received`/`request.finished`-Zeilen, und der Monitor
 kann nur „unbekannt“ melden. Die Warteschlangenzahl funktioniert auch ohne.
 
-Beim Start liest er das Log **von hinten**. Liegt beim Start noch eine Queue aus
-Aufträgen, die vor dem Aktivieren des Loggings eingereiht wurden, zeigt er diesen
-Altbestand als Banner an und behauptet keinen Halter, bis die Queue auf 0 steht.
+Beim Start liest er das Log **von vorn**. Liegt beim Start noch eine Queue aus
+Aufträgen, die vor dem Aktivieren des Loggings eingereiht wurden, zeigen sich
+darin keine `request.received`-Zeilen — der Monitor zählt stattdessen die
+Differenz zur Warteschlangenlänge und zeigt diesen **Altbestand** als Banner an.
+Einen Halter behauptet er erst, wenn die Queue auf 0 steht.
 
 ## Konfiguration
 
@@ -93,8 +95,8 @@ läuft nicht halb konfiguriert.
 
 ## Log-Aufräumen
 
-Ab 1 MB wird `/tmp/escha_server_lan.log` auf 0 gekürzt, ab 900 MB warnt das
-Dashboard.
+Ab 1 GB (`MAX_LOG_MB`) wird `/tmp/escha_server_lan.log` auf 0 gekürzt, ab 900 MB
+warnt das Dashboard. Beide Werte sind konfigurierbar.
 
 **Nicht `rm`.** Der Server hält die Datei offen (`fd 1` und `fd 2`). Ein `rm`
 entfernt nur den Verzeichniseintrag — die Datei lebt als Anonymous-Inode weiter,

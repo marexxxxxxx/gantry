@@ -78,13 +78,11 @@ alive() {
     return 0
 }
 
-is_running() {
-    pgrep -f "$PATTERN" >/dev/null 2>&1
-}
-
-monitor_pids() {
-    pgrep -f "$PATTERN" 2>/dev/null | tr '\n' ' '
-}
+# Anmerkung fuer Leser: `is_running` und `monitor_pids` stehen hier **einmal**,
+# mit dem `is_monitor_cmdline`-Filter darunter. Sie waren vorher zweimal
+# definiert - zuerst ohne Filter, dann mit. Bash nimmt die spaetere, also war
+# die erste Fassung toter Code, der beim Lesen so aussah, als gaebe es einen
+# Pfad ohne Filter.
 
 # `pgrep -f` vergleicht die **ganze Kommandozeile**, nicht den Prozessnamen.
 # Das heisst: jeder Prozess, der das Muster nur *nennt*, gilt als Treffer -
