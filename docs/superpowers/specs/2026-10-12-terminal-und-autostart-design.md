@@ -247,28 +247,51 @@ Ein abgebrochener Wartender **wird nicht** abgearbeitet — er wird aus der
 den TokenizerManager. Im Server-Log erscheint dazu ein `request.finished` mit
 `finish_reason: "abort"`.
 
-**Das ist eine offene Frage und keine Nebensache.** Der Collector liest
-`finish_reason` bereits (`collector.py:313`), **wertet es aber nirgends aus**. Ein
-abgebrochener Wartender landet damit in der Historie wie ein normal abgeschlossener
-Auftrag — mit einer Dauer, die der Zeit zwischen `request.received` und dem Abbruch
-entspricht, also dem gesamten Wartezeitraum.
+**Der Collector liest `finish_reason` bereits (`collector.py:313`), wertet es aber
+nirgends aus.** Ein abgebrochener Wartender landet damit in der Historie wie ein
+normal abgeschlossener Auftrag — mit einer Dauer, die dem gesamten Wartezeitraum
+entspricht.
 
-Zwei Lesarten, und die Wahl ist eine Produktentscheidung:
+**Entschieden (Nutzer, 2026-10-12): eigenes Ereignis.** Ein abgebrochener Auftrag ist
+kein Slot, und eine Kennzahl, die Abbrüche als Laufzeit zählt, ist falsch.
 
-| Lesart | Folge im Dashboard |
+| | Folge im Dashboard |
 |---|---|
-| **Als normaler Abschluss** | Die Historie zählt einen Slot, der nie lief. Die mittlere Slot-Dauer, die im Reiter „Verlauf" steht, wird dadurch verfälscht. |
-| **Eigenes Ereignis** | Der Eintrag trägt „abgebrochen", wird nicht in die Dauer-Mittelung gerechnet, zählt aber in „Übergaben" mit. |
+| **Eigenes Ereignis** | Der Eintrag trägt „abgebrochen", zählt in „Übergaben" mit, **nicht** in die mittlere Slot-Dauer. |
+| Als normaler Abschluss | *(verworfen)* — würde die mittlere Dauer mit jedem Abbruch verfälschen. |
 
-**Empfehlung: die zweite.** Ein abgebrochener Auftrag ist kein Slot, und eine
-Kennzahl, die Abbrüche als Laufzeit zählt, ist falsch. Die Umsetzung ist eine Zeile in
-`_flush_finished`, aber sie gehört **vor** den ersten echten Abbruch — sonst steht
-schon eine falsche Zahl im Log.
+**Die Umsetzung** ist eine Zeile in `_flush_finished`, plus eine in der Mittelung:
+`averageWait`/`averageDuration` müssen über einen schaltbaren Filter laufen, sonst
+vergisst das Dashboard die Trennung beim nächsten Umbau. Der Test prüft beides
+getrennt — ein Historieeintrag mit `finish_reason: "abort"` **darf** in „Übergaben"
+stehen und **darf nicht** in der mittleren Dauer stehen.
 
-Zu entscheiden ist außerdem, ob der Wartende **nach** dem Abbruch wieder als
-Wartender erscheint. Er tut es nicht: seine `request.finished`-Zeile schließt ihn.
-Das ist richtig, aber es heißt auch, dass die Positionen nach einem Abbruch
-durchnummeriert verschieben.
+**Die beiden Abbruch-Arten sind im Log nicht unterscheidbar — und das ist eine
+echte offene Frage, keine Formulierung.**
+
+Ein abgebrochener **Halter** und ein abgebrochener **Wartender** erzeugen beide
+`request.finished` mit `finish_reason: "abort"`. Der Unterschied steckt nur im
+Zeitverlauf: beim Halter ist die Zeit zwischen `received` und `finished` die echte
+Laufzeit, beim Wartenden die Wartezeit. **`finish_reason` allein trennt sie nicht.**
+
+| Lesart | Folge |
+|---|---|
+| **Jeder `abort` ist ein eigenes Ereignis** | Einfach, ehrlich, aber die Rechenzeit eines abgebrochenen Halters zählt nicht in der mittleren Slot-Dauer. Das ist die *real* verlorene Rechenzeit. |
+| **Abbruch ist Abbruch, außer der Halter lief** | Sauberere Kennzahlen, braucht aber eine zweite Information, die es in der Zeile nicht gibt. |
+
+**Empfehlung: die erste, solange die zweite nicht belegbar ist.** Eine
+Durchschnittszahl, die eine verkleinerte Menge enthält, ist schlimmer als eine, die
+einen Sonderfall auslässt — beide sind erklärbar, nur die erste ist es ohne
+zusätzliche Annahme.
+
+Wichtig für die Umsetzung: `_flush_finished` schreibt **jeden** Abschluss, auch einen
+abgebrochenen Halter. Das ist richtig — der Slot wurde belegt, und das gehört in die
+Historie. Offen bleibt nur, ob seine Dauer in die Mittelung eingeht.
+
+**Und noch etwas, das man leicht übersieht:** Nach dem Abbruch eines Wartenden
+erscheint er **nicht** wieder in der Liste — seine `request.finished`-Zeile schließt
+ihn. Das ist richtig, aber die Positionen verschieben sich dadurch durchnummeriert.
+Wer Position 3 abbricht, sieht danach einen anderen Auftrag auf Position 3.
 
 ### Der Fall, den wir nicht absichern können
 
@@ -531,6 +554,20 @@ Absicht.
 | Altbestand > 0 → **leere** Liste, kein Abbrechen | Liste wird aus der Warteschlangenlenzahl geraten |
 | Position 1 = nächster dran | Aussage fällt weg |
 | Leere Queue → „keine Wartenden" | Leere Tabelle ohne Erklärung |
+
+### Die Historie nach einem Abbruch
+
+| Test | Mutant, der ihn töten muss |
+|---|---|
+| Ein `abort` **zählt** in „Übergaben" | Eintrag wird ganz verworfen |
+| Ein `abort` steht **mit** „abgebrochen" in der Liste | Etwas anderes steht da |
+| **Ein `abort` steht nicht in der mittleren Dauer** | Filter in `averageWait`/`averageDuration` entfällt |
+| Ein normaler Abschluss steht **in** der mittleren Dauer | Filter wirkt auf alle Einträge |
+| **Ein abgebrochener Halter** wird in die Historie geschrieben | `_flush_finished` verwirft `abort` pauschal |
+
+Der letzte Test ist der Gegenpol zum dritten: Der Slot **war** belegt, und die
+verlorene Rechenzeit ist eine Tatsache, die nirgends sonst auftaucht. Wer beides
+verwirft, verliert sie endgültig.
 
 ### Das Dashboard und die TUI
 
