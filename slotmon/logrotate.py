@@ -90,6 +90,11 @@ class RotateResult:
     truncated: bool = False
     warn: bool = False
     error: str | None = None
+    #: Unix-Zeit der Messung, aus der diese Werte stammen. `None`, wenn dieser
+    #: Takt uebersprungen wurde. Der Collector fuellt das auf einem
+    #: uebersprungenen Takt aus seinem zuletzt gemessenen Befund nach, damit
+    #: eine Warnung nicht zwischen zwei Messungen verschwindet.
+    measured_at: float | None = None
 
 
 class LogRotator:

@@ -23,7 +23,7 @@ from unittest import mock
 
 from slotmon.collector import Collector
 from slotmon.config import load_config
-from slotmon.logrotate import RotateResult
+from slotmon.logrotate import LogRotator, RotateResult
 from slotmon.sources import Sample, ServerSources
 
 #: Unix-Zeit des `request.received` der Fixtures.
@@ -106,6 +106,7 @@ class CollectorCase(unittest.TestCase):
         self.log = os.path.join(self.dir, "escha_server_test.log")
         with open(self.log, "w", encoding="utf-8"):
             pass
+
         # Auch das Monitor-Log wird rotiert. Ohne eigene Temp-Datei fasste ein
         # Testlauf das echte /tmp/slotmon.log an.
         self.monitor_log = os.path.join(self.dir, "slotmon.log")
@@ -136,6 +137,15 @@ class CollectorCase(unittest.TestCase):
     def server_info(self, **kwargs):
         self.info_calls += 1
         return self.sample({"max_req_input_len": MAX_REQ_INPUT_LEN})
+
+    def write_log_mb(self, path, size_mb):
+        """Logdatei auf eine Groesse bringen.
+
+        Byte-genau, damit `size_mb` im Rotator wirklich das ist, was der Test
+        behauptet - 4.5 MB sind 4718592 Bytes, nicht 4.
+        """
+        with open(path, "wb") as handle:
+            handle.write(b"x" * int(size_mb * 1024 * 1024))
 
     def make(self, names=None, now_fn=None, cfg=None):
         collector = Collector(
@@ -737,6 +747,62 @@ class TestRotation(CollectorCase):
         output = self.stderr_of(lambda: [collector.tick() for _ in range(5)])
         self.assertEqual(output.count("server_log"), 1)
         self.assertEqual(output.count("monitor_log"), 1)
+
+    def test_a_warning_stays_visible_between_two_measurements(self):
+        """Der Rotator misst nur jeden 60. Takt - die Warnung muss trotzdem stehen.
+
+        Aus dem Whole-Branch-Review. `LogRotator.check()` liefert auf einem
+        uebersprungenen Takt absichtlich nichts: ein Takt, der nicht gemessen
+        hat, soll das auch sagen. Das ist eine Zusage aus Task 8 und sie
+        bleibt - aber sie endete in der Anzeige, denn der Collector reichte
+        den leeren Befund unveraendert durch.
+
+        Gemessen waren 2 von 120 Taks mit `warn=True` (Indizes 0 und 60). Bei
+        `POLL_INTERVAL=2.0` ist die Warnung damit 1,7 Prozent der Zeit
+        sichtbar; 98 Sekunden lang stand im Dashboard gar nichts.
+
+        Randbedingung 3 verbietet `0`, nicht "zuletzt gemessen".
+        """
+        collector = self.make()
+        # Datei zwischen warn_mb und max_mb: gewarnt, aber nicht gekuerzt.
+        self.write_log_mb(self.log, 4.5)
+        collector.rotator = LogRotator(max_mb=5, warn_mb=4)
+
+        zustaende = [collector.tick() for _ in range(61)]
+        with_warn = [z for z in zustaende if z["log"]["warn"]]
+        self.assertEqual(
+            len(with_warn), 61,
+            f"nur {len(with_warn)} von 61 Taks zeigten die Warnung")
+
+    def test_the_stale_measurement_carries_its_timestamp(self):
+        """Ein alter Befund wird als alter ausgewiesen, nicht als frischer.
+
+        Sonst waere eine Groesse von vor zwei Minuten von einer frischen nicht
+        zu unterscheiden - und genau das ist die Behauptung, die die Kachel
+        tragen soll.
+        """
+        collector = self.make()
+        self.write_log_mb(self.log, 4.5)
+        collector.rotator = LogRotator(max_mb=5, warn_mb=4)
+
+        collector.tick()
+        self.now += 10.0
+        spaeter = collector.tick()
+        self.assertEqual(spaeter["log"]["measured_at"], self.now - 10.0,
+                         "der Zeitstempel sagt nicht, dass der Befund alt ist")
+
+    def test_a_fresh_measurement_is_not_marked_stale(self):
+        """Nach einer echten Messung ist nichts veraltet.
+
+        Sonst wuerde jede Kachel dauerhaft "gemessen vor N s" sagen und der
+        Unterschied zwischen alt und frisch ginge verloren.
+        """
+        collector = self.make()
+        self.write_log_mb(self.log, 0.5)
+        collector.rotator = LogRotator(max_mb=5, warn_mb=4)
+        state = collector.tick()
+        self.assertEqual(state["log"]["measured_at"], self.now)
+        self.assertLess(state["log"]["measured_at"] - self.now, 1.0)
 
 
 class TestHistoryCompaction(CollectorCase):

@@ -146,6 +146,16 @@ class Collector:
         self._last_compact = None
         #: Zuletzt protokollierter Rotationsfehler je Logdatei.
         self._last_rotate_error = {}
+        #: Zuletzt **gemessener** Rotationsbefund je Logdatei. Der Rotator prueft
+        #: nur jeden 60. Takt und liefert sonst absichtlich nichts - ohne diese
+        #: Merkung war eine Warnung in 2 von 120 Ticks sichtbar (gemessen,
+        #: Indizes 0 und 60) und das Dashboard zeigte 98 Sekunden lang nichts.
+        #:
+        #: Nicht im Rotator: dort ist "nichts melden" eine bewusste Zusage aus
+        #: Task 8 - ein Takt, der nicht gemessen hat, soll das auch sagen. Hier
+        #: im Collector geht es um die *Anzeige*, und da ist "zuletzt gemessen,
+        #: vor N s" etwas voellig anderes als "nichts bekannt".
+        self._last_rotate = {}
         #: rids aus history.jsonl, damit ein Neustart sie nicht doppelt schreibt.
         self._recorded = None
         #: Letzter Schreibfehler der Historie, fuer den `log`-Teil des Zustands.
@@ -208,7 +218,7 @@ class Collector:
                       "output_pct": None},
             "gpu": {"util": None, "used_mb": None, "total_mb": None},
             "log": {"size_mb": None, "warn": False, "truncated": False,
-                    "history_error": None},
+                    "history_error": None, "measured_at": None},
             "history": [],
         }
 
@@ -476,7 +486,7 @@ class Collector:
         # dem Filter raus, sonst waechst er ohne Ende.
         self._recorded = None
 
-    def _rotate(self, name, rotator):
+    def _rotate(self, name, rotator, now):
         """`check()` aufrufen und das Ergebnis melden.
 
         Ein Aufrufer-Gate neben `check()` waere die zweite Taktung, an der die
@@ -486,6 +496,36 @@ class Collector:
         """
         path = getattr(self.cfg, name)
         rotate = rotator.check(path)
+        if rotate.size_mb is None and rotate.error is None:
+            # Der Rotator hat diesen Takt uebersprungen. Der letzte gemessene
+            # Befund wird weitergereicht, damit eine Warnung nicht zwischen
+            # zwei Messungen verschwindet. Gemessen: `warn=True` in 2 von 120
+            # Taks statt in allen.
+            alt = self._last_rotate.get(name)
+            # **Nur eine belastbare Aussage** wird weitergereicht: eine
+            # Warnung oder ein Kuerzen. Eine harmlose Groesse nicht - die
+            # zusage "nicht gemessen" heisst "nicht gemessen", und
+            # `test_skipped_tick_reports_no_size_not_zero` haelt sie fest.
+            # Die Warnung ist das einzige, was zwischen zwei Messungen
+            # verschwinden und damit ungesehen bleiben wuerde.
+            if alt is not None and (alt["warn"] or alt["truncated"]):
+                rotate.size_mb = alt["size_mb"]
+                rotate.warn = alt["warn"]
+                rotate.measured_at = alt["at"]
+                # **`truncated` nicht** weiterreichen. Das Kuerzen ist ein
+                # **Ereignis**, kein Zustand: es hat genau einmal stattgefunden.
+                # Dauerhaft gemeldet wuerde der Blind-Flag nie wieder fallen und
+                # der Slot bliebe ewig `unknown` - genau das, was zwei Tests
+                # aus Task 8 verhindern.
+                rotate.truncated = False
+        else:
+            rotate.measured_at = now
+            self._last_rotate[name] = {
+                "size_mb": rotate.size_mb,
+                "warn": rotate.warn,
+                "truncated": rotate.truncated,
+                "at": now,
+            }
         if rotate.truncated:
             size = "unbekannt" if rotate.size_mb is None else f"{rotate.size_mb:.0f} MB"
             self._log(f"log-truncated {size} -> 0 ({path})")
@@ -720,8 +760,8 @@ class Collector:
         if ctx is not None and max_req_input_len:
             output_pct = round(100.0 * ctx / max_req_input_len, 2)
 
-        rotate = self._rotate("server_log", self.rotator)
-        self._rotate("monitor_log", self.monitor_rotator)
+        rotate = self._rotate("server_log", self.rotator, now)
+        self._rotate("monitor_log", self.monitor_rotator, now)
         truncated = rotate.truncated
         if truncated:
             # Die Datei ist leer; der Reader beginnt dort von vorn. Die
@@ -801,6 +841,9 @@ class Collector:
         state["log"] = {
             "size_mb": rotate.size_mb, "warn": rotate.warn,
             "truncated": truncated, "history_error": self._history_error,
+            # Wann zuletzt **gemessen** wurde. Ohne das ist ein Befund von
+            # diesem Takt nicht von einem von vor zwei Minuten zu unterscheiden.
+            "measured_at": rotate.measured_at,
         }
         state["history"] = self.history.load(now)
 

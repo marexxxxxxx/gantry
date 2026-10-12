@@ -241,10 +241,20 @@ function formatMb(value) {
 function renderLogNotices(logState, slot) {
   // Spec Z. 337: Warnung ab 900 MB. `size_mb` ist die Beilage, `warn` die
   // belegte Aussage - ohne gemessene Groesse steht keine Zahl im Text.
+  //
+  // Der Rotator misst nur jeden 60. Takt, der Collector reicht den letzten
+  // gemessenen Befund aber durch. `measured_at` sagt, wie alt er ist: ohne
+  // das waere eine Groesse von vor zwei Minuten nicht von einer frischen zu
+  // unterscheiden, und die Warnung waere zeitweise einfach weg.
+  const stale = typeof logState.measured_at === "number"
+    ? Math.max(0, Math.round(data.at - logState.measured_at)) : null;
+  const note = stale !== null && stale > 5
+    ? ` (gemessen vor ${duration(stale)})`
+    : "";
   showNotice("log-warn", logState.warn === true
     ? (logState.size_mb === null || logState.size_mb === undefined
-        ? "Log naehert sich 1 GB"
-        : `Log naehert sich 1 GB (${formatMb(logState.size_mb)} MB)`)
+        ? `Log naehert sich 1 GB${note}`
+        : `Log naehert sich 1 GB (${formatMb(logState.size_mb)} MB)${note}`)
     : null);
 
   const reason = (slot && typeof slot.reason === "string") ? slot.reason : "";
