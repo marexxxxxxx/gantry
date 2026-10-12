@@ -50,6 +50,50 @@ class TestLegacy(unittest.TestCase):
         self.assertTrue(state.complete)
 
 
+class TestUnusableWaiting(unittest.TestCase):
+    """Ein `waiting`, das keine Zahl ist, ist **unbekannt**, nicht null.
+
+    `evaluate()` bekommt `waiting` aus `/get_load`. sglang ist JSON, also
+    steht dort normalerweise eine Zahl - aber JSON erlaubt auch `"180"`
+    oder `true`, und `sources.py:63` holt den Wert mit `.get()`, ohne ihn
+    zu pruefen. `max(0, "0" - 0)` wirft `TypeError`, und damit verlaesst
+    die Exception `tick()`.
+
+    Das widerspricht der Zusicherung "keine Quelle wirft aus `tick()`"
+    und der Fehlerbehandlung "Ist nur eine Quelle tot, zeigen die
+    uebrigen Kacheln weiter; Monitor laeuft weiter".
+
+    Befund aus Task 8, dort bewusst auf den Whole-Branch-Review
+    verschoben, weil `slot.py` dort nicht freigegeben war.
+    """
+
+    def test_a_numeric_string_is_not_a_number(self):
+        """`"0"` ist keine 0. Es ist eine Behauptung, die wir nicht lesen koennen."""
+        state = evaluate({}, waiting="0")
+        self.assertIsNone(state.legacy)
+        self.assertFalse(state.complete)
+        self.assertIsNone(state.holder_rid)
+
+    def test_a_non_empty_string_yields_unknown_too(self):
+        state = evaluate({"a": 1.0}, waiting="180")
+        self.assertIsNone(state.legacy)
+        self.assertIsNone(state.holder_rid)
+
+    def test_a_bool_is_not_a_count(self):
+        """`True` ist im JSON eine Zahl, aber keine Warteschlangenlaenge.
+
+        `bool` ist eine Subklasse von `int` in Python; `max(0, True - 0)`
+        ergaebe 1 und damit eine erfundene Wartenden-Zahl.
+        """
+        state = evaluate({}, waiting=True)
+        self.assertIsNone(state.legacy)
+
+    def test_a_float_count_still_works(self):
+        """Kein Ueberdrehen: `180.0` ist eine Zahl und bleibt eine."""
+        state = evaluate({"a": 1.0}, waiting=180.0)
+        self.assertEqual(state.legacy, 179)
+
+
 class TestHolderSinceClock(unittest.TestCase):
     """`holder_since` ist Unix-Zeit aus dem Log-`timestamp`, nicht `received_time`.
 

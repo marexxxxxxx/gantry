@@ -47,7 +47,7 @@ from slotmon.history import History
 from slotmon.logreader import FINISHED, RECEIVED, LogReader
 from slotmon.logrotate import LogRotator
 from slotmon.names import resolve
-from slotmon.slot import evaluate
+from slotmon.slot import count_of, evaluate
 from slotmon.sources import ServerSources
 
 #: sglangs interner Health-Check nutzt ``HEALTH_CHECK_<unix>.<usec>`` als rid
@@ -551,7 +551,15 @@ class Collector:
         age = None
         if load.fresh:
             connected = True
-            waiting = load.value.get("num_waiting_reqs")
+            # `sources.py` holt den Wert mit `.get()`, ohne ihn zu pruefen.
+            # JSON erlaubt dort auch `"180"` und `true`; eine davon als
+            # Wartenden-Zahl anzuzeigen, waere eine Behauptung, die nicht
+            # belegt ist. Dieselbe Wache wie in `slot._count` - dort
+            # schuetzt sie vor der `TypeError`, hier vor der falschen Zahl
+            # im Dashboard. Ein Wert, der hier durchfaellt, kaeme als
+            # "WARTEND 180" neben einem Slot-Feld daher, das "Halter nicht
+            # bestimmbar" sagt.
+            waiting = count_of(load.value.get("num_waiting_reqs"))
             # `Sample.at` ist die Abrufzeit. Genau darauf beruht dieses Alter.
             age = max(0.0, now - load.at)
         else:

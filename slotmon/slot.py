@@ -27,8 +27,26 @@ class SlotState:
     complete: bool
 
 
+def count_of(value):
+    """Eine verwertbare Warteschlangenlaenge, oder `None`.
+
+    `waiting` kommt aus `/get_load` per `.get()`, also ungeprueft. JSON
+    erlaubt dort auch `"180"` und `true`. Beides ist keine Zahl:
+    `max(0, "0" - 0)` wirft `TypeError` und `bool` ist in Python eine
+    Subklasse von `int`, weshalb `True` stillschweigend zur 1 wuerde.
+
+    Beides waere eine **Behauptung ueber den Server**, die nicht belegt
+    ist. Deshalb ist die Antwort `None`, nicht 0 - derselbe Weg, den
+    `waiting=None` schon nimmt.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
 def evaluate(open_rids, waiting):
     open_count = len(open_rids)
+    waiting = count_of(waiting)
     if waiting is None:
         return SlotState(None, None, open_count, None, False)
 
