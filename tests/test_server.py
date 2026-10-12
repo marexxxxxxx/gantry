@@ -371,6 +371,13 @@ const sessionStorage = { getItem: () => null, setItem: () => {} };
 // Harness-Schnur statt am Verhalten scheitern lassen.
 const fetch = () => ({ then: () => ({ then: () => ({}) }) });
 const EventSource = class { constructor(url) { this.url = url; } };
+// Timer werden nicht ausgefuehrt - `node` wuerde sonst ewig haengen. Die
+// Rueckrufe werden aber **gesammelt**, damit der Test sie einmal aufrufen
+// kann: die Altersanzeige soll ohne SSE-Tick weiterlaufen, und das ist nur
+// pruefbar, wenn der Tick wirklich beim Warten ausgefuehrt wird.
+const __timers = [];
+const setInterval = (fn) => { __timers.push(fn); return __timers.length; };
+function __runTimers() { for (const fn of __timers) fn(); }
 function __dump() {
   const out = {};
   for (const id of Object.keys(__els)) {
@@ -384,6 +391,7 @@ function __dump() {
       attrs: el.attrs,
     };
   }
+  out["#timers"] = __timers.length;
   return out;
 }
 """
@@ -400,7 +408,11 @@ const __list = Array.isArray(__states);
 const __states_ = __list ? __states : [__states];
 const __dumps = [];
 for (const state of __states_) { render(state); __dumps.push(__dump()); }
-process.stdout.write(JSON.stringify(__list ? __dumps : __dumps[0]));
+// `process.argv[4]` schaltet die gesammelten Timer einmal aus. Ohne das
+// waere die Altersanzeige nach einem Fehler eine eingefrorene Zahl.
+if (process.argv[4] === "timers") __runTimers();
+process.stdout.write(JSON.stringify(__list && process.argv[4] !== "timers"
+  ? __dumps : __dump()));
 """
 
 #: `node` oder `nodejs`. Ohne einen davon laeuft der `render()`-Test nicht -
@@ -408,7 +420,7 @@ process.stdout.write(JSON.stringify(__list ? __dumps : __dumps[0]));
 NODE = shutil.which("node") or shutil.which("nodejs")
 
 
-def render(state, more=()):
+def render(state, more=(), run_timers=False):
     """`render()` aus `dashboard.html` mit einem DOM-Stub ausfuehren.
 
     Der HTML-Text wird nicht geparst und nicht mit `assertIn` abgetastet:
@@ -422,6 +434,11 @@ def render(state, more=()):
     Puffer, und der gemessene Poll-Takt braucht zwei `data.at`. Der
     Rueckgabewert ist dann eine **Liste** mit einem Eintrag je `render()`,
     sonst ein einzelnes Element-Objekt.
+
+    `run_timers` fuehrt die gesammelten `setInterval`-Rueckrufe einmal aus und
+    gibt den Endzustand zurueck. Damit ist pruefbar, dass die
+    Altersanzeige ohne einen SSE-Tick weiterlaeuft - eine eingefrorene Zahl
+    waere nach einer Minute eine Luege.
     """
     html = read_dashboard()
     match = SCRIPT_BLOCK.search(html)
@@ -436,7 +453,8 @@ def render(state, more=()):
             handle.write(program)
         with open(payload, "w", encoding="utf-8") as handle:
             json.dump([state, *more] if more else state, handle)
-        done = subprocess.run([NODE, script, payload, json.dumps(ids)],
+        done = subprocess.run([NODE, script, payload, json.dumps(ids),
+                               "timers" if run_timers else "no-timers"],
                               capture_output=True, text=True, timeout=30)
     if done.returncode != 0:
         raise AssertionError(f"render() ist abgebrochen:\n{done.stderr}")
@@ -1080,13 +1098,13 @@ class TestStreamError(unittest.TestCase):
         self.assertEqual(after["slot-note"]["text"], before["slot-note"]["text"])
 
     def test_the_failure_is_visible(self):
-        after = render(sample_state(), [{"error": "RuntimeError: Poll kaputt"}])
+        _, after = render(sample_state(), [{"error": "RuntimeError: Poll kaputt"}])
         line = after["source-age"]["text"]
         self.assertIn("Poll kaputt", line)
         self.assertIn("fehlgeschlagen", line)
 
     def test_the_age_of_the_good_value_is_still_shown(self):
-        after = render(sample_state(), [{"error": "RuntimeError: Poll kaputt"}])
+        _, after = render(sample_state(), [{"error": "RuntimeError: Poll kaputt"}])
         # Ohne diese Zahl ist nicht zu erkennen, wie alt der gute Wert ist.
         self.assertIn("Letzter Wert", after["source-age"]["text"])
 
@@ -1094,9 +1112,27 @@ class TestStreamError(unittest.TestCase):
         good = sample_state(server={"connected": True, "load_error": None,
                                     "age_s": 0.1})
         _, _, after = render(good,
-                             [{"error": "RuntimeError: Poll kaputt"}],
-                             [good])
+                             [{"error": "RuntimeError: Poll kaputt"}, good])
         self.assertNotIn("fehlgeschlagen", after["source-age"]["text"])
+
+    def test_the_age_keeps_counting_while_the_stream_is_silent(self):
+        """Ohne SSE-Tick muss die Altersanzeige weiterlaufen.
+
+        Ohne den Timer stuende die Zahl nach dem Fehler auf "0 s" still -
+        das waere eine Luege, sobald der gute Wert eine Minute alt ist.
+        """
+        idle = render(sample_state(), [{"error": "RuntimeError: Poll kaputt"}],
+                      run_timers=True)
+        self.assertGreaterEqual(idle["#timers"], 1)
+        self.assertIn("fehlgeschlagen", idle["source-age"]["text"])
+        # Der Timer darf die Kacheln nicht anfassen, nur die Alterszeile.
+        self.assertEqual(idle["k-wait"]["html"], "3")
+
+    def test_an_error_before_the_first_state_does_not_throw(self):
+        """Der allererste Rahmen kann der Fehler sein - auch das darf nicht
+        den Aufruf abbrechen."""
+        after = render({"error": "RuntimeError: erster Poll"})
+        self.assertIn("erster Poll", after["source-age"]["text"])
 
 
 class TestOpenCount(unittest.TestCase):

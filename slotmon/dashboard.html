@@ -298,6 +298,15 @@ let lastAt = null;
 // `load_error` und `age_s` - fuer `/metrics` und `nvidia-smi` liefert der
 // Zustand kein Alter, also steht hier keines. Eine erfundene Zahl waere
 // schlimmer als ein Strich: `null` heisst "nicht gemessen".
+//
+// Die Zeile traegt **zwei** Dinge: das Alter der Quelle aus dem Zustand und -
+// seit F9 - den Fehler des zuletzt fehlgeschlagenen Ticks samt dem Alter des
+// letzten guten Werts. Beide Male dasselbe Dekor: eine Anzeige, die sagt "das
+// hier ist nicht aktuell", damit die Kacheln nicht stillstehen und so tun, als
+// waeren sie es.
+let streamError = null;
+let lastGoodAt = null;
+
 function renderSourceAge(server) {
   const measured = (typeof server.age_s === "number" && isFinite(server.age_s));
   const age = measured ? server.age_s.toFixed(1) + " s" : DASH;
@@ -310,7 +319,36 @@ function renderSourceAge(server) {
   if (server.connected === true && measured && server.age_s > 3 * tickIntervalS) {
     parts.push("veraltet");
   }
-  document.getElementById("source-age").textContent = "Quellen: " + parts.join(" - ");
+  const line = ["Quellen: " + parts.join(" - ")];
+  if (streamError !== null) {
+    line.push(`Letzter Tick fehlgeschlagen: ${streamError} - `
+      + `Letzter Wert vor ${secondsSinceLastGood()} s`);
+  }
+  document.getElementById("source-age").textContent = line.join(" | ");
+}
+
+// Wie alt der zuletzt **gute** Zustand ist. Ohne diese Zahl ist nicht zu
+// erkennen, wie alt die stehen gebliebenen Kacheln sind - und genau das ist
+// der Fehlerfall, den die Spec mit "Kacheln zeigen Alter statt Zahl"
+// beschreibt.
+function secondsSinceLastGood() {
+  if (lastGoodAt === null) return DASH;
+  const age = Date.now() / 1000 - lastGoodAt;
+  return age >= 0 ? age.toFixed(0) : "0";
+}
+
+// Ein Fehler im SSE-Rahmen. Die Werte bleiben stehen - `render()` wird
+// **nicht** aufgerufen, denn `data.slot` waere `undefined` und `slot.legacy`
+// wuerfe mit `TypeError`; die Anzeige bliebe auf dem letzten guten Tick
+// stehen, ohne jede Altersangabe.
+function noteStreamError(message) {
+  streamError = message;
+  if (lastState === null) {
+    document.getElementById("source-age").textContent =
+      `Letzter Tick fehlgeschlagen: ${message} - Letzter Wert ${DASH}`;
+    return;
+  }
+  renderSourceAge(lastState.server);
 }
 
 function averageDuration(entries) {
@@ -320,6 +358,20 @@ function averageDuration(entries) {
 }
 
 function render(data) {
+  // Ein Fehlerrahmen des SSE-Streams ist **kein** Zustand. Ihn an `render()`
+  // zu reichen hiesse `slot.legacy` auf `undefined` zu lesen: der Aufruf
+  // bricht mit `TypeError` ab, die Anzeige bleibt auf dem letzten guten Tick
+  // stehen - ohne jede Altersangabe, also genau in dem Fehlerfall, den die
+  // Spec mit "Kacheln zeigen Alter statt Zahl" beschreibt. Der Client prueft
+  // die Bedingung in `onmessage`, `render()` prueft sie noch einmal: eine
+  // Bedingung, die nur an einer Stelle steht, steht an der falschen.
+  if (data === null || typeof data !== "object" || data.error) {
+    noteStreamError(data && data.error
+      ? String(data.error) : "unlesbarer Rahmen ohne Fehlerangabe");
+    return;
+  }
+  streamError = null;
+  lastGoodAt = Date.now() / 1000;
   lastState = data;
   const slot = data.slot, queue = data.queue, speed = data.speed, gpu = data.gpu;
 
@@ -465,7 +517,28 @@ if (saved && saved !== "now") document.querySelector(`[data-tab="${saved}"]`).cl
 fetch("/api/state").then(r => r.json()).then(render);
 
 const source = new EventSource("/api/stream");
-source.onmessage = event => render(JSON.parse(event.data));
+source.onmessage = event => {
+  let data;
+  try {
+    data = JSON.parse(event.data);
+  } catch (err) {
+    noteStreamError(`unlesbarer Rahmen: ${err}`);
+    return;
+  }
+  if (data && data.error) {
+    noteStreamError(String(data.error));
+    return;
+  }
+  render(data);
+};
+
+// Die Altersangabe muss weiterlaufen, auch wenn kein Tick kommt - sonst
+// stuende die Zahl still und waere nach einer Minute eine Luege. Der Takt
+// liegt bei einer Sekunde, unabhaengig von `POLL_INTERVAL`: es geht um die
+// Anzeige des Alters, nicht um den Poll.
+setInterval(() => {
+  if (lastState !== null) renderSourceAge(lastState.server);
+}, 1000);
 </script>
 </body>
 </html>
