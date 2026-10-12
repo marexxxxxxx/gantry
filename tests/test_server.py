@@ -667,6 +667,56 @@ class TestTimeline(unittest.TestCase):
                          "FERTIG - - - ctx - - - tok/s - - tok - - cache")
 
 
+class TestNameHint(unittest.TestCase):
+    """Wer seinen Namen erst durch den Abschluss erfuhr, sagt das.
+
+    Spec Z. 303-304: "Eintraege, deren Systemname erst durch den Abschluss
+    bekannt wurde, zeigen ihn mit dem Hinweis `Name nachtraeglich`".
+
+    `collector.py` setzt `record["system"] = resolve(...)` **erst im Moment des
+    Abschlusses** - waehrend des Laufs stand der Name nie fest. Der Hinweis
+    gehoert also an **jeden** Eintrag mit Name oder IP, und an keinen ohne.
+    """
+
+    def hint_of(self, dom):
+        found = [record for record in timeline(dom) if "FERTIG" in record[2]]
+        if len(found) != 1:
+            raise AssertionError(f"{len(found)} FERTIG-Eintraege, erwartet einer")
+        return found[0][2]
+
+    def test_named_entry_carries_the_hint(self):
+        dom = render(sample_state(history=[entry(system="Laptop")]))
+        html = self.hint_of(dom)
+        self.assertIn("Laptop", html)
+        self.assertIn("Name nachtraeglich", html)
+
+    def test_ip_only_entry_carries_the_hint_too(self):
+        """Nur die IP aufgeloest, kein Name: der Name war trotzdem erst spaeter da."""
+        dom = render(sample_state(history=[entry(system=None)]))
+        html = self.hint_of(dom)
+        self.assertIn("192.168.9.2:44444", html)
+        self.assertIn("Name nachtraeglich", html)
+
+    def test_entry_without_ip_and_name_says_so_instead(self):
+        """Ohne Name **und** ohne IP ist das ein anderer Fall.
+
+        Die Abschlusszeile trug keine Client-Adresse. Das ist nicht "der Name
+        kam spaeter", das ist "es gibt keine Zuordnung" - und `Name
+        nachtraeglich` waere hier eine falsche Aussage.
+        """
+        dom = render(sample_state(history=[entry(system=None, ip_port=None)]))
+        html = self.hint_of(dom)
+        self.assertIn("keine IP im Log", html)
+        self.assertNotIn("Name nachtraeglich", html)
+
+    def test_the_running_entry_has_no_hint(self):
+        """Der laufende Slot kennt seinen Namen noch nicht - der Hinweis
+        gehoert zu abgeschlossenen Eintraegen, nicht zum laufenden."""
+        dom = render(sample_state(slot={"state": "busy", "rid": "r", "system": None,
+                                        "duration_s": 5.0}))
+        self.assertNotIn("Name nachtraeglich", timeline(dom)[0][2])
+
+
 class TestOpenCount(unittest.TestCase):
     """`open_count` wird nicht angezeigt.
 

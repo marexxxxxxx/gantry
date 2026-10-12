@@ -149,19 +149,31 @@ function meanRate(tokens, seconds) {
   return tokens / seconds;
 }
 
-// Der Hinweis, dass der Name erst durch den Abschluss bekannt wurde. Die
-// Bedingung wird in F3 korrigiert - sie ist hier noch die alte.
+// Der Hinweis auf den Namen des Eintrags.
+//
+// `collector.py` setzt `record["system"] = resolve(names, host_of(ip_port))`
+// **erst im Moment des Abschlusses** (`collector.py:362`). Waehrend des Laufs
+// stand der Systemname nie fest - er wurde zur Abschlusszeit aufgeloest, als
+// die Access-Log-Zeile endlich vorlag. Der Hinweis gehoert also an **jeden**
+// Eintrag mit Name oder IP.
+//
+// Ein Eintrag **ohne** Name und **ohne** IP ist ein anderer Fall: die
+// Abschlusszeile trug keine Client-Adresse, es gab also nie eine Zuordnung,
+// die "nachgetraeglich" werden konnte. Dafuer steht `keine IP im Log`.
 function nameHint(record) {
-  return record.system === null && record.ip_port === null
-    ? '<span class="muted">Name nachtraeglich</span>' : "";
+  if (record.system === null && record.ip_port === null) {
+    return '<span class="muted">keine IP im Log</span>';
+  }
+  return '<span class="muted">Name nachtraeglich</span>';
 }
 
 // Ein Zeitstrahl-Eintrag. `color` ist eine der vorhandenen Variablen
 // (`--ok` gruen, `--idle` grau, `--warn` orange); es gibt keine neue Farbe.
-function tlEntry(cls, color, head, meta, tail) {
+function tlEntry(cls, color, head, meta, tail, hint) {
   return `<div class="tl-entry ${cls}" style="border-left:3px solid ${color}">`
     + `<strong>${head}</strong> <span class="muted">${meta}</span>`
     + (tail ? ` <span class="rid">${tail}</span>` : "")
+    + (hint ? ` ${hint}` : "")
     + `</div>`;
 }
 
@@ -202,7 +214,7 @@ function timeline(data) {
     + ` - ${dec(meanRate(record.completion_tokens, record.duration_s), 1)} tok/s`
     + ` - ${num(record.completion_tokens)} tok`
     + ` - ${num(record.cached_tokens)} cache`,
-    (record.rid ? `rid ${record.rid}` : "") + nameHint(record)))).join("");
+    record.rid ? `rid ${record.rid}` : "", nameHint(record)))).join("");
 }
 
 let lastState = null;
