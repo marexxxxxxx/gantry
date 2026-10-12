@@ -71,6 +71,7 @@
   </div>
 
   <div class="note" id="source-age"></div>
+  <div class="note" id="wait-footnote"></div>
 
   <div class="card slot" id="slot-card">
     <div><span class="badge unknown" id="slot-badge">-</span>
@@ -261,6 +262,17 @@ function renderLogNotices(logState, slot) {
       : `Historie nicht geschrieben: ${logState.history_error}`);
 }
 
+// Spec Z. 245-246 und 252-253: "Der Halter-Wechsel wird erst erkannt, wenn
+// der naechste Halter tatsaechlich sendet. Im Extremfall steht der alte Name
+// wenige Sekunden zu lang." - der dritte Punkt der Grenzenliste als Fussnote
+// an der WARTEND-Kachel. Der Satz steht an beiden Orten: der `title` erscheint
+// nur mit der Maus, und gerade in diesem Zustand schaut niemand auf die
+// Kachel.
+const HOLD_SWITCH_NOTE =
+  "Der Halter-Wechsel wird erst erkannt, wenn der naechste Halter "
+  + "tatsaechlich sendet - im Extremfall steht der alte Name wenige "
+  + "Sekunden zu lang.";
+
 let lastState = null;
 
 // Der Poll-Takt des Servers, **gemessen** an `data.at` zweier
@@ -329,6 +341,8 @@ function render(data) {
     : `<span class="unknown">${labels[slot.state]}</span>`;
   renderSourceAge(server);
   document.getElementById("k-wait").innerHTML = fmt(queue.waiting);
+  document.getElementById("k-wait").setAttribute("title", HOLD_SWITCH_NOTE);
+  document.getElementById("wait-footnote").textContent = HOLD_SWITCH_NOTE;
   // `open_count` wird bewusst nicht angezeigt. Die Zahl der offenen rid(s) im
   // Log bildet die Warteschlange nicht ab (gemessen: 35 zu 1 Verbindung bei 180
   // zu 1492 Wartenden), und die Spec hat die Kachel dafuer ausdruecklich

@@ -339,13 +339,19 @@ function __el(id) {
     __els[id] = {
       _id: id, _classes: set,
       textContent: "", innerHTML: "", className: "", value: "",
-      dataset: {}, style: {},
+      dataset: {}, style: {}, attrs: {},
       classList: {
         add: (c) => set.add(c),
         remove: (c) => set.delete(c),
         contains: (c) => set.has(c),
       },
     };
+    // `title` und Freunde. Im Browser wird der Titel aus dem Attribut
+    // gelesen; ein `title` nur im Quelltext waere fuer den Test unsichtbar.
+    // Eigene Funktionen statt Pfeile: ein Pfeil in einem Objektliteral hat
+    // kein eigenes `this`, `__els[id]` waere dort nicht erreichbar.
+    __els[id].setAttribute = (k, v) => { __els[id].attrs[k] = v; };
+    __els[id].getAttribute = (k) => (k in __els[id].attrs ? __els[id].attrs[k] : null);
   }
   return __els[id];
 }
@@ -375,6 +381,7 @@ function __dump() {
       cls: el.className,
       classes: Array.from(el._classes),
       width: el.style.width === undefined ? null : el.style.width,
+      attrs: el.attrs,
     };
   }
   return out;
@@ -912,6 +919,167 @@ class TestSourceAge(unittest.TestCase):
         self.assertNotIn("veraltet", second["source-age"]["text"])
         self.assertIn("40.0 s", third["source-age"]["text"])
         self.assertIn("veraltet", third["source-age"]["text"])
+
+
+@unittest.skipUnless(NODE, "kein node/nodejs im PATH - render() wird nicht ausgefuehrt")
+class TestWaitingFootnote(unittest.TestCase):
+    """Fussnote an der WARTEND-Kachel - sichtbar **und** als `title`.
+
+    Spec Z. 245-246: "Der Halter-Wechsel wird erst erkannt, wenn der naechste
+    Halter tatsaechlich sendet. Im Extremfall steht der alte Name wenige
+    Sekunden zu lang." Die Spec verlangt dafuer ausdruecklich eine Fussnote an
+    der WARTEND-Kachel (Z. 252-253); die ersten beiden Punkte der Liste stehen
+    laut Spec bereits im Slot-Bereich.
+
+    Beide Orte tragen denselben Satz: der `title` erscheint nur mit der Maus,
+    und genau in diesem Zustand schaut niemand auf die Kachel.
+    """
+
+    def test_the_note_is_visible_without_a_mouse(self):
+        text = render(sample_state())["wait-footnote"]["text"]
+        self.assertIn("Halter-Wechsel", text)
+        self.assertIn("erst erkannt, wenn der naechste Halter", text)
+        self.assertIn("Sekunden zu lang", text)
+
+    def test_the_waiting_tile_carries_it_as_a_title(self):
+        title = render(sample_state())["k-wait"]["attrs"]["title"]
+        self.assertIn("Halter-Wechsel", title)
+        self.assertEqual(title, render(sample_state())["wait-footnote"]["text"])
+
+    def test_the_waiting_number_itself_stays_the_queue_number(self):
+        """Die Fussnote darf die Zahl nicht angetasten."""
+        dom = render(sample_state(queue={"waiting": 180}))
+        self.assertEqual(dom["k-wait"]["html"], "180")
+        self.assertIn("Halter-Wechsel", dom["k-wait"]["attrs"]["title"])
+
+
+class TestQueueFootnote(unittest.TestCase):
+    """Der Pflichtsatz zur Nicht-Zuordenbarkeit - ohne erfundene Begruendung.
+
+    Spec Z. 294-296 verlangt **einen Satz**: einzelne Wartende lassen sich
+    keinem System zuordnen. Die alte Fassung begruendete das mit einer
+    Verbindungszahl, die es seit `36840ab` nicht mehr gibt.
+    """
+
+    def test_the_note_says_the_one_thing_the_spec_asks_for(self):
+        note = render(sample_state())["queue-note"]["text"]
+        self.assertIn("Einzelne Wartende lassen sich keinem System zuordnen",
+                      note)
+        self.assertIn("keine Zuordnung", note)
+        self.assertIn("kein Prompt-Text", note)
+
+    def test_the_note_does_not_mention_a_connection_count(self):
+        """Die Begründung verweist nicht mehr auf ein gestrichenes Element."""
+        note = render(sample_state())["queue-note"]["text"]
+        self.assertNotIn("Verbindung", note)
+        self.assertNotIn("1492", note)
+        self.assertNotIn("gemessen", note)
+
+
+class TestSums(unittest.TestCase):
+    """Spec Z. 302: "Summen: Uebergaben, O Dauer, verbleibende Queue" - drei.
+
+    Die vierte Kachel `Tok/s jetzt` war nicht gefordert; der Durchsatz gehoert
+    laut Spec Z. 301 in die Sparkline.
+    """
+
+    def test_three_sums_and_no_more(self):
+        html = read_dashboard()
+        tiles = dict((ident, label) for label, ident in
+                     re.findall(r'<div class="label"[^>]*>([^<]*)</div>'
+                                r'<div class="value" id="([^"]*)">', html))
+        self.assertEqual(sorted(i for i in tiles if i.startswith("h-")),
+                         ["h-avg", "h-count", "h-queue"])
+        self.assertNotIn("h-tps", html)
+
+    @unittest.skipUnless(NODE, "kein node/nodejs im PATH - render() wird nicht ausgefuehrt")
+    def test_throughput_is_reachable_only_through_the_sparkline(self):
+        dom = render(sample_state(speed={"tok_per_s": 42.5}))
+        self.assertNotIn("h-tps", dom)
+        self.assertIn("42.5", dom["spark"]["html"])
+
+
+class TestSparklineWindow(unittest.TestCase):
+    """Die Sparkline zeigt die letzten **60 Sekunden**, nicht 60 Werte.
+
+    Spec Z. 301: "Sparkline tok/s der letzten 60 s". Mit einem Wert je
+    `render()` und einem Deckel bei 60 Werten waeren das 120 s - die
+    Beschriftung gelogen.
+    """
+
+    #: `width:3px` ist die Balkenbreite im Sparkline-Markup. Gezaehlt wird die
+    #: **Anzahl**, nicht eine Zahl im Text: `assertIn("2", ...)` ist bei "182"
+    #: erfuellt.
+    BARS = "width:3px"
+
+    def window(self, *stamps):
+        """Puffer mit den angegebenen Unix-Zeiten, je ein Wert `10 + i`."""
+        dumps = render(sample_state(at=stamps[0], speed={"tok_per_s": 10.0}),
+                       [sample_state(at=stamp, speed={"tok_per_s": 10.0 + index})
+                        for index, stamp in enumerate(stamps[1:], start=1)])
+        return dumps[-1]["spark"]["html"]
+
+    def test_values_outside_sixty_seconds_fall_out(self):
+        base = 1791795000.0
+        html = self.window(base, base + 40, base + 75, base + 80)
+        # 0 s und 40 s sind zu weit weg, 75 s und 80 s bleiben.
+        self.assertEqual(html.count(self.BARS), 2)
+
+    def test_values_inside_sixty_seconds_stay(self):
+        base = 1791795000.0
+        html = self.window(base, base + 59, base + 60)
+        # Genau 60 s ist "innerhalb" - die Grenze gehoert zum Fenster.
+        self.assertEqual(html.count(self.BARS), 2)
+
+    def test_an_empty_buffer_shows_a_dash_not_an_empty_box(self):
+        dom = render(sample_state(speed={"tok_per_s": None}))
+        self.assertNotIn(self.BARS, dom["spark"]["html"])
+        self.assertIn("-", dom["spark"]["html"])
+
+    def test_the_label_still_claims_sixty_seconds(self):
+        """Die Beschriftung ist erst wahr, seit der Puffer zeitbasiert ist."""
+        self.assertIn("Durchsatz letzte 60 Sekunden", read_dashboard())
+
+
+class TestStreamError(unittest.TestCase):
+    """Ein Fehler im SSE-Rahmen darf das Dashboard nicht einfrieren.
+
+    `source.onmessage` rief `render(JSON.parse(event.data))` auch dann auf.
+    `data.slot` war `undefined`, `slot.legacy` warf `TypeError`, und die
+    Anzeige blieb auf dem letzten guten Tick stehen - ohne jede Altersangabe,
+    also genau in dem Fehlerfall, den die Spec mit "Kacheln zeigen Alter statt
+    Zahl" beschreibt.
+    """
+
+    def test_an_error_frame_keeps_the_last_good_values(self):
+        good = sample_state(slot={"state": "busy", "rid": "rid-gut", "system": "Laptop",
+                                  "duration_s": 12.0},
+                            queue={"waiting": 180}, speed={"tok_per_s": 42.5})
+        before, after = render(good, [{"error": "RuntimeError: Poll kaputt"}])
+        self.assertEqual(after["k-slot"]["html"], before["k-slot"]["html"])
+        self.assertEqual(after["k-wait"]["html"], "180")
+        self.assertEqual(after["s-tps"]["text"], "42.5")
+        self.assertEqual(after["timeline"]["html"], before["timeline"]["html"])
+        self.assertEqual(after["slot-note"]["text"], before["slot-note"]["text"])
+
+    def test_the_failure_is_visible(self):
+        after = render(sample_state(), [{"error": "RuntimeError: Poll kaputt"}])
+        line = after["source-age"]["text"]
+        self.assertIn("Poll kaputt", line)
+        self.assertIn("fehlgeschlagen", line)
+
+    def test_the_age_of_the_good_value_is_still_shown(self):
+        after = render(sample_state(), [{"error": "RuntimeError: Poll kaputt"}])
+        # Ohne diese Zahl ist nicht zu erkennen, wie alt der gute Wert ist.
+        self.assertIn("Letzter Wert", after["source-age"]["text"])
+
+    def test_a_recovered_stream_clears_the_failure(self):
+        good = sample_state(server={"connected": True, "load_error": None,
+                                    "age_s": 0.1})
+        _, _, after = render(good,
+                             [{"error": "RuntimeError: Poll kaputt"}],
+                             [good])
+        self.assertNotIn("fehlgeschlagen", after["source-age"]["text"])
 
 
 class TestOpenCount(unittest.TestCase):
