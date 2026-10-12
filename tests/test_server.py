@@ -994,9 +994,15 @@ class TestSums(unittest.TestCase):
 
     @unittest.skipUnless(NODE, "kein node/nodejs im PATH - render() wird nicht ausgefuehrt")
     def test_throughput_is_reachable_only_through_the_sparkline(self):
+        """Keine Kachel mehr - und der Durchsatz ist trotzdem zu sehen.
+
+        Die Balkenhoehe ist der Durchsatz, normiert auf den Puffer-Hoechstwert.
+        Geprueft wird die **Anzahl** der Balken: eine Zahl im Text gibt es dort
+        nicht, und `assertIn("42.5", ...)` waere ein Fehlschluss.
+        """
         dom = render(sample_state(speed={"tok_per_s": 42.5}))
         self.assertNotIn("h-tps", dom)
-        self.assertIn("42.5", dom["spark"]["html"])
+        self.assertEqual(dom["spark"]["html"].count("width:3px"), 1)
 
 
 class TestSparklineWindow(unittest.TestCase):

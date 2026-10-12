@@ -104,7 +104,6 @@
       <div class="kpi"><div class="label">Uebergaben</div><div class="value" id="h-count">-</div></div>
       <div class="kpi"><div class="label">Mittl. Dauer</div><div class="value" id="h-avg">-</div></div>
       <div class="kpi"><div class="label">Queue</div><div class="value" id="h-queue">-</div></div>
-      <div class="kpi"><div class="label">Tok/s jetzt</div><div class="value" id="h-tps">-</div></div>
     </div>
   </div>
   <div class="card">
@@ -423,8 +422,6 @@ function render(data) {
   document.getElementById("h-count").textContent = data.history.length;
   document.getElementById("h-avg").textContent = duration(avgDur);
   document.getElementById("h-queue").textContent = queue.waiting === null ? "-" : queue.waiting;
-  document.getElementById("h-tps").textContent = speed.tok_per_s === null ? "-"
-    : speed.tok_per_s.toFixed(1);
 
   // Sparkline
   if (speed.tok_per_s !== null) sparkline.push(speed.tok_per_s);
