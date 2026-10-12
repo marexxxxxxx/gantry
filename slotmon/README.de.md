@@ -54,8 +54,15 @@ Für die Halter-Erkennung braucht der Monitor zwei Zeilen im Server-Log:
 --log-requests --log-requests-format json
 ```
 
-Ohne sie gibt es keine `request.received`/`request.finished`-Zeilen, und der Monitor
-kann nur „unbekannt“ melden. Die Warteschlangenzahl funktioniert auch ohne.
+`runtime/sglang/serve.sh` setzt beides über `ENABLE_LOG_REQUESTS` (Default: an),
+sodass ein neu gestarteter Server sie von selbst bekommt. **Der Monitor stellt
+nichts ein** — er liest nur, was da ist.
+
+Ohne diese Zeilen gibt es keine `request.received`/`request.finished`-Zeilen, und
+der Monitor meldet `unknown` mit der Begründung, dass keine Events vorliegen.
+Die Warteschlangenzahl funktioniert auch ohne.
+
+Abschalten mit `ENABLE_LOG_REQUESTS=0`.
 
 Beim Start liest er das Log **von vorn**. Liegt beim Start noch eine Queue aus
 Aufträgen, die vor dem Aktivieren des Loggings eingereiht wurden, zeigen sich

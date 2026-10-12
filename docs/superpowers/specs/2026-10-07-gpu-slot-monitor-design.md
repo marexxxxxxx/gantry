@@ -25,6 +25,15 @@ Der Monitor liest ausschließlich.
 - `log_requests: False` laut `/get_server_info`, **trotzdem** schreibt der Server
   `request.received` / `request.finished` mit `rid` ins Log. Prompts enthält das Log
   weiterhin nicht.
+  **Nachtrag (13.10.):** Diese Messung galt dem laufenden Server. Damit die
+  Halter-Erkennung **dauerhaft** funktioniert, setzt `runtime/sglang/serve.sh`
+  `ENABLE_LOG_REQUESTS` per Default auf 1 und damit `--log-requests
+  --log-requests-format json` — der Server, der am 12.10. neu gestartet wurde,
+  meldet entsprechend `log_requests: True`. Das ist eine Änderung der
+  **Startkonfiguration**, nicht des laufenden Servers: der Monitor selbst stellt
+  nichts ein und ruft insbesondere `/configure_logging` nicht auf. Ausgeschaltet
+  werden kann sie mit `ENABLE_LOG_REQUESTS=0`; dann meldet der Monitor
+  `unknown` mit Begründung, die Warteschlangenzahl funktioniert weiter.
 - `/metrics` (ohne Auth) liefert `sglang:gen_throughput`, `sglang:num_queue_reqs`,
   `sglang:num_running_reqs`
 - Log: `/tmp/escha_server_lan.log`, ist `fd 1` **und** `fd 2` von PID 145265

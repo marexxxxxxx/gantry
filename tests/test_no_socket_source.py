@@ -141,7 +141,50 @@ class TestMonitorStaysAwayFromTheServer(unittest.TestCase):
         self.assertIn("[s]lotmon.server", self.script)
 
 
-class TestSpecIsCurrent(unittest.TestCase):
+class TestLogRequestsIsDurable(unittest.TestCase):
+    """`ENABLE_LOG_REQUESTS` ist per Default **an** und abschaltbar.
+
+    Aus dem Whole-Branch-Review. Die Spec mass, dass der laufende Server die
+    Events auch ohne die Flags schreibt; damit die Halter-Erkennung aber
+    *dauerhaft* funktioniert, setzt `serve.sh` `ENABLE_LOG_REQUESTS` auf 1. Das
+    war in keinem der Dokumente festgehalten, die die Feature-Messwerte
+    fuehren - die Spec sagte sogar ausdruecklich, der Monitor stelle nichts
+    ein.
+
+    Der Test haelt die Abschalt-Absicht fest. Ohne ihn koennte jemand die
+    Zeile entfernen, und der naechste Neustart verlierst die Events, ohne dass
+    jemand etwas bemerkte: der Monitor meldet dann `unknown` mit einer
+    Begruendung, die stimmt - nur faellt niemandem auf, dass sie falsch ist.
+    """
+
+    SCRIPT = os.path.join(REPO, "runtime", "sglang", "serve.sh")
+
+    def test_the_flag_starts_with_a_default_of_one(self):
+        serve = _read(self.SCRIPT)
+        self.assertIn('ENABLE_LOG_REQUESTS:-1', serve,
+                      "serve.sh setzt ENABLE_LOG_REQUESTS nicht per Default")
+
+    def test_it_still_passes_the_json_format(self):
+        """Nur `--log-requests` reicht nicht.
+
+        sglangs Default ist `text` (`Receive: obj=...`), und nur die
+        json-Variante liefert die `{"event": ..., "rid": ...}`-Zeilen, aus
+        denen der Leser seinen Halter bestimmt. Ohne `-format json` waere die
+        Zeile vorhanden und trotzdem unlesbar - der Monitor meldet dann
+        `unknown` mit derselben plausiblen Begruendung.
+        """
+        serve = _read(self.SCRIPT)
+        self.assertIn("--log-requests-format json", serve)
+
+    def test_it_can_be_switched_off(self):
+        """Abschalten muss moeglich sein, sonst ist es keine Konfiguration.
+
+        Die Bedingung vergleicht auf `"1"` - alles andere schaltet ab.
+        """
+        serve = _read(self.SCRIPT)
+        zeile = [z for z in serve.split("\n") if "LOGREQ_ARGS=()" in z]
+        self.assertEqual(len(zeile), 1, "die LOGREQ_ARGS-Zeile ist nicht eindeutig")
+        self.assertIn('${ENABLE_LOG_REQUESTS:-1}" == "1"', zeile[0])
     """Die Spec haelt fest, worauf sich der Monitor stuetzt."""
 
     def setUp(self):
