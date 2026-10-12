@@ -42,6 +42,7 @@ Details, GPU-Profile und Troubleshooting: [`runtime/sglang/INSTALL.de.md`](runti
 | [`runtime/sglang/`](runtime/sglang/) | **Die eigentliche Laufzeitumgebung**: escha-Wheel + SGLang-Fork, `serve.sh`-Launcher, Payload-Builder (`overthinking_penalty.py`, `thinking_budget.py`), Benchmark-Wrapper, Server-Default-Patch, sämtliche Dokumentation |
 | [`Qwen3.8-27B-Escha-W2/`](Qwen3.8-27B-Escha-W2/) | Heruntergeladene Modellgewichte (separates HF-Repo, nicht Teil dieser Codebasis) |
 | [`docs/`](docs/) | Technische Vertiefungen: FP8-KV-Cache-Quantisierung |
+| [`slotmon/`](slotmon/) | **GPU-Slot-Monitor**: liest das Server-Log passiv mit und zeigt, welcher Auftrag den Slot hält (`monitor.sh start` → `http://0.0.0.0:8090`) |
 | `ctxmon.sh` | Live-Monitor für den Server: tok/s, aktuelle Kontextbelegung, Kontext-Peak |
 
 ## 2. Dokumentationskarte

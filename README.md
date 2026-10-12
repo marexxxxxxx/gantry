@@ -41,6 +41,7 @@ Details, GPU profiles and troubleshooting: [`runtime/sglang/INSTALL.md`](runtime
 | [`runtime/sglang/`](runtime/sglang/) | **The actual runtime**: escha wheel + sglang fork, `serve.sh` launcher, payload builders (`overthinking_penalty.py`, `thinking_budget.py`), benchmark wrapper, server-default patch, all documentation |
 | [`Qwen3.8-27B-Escha-W2/`](Qwen3.8-27B-Escha-W2/) | Downloaded model weights (separate HF repo, not part of this codebase) |
 | [`docs/`](docs/) | Technical deep dives: FP8 KV-cache quantization |
+| [`slotmon/`](slotmon/) | **GPU slot monitor**: reads the server log passively and shows which job holds the slot (`monitor.sh start` → `http://0.0.0.0:8090`) |
 | `ctxmon.sh` | Live server monitor: tok/s, current context usage, context peak |
 
 ## 2. Documentation map
