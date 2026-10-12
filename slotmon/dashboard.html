@@ -59,7 +59,7 @@
   <div class="grid">
     <div class="kpi"><div class="label">Slot</div><div class="value" id="k-slot">-</div></div>
     <div class="kpi"><div class="label">Wartend</div><div class="value" id="k-wait">-</div></div>
-    <div class="kpi"><div class="label" title="Offene Verbindungen, nicht die Warteschlange">Verbindungen</div><div class="value" id="k-conn">-</div></div>
+    
     <div class="kpi"><div class="label">Tok/s</div><div class="value" id="k-tps">-</div></div>
     <div class="kpi"><div class="label">GPU</div><div class="value" id="k-gpu">-</div></div>
     <div class="kpi"><div class="label">VRAM</div><div class="value" id="k-vram">-</div></div>
@@ -89,9 +89,8 @@
     </table>
     <div class="note">Einzelne Wartende lassen sich keinem System zuordnen - die
       Warteschlange des Servers ist laenger als die Zahl offener Verbindungen
-      (gemessen: 35 zu 1 Verbindung bei 180 zu 1492 Wartenden). Die beiden
-      Zahlen stehen deshalb getrennt: WARTEND aus <code>/get_load</code>,
-      VERBINDUNGEN aus den offenen rid(s) im Log. Keine Zuordnung behauptet.
+      (gemessen: 35 zu 1 Verbindung bei 180 zu 1492 Wartenden). Angezeigt wird
+      deshalb nur die Zahl aus <code>/get_load</code>, ohne behauptete Zuordnung.
       Es stehen hier nur Token-Zahlen, kein Prompt-Text.</div>
   </div>
 </section>
@@ -154,11 +153,11 @@ function render(data) {
   const labels = { busy: "BELEGT", free: "FREI", unknown: "UNBEKANNT" };
   document.getElementById("k-slot").innerHTML = `<span class="unknown">${labels[slot.state]}</span>`;
   document.getElementById("k-wait").innerHTML = fmt(queue.waiting);
-  // Eigene Kachel, eigene Zahl: `open_count` zaehlt die offenen rid(s) im Log
-  // und ist **nicht** die Warteschlange. Gemessen 35 zu 1 Verbindung bei 180
-  // zu 1492 Wartenden. Beischaetzt ergaebe es eine Zustaendigkeit, die nicht
-  // belegt ist, deshalb stehen die beiden Zahlen getrennt.
-  document.getElementById("k-conn").innerHTML = fmt(slot.open_count);
+  // `open_count` wird bewusst nicht angezeigt. Die Zahl der offenen rid(s) im
+  // Log bildet die Warteschlange nicht ab (gemessen: 35 zu 1 Verbindung bei 180
+  // zu 1492 Wartenden), und die Spec hat die Kachel dafuer ausdruecklich
+  // gestrichen. Eine eigene Kachel waere eine dritte Zahl mit unklarer
+  // Bedeutung - die WARTEND-Kachel ist die einzige belegte.
   document.getElementById("k-tps").innerHTML = fmt(
     speed.tok_per_s === null ? null : speed.tok_per_s.toFixed(1));
   document.getElementById("k-gpu").innerHTML = fmt(gpu.util === null ? null : gpu.util + " %");

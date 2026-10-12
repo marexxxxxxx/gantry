@@ -310,26 +310,40 @@ class TestRenderedSlotNote(unittest.TestCase):
 
 
 class TestOpenCount(unittest.TestCase):
-    """`open_count` ist eine eigene Zahl und geht nicht in die Wartenden-Zahl.
+    """`open_count` wird nicht angezeigt.
 
-    Die Zahl offener TCP-Verbindungen bildet die Warteschlange nicht ab
-    (gemessen: 35 zu 1 Verbindungen bei 180 zu 1492 Wartenden). Wer sie
-    beischaetzt, behauptet eine Zustaendigkeit, die nicht belegt ist.
+    Die Zahl offener rid(s) im Log bildet die Warteschlange nicht ab (gemessen:
+    35 zu 1 Verbindungen bei 180 zu 1492 Wartenden). Die Spec hat die Kachel
+    VERBINDUNGEN deshalb ausdruecklich gestrichen: "Eine Kachel VERBINDUNGEN
+    gibt es nicht mehr - sie beruhte auf der widerlegten Socket-Annahme."
+
+    Beischaetzt mit der Wartenden-Zahl waere es eine Zustaendigkeit, die nicht
+    belegt ist - das ist der Fehler, den dieser Test verhindert.
     """
 
-    def test_open_count_has_its_own_labelled_tile(self):
-        """Eine eigene Kachel mit eigener Beschriftung - nicht die WARTEND-Kachel."""
+    def test_no_connections_tile_exists(self):
+        """Es gibt nur die fuenf Kacheln der Spec, keine siebte."""
         html = read_dashboard()
         tiles = re.findall(r'<div class="label"[^>]*>([^<]*)</div>'
                           r'<div class="value" id="([^"]*)">', html)
         labels = dict((ident, label) for label, ident in tiles)
-        self.assertIn("k-conn", labels)
-        self.assertEqual(labels["k-conn"], "Verbindungen")
+        self.assertNotIn("k-conn", labels)
+        self.assertNotIn("k-conn", html)
+        # Das KPI-Raster aus tab-now, wo die Kachel gestrichen wurde. `h-*`
+        # gehoeren zu tab-history, `s-*` sind die vier Kennzahlen der
+        # Slot-Karte. `k-vram` ist durch die Fehlerbehandlung der Spec
+        # gedeckt ("GPU- und VRAM-Kachel zeigen -").
+        self.assertEqual(sorted(i for i in labels if i.startswith("k-")),
+                         ["k-gpu", "k-slot", "k-tps", "k-vram",
+                          "k-wait", "k-wait-time"])
+        # Die Beschriftung ist Teil der Aussage: WARTEND ist `num_waiting_reqs`,
+        # nicht irgendeine Zahl. Ein umbenanntes Kachel-Label waere eine
+        # Behauptung, die der Monitor nicht belegen kann.
         self.assertEqual(labels["k-wait"], "Wartend")
 
     @unittest.skipUnless(NODE, "kein node/nodejs im PATH - render() wird nicht ausgefuehrt")
-    def test_open_count_lands_in_its_own_tile_and_not_in_the_waiting_number(self):
-        """Die Wartenden-Zahl bleibt die Wartenden-Zahl.
+    def test_open_count_never_reaches_the_waiting_number(self):
+        """Die Wartenden-Zahl bleibt exakt die Wartenden-Zahl.
 
         Geprueft wird **exakt**, nicht mit `assertIn`: eine Beimischung ergaebe
         `2 + 180 = 182`, und ein blosses "2 steckt in 182" wuerde einen
@@ -337,8 +351,8 @@ class TestOpenCount(unittest.TestCase):
         """
         dom = render(sample_state(slot={"open_count": 2},
                                   queue={"waiting": 180}))
-        self.assertEqual(dom["k-conn"]["html"], "2")
         self.assertEqual(dom["k-wait"]["html"], "180")
+        self.assertNotIn("k-conn", dom)
 
 
 if __name__ == "__main__":
