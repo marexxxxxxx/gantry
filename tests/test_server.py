@@ -794,6 +794,29 @@ class TestLogNotices(unittest.TestCase):
         self.assertEqual(dom["log-warn"]["text"], "Log naehert sich 1 GB (912 MB)")
         self.assertFalse(hidden(dom, "log-warn"))
 
+    def test_a_fractional_size_is_never_rounded_down_to_zero(self):
+        """Eine gemessene Groesse von 0,4 MB darf nicht als "0 MB" dastehen.
+
+        `Math.round(0.395)` ist `0`. Die Warnung behauptete damit eine
+        leere Logdatei, wo eine Datei mit Inhalt liegt - die Sorte Zahl,
+        die die Spec ueberall verbietet ("Nie `0`, weil 0 als Aussage
+        gelesen wird", Spec Z. 318).
+
+        Live gefunden: mit `WARN_LOG_MB=0` auf einer 0,395-MB-Datei.
+        Der Test `test_warn_shows_the_real_size` sieht das nicht, weil
+        `912.0` und `0.395` beide durch `Math.round` gehen - nur die
+        zweite Zahl faellt dabei auf 0.
+        """
+        dom = render(sample_state(log={"warn": True, "size_mb": 0.395}))
+        self.assertEqual(dom["log-warn"]["text"],
+                         "Log naehert sich 1 GB (0.4 MB)")
+
+    def test_a_size_below_one_mb_keeps_one_decimal(self):
+        """Unter 1 MB reicht eine Nachkommastelle, um die Aussage zu tragen."""
+        dom = render(sample_state(log={"warn": True, "size_mb": 0.04}))
+        self.assertEqual(dom["log-warn"]["text"],
+                         "Log naehert sich 1 GB (0.04 MB)")
+
     def test_warn_without_a_measured_size_invents_no_number(self):
         """`warn` ist die belegte Aussage, `size_mb` nur die Beilage.
 

@@ -229,13 +229,22 @@ function showNotice(ident, text) {
   else el.classList.remove("hidden");
 }
 
+// Eine gemessene Groesse wird nie auf "0 MB" gerundet: `Math.round(0.395)`
+  // ist `0`, und die Warnung behauptete damit eine leere Logdatei, wo eine
+  // Datei mit Inhalt liegt. Unter 10 MB eine Nachkommastelle, sonst rundet
+  // sie auf ganze MB - dort kann das Runden keine Null erzeugen.
+function formatMb(value) {
+  return value < 10 ? value.toFixed(2).replace(/0+$/, "").replace(/\.$/, "")
+    : Math.round(value);
+}
+
 function renderLogNotices(logState, slot) {
   // Spec Z. 337: Warnung ab 900 MB. `size_mb` ist die Beilage, `warn` die
   // belegte Aussage - ohne gemessene Groesse steht keine Zahl im Text.
   showNotice("log-warn", logState.warn === true
     ? (logState.size_mb === null || logState.size_mb === undefined
         ? "Log naehert sich 1 GB"
-        : `Log naehert sich 1 GB (${Math.round(logState.size_mb)} MB)`)
+        : `Log naehert sich 1 GB (${formatMb(logState.size_mb)} MB)`)
     : null);
 
   const reason = (slot && typeof slot.reason === "string") ? slot.reason : "";
