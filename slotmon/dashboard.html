@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU-Slot-Monitor</title>
+<style>
+  :root {
+    --bg: #10131a; --card: #191d27; --line: #262b38;
+    --text: #e6e9f0; --muted: #8b93a7;
+    --ok: #3ecf8e; --warn: #f0a742; --idle: #4a5163; --busy: #2b6b4f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; padding: 20px; }
+  h1 { font-size: 18px; margin: 0 0 16px; font-weight: 600; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 18px; border-bottom: 1px solid var(--line); }
+  .tab { padding: 8px 16px; cursor: pointer; color: var(--muted);
+         border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0; }
+  .tab.active { color: var(--text); background: var(--card); border-color: var(--line); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .kpi, .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+  .kpi .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  .kpi .value { font-size: 24px; font-weight: 600; margin-top: 4px;
+                font-variant-numeric: tabular-nums; }
+  .kpi .value.unknown { color: var(--idle); font-size: 18px; }
+  .card { margin-top: 14px; }
+  .slot.busy { border-color: var(--ok); box-shadow: inset 0 0 0 1px var(--busy); }
+  .badge { display: inline-block; padding: 3px 9px; border-radius: 4px; font-size: 11px;
+           font-weight: 700; letter-spacing: .05em; }
+  .badge.busy { background: var(--ok); color: #06231a; }
+  .badge.free { background: var(--idle); color: var(--text); }
+  .badge.unknown { background: var(--warn); color: #2a1a02; }
+  .rid { font-family: ui-monospace, monospace; color: var(--muted); font-size: 12px; }
+  .banner { background: rgba(240,167,66,.12); border: 1px solid var(--warn);
+            color: var(--warn); border-radius: 6px; padding: 10px 14px; margin-bottom: 14px; }
+  .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin-top: 8px; }
+  .bar > div { height: 100%; background: var(--ok); transition: width .4s; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.now td { color: var(--ok); }
+  .muted { color: var(--muted); }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<h1>GPU-Slot-Monitor</h1>
+
+<div class="tabs">
+  <div class="tab active" data-tab="now">Jetzt</div>
+  <div class="tab" data-tab="history">Verlauf</div>
+</div>
+
+<section id="tab-now">
+  <div id="altbestand" class="banner hidden"></div>
+  <div class="grid">
+    <div class="kpi"><div class="label">Slot</div><div class="value" id="k-slot">-</div></div>
+    <div class="kpi"><div class="label">Wartend</div><div class="value" id="k-wait">-</div></div>
+    <div class="kpi"><div class="label" title="Offene Verbindungen, nicht die Warteschlange">Verbindungen</div><div class="value" id="k-conn">-</div></div>
+    <div class="kpi"><div class="label">Tok/s</div><div class="value" id="k-tps">-</div></div>
+    <div class="kpi"><div class="label">GPU</div><div class="value" id="k-gpu">-</div></div>
+    <div class="kpi"><div class="label">VRAM</div><div class="value" id="k-vram">-</div></div>
+    <div class="kpi"><div class="label">Wartezeit</div><div class="value" id="k-wait-time">-</div></div>
+  </div>
+
+  <div class="card slot" id="slot-card">
+    <div><span class="badge unknown" id="slot-badge">-</span>
+      <strong id="slot-system">-</strong></div>
+    <div class="rid" id="slot-ip"></div>
+    <div class="rid" id="slot-rid"></div>
+    <div class="grid" style="margin-top:12px">
+      <div class="kpi"><div class="label">Laeuft</div><div class="value" id="s-dur">-</div></div>
+      <div class="kpi"><div class="label">Tok/s</div><div class="value" id="s-tps">-</div></div>
+      <div class="kpi"><div class="label">Ctx</div><div class="value" id="s-ctx">-</div></div>
+      <div class="kpi"><div class="label">Ausgaben</div><div class="value" id="s-out">-</div></div>
+    </div>
+    <div class="bar"><div id="s-bar" style="width:0%"></div></div>
+    <div class="note" id="slot-note"></div>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead><tr><th>System</th><th class="num">Dauer</th><th class="num">Prompt</th>
+        <th class="num">Antwort</th><th class="num">Cache</th><th>Ende</th></tr></thead>
+      <tbody id="history-rows"></tbody>
+    </table>
+    <div class="note">Einzelne Wartende lassen sich keinem System zuordnen - die
+      Warteschlange des Servers ist laenger als die Zahl offener Verbindungen
+      (gemessen: 35 zu 1 Verbindung bei 180 zu 1492 Wartenden). Die beiden
+      Zahlen stehen deshalb getrennt: WARTEND aus <code>/get_load</code>,
+      VERBINDUNGEN aus den offenen rid(s) im Log. Keine Zuordnung behauptet.
+      Es stehen hier nur Token-Zahlen, kein Prompt-Text.</div>
+  </div>
+</section>
+
+<section id="tab-history" class="hidden">
+  <div class="card">
+    <div class="grid">
+      <div class="kpi"><div class="label">Uebergaben</div><div class="value" id="h-count">-</div></div>
+      <div class="kpi"><div class="label">Mittl. Dauer</div><div class="value" id="h-avg">-</div></div>
+      <div class="kpi"><div class="label">Queue</div><div class="value" id="h-queue">-</div></div>
+      <div class="kpi"><div class="label">Tok/s jetzt</div><div class="value" id="h-tps">-</div></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="label muted">Durchsatz letzte 60 Sekunden</div>
+    <div id="spark" class="bar" style="height:40px"></div>
+  </div>
+  <div class="card">
+    <div class="label muted">Zeitstrahl</div>
+    <div id="timeline"></div>
+  </div>
+</section>
+
+<script>
+const sparkline = [];
+const fmt = (v, suffix = "") =>
+  (v === null || v === undefined) ? '<span class="unknown">-</span>' : v + suffix;
+
+function duration(seconds) {
+  if (seconds === null || seconds === undefined) return null;
+  const s = Math.floor(seconds);
+  const m = Math.floor(s / 60), h = Math.floor(m / 60);
+  return h > 0 ? `${h}h ${m % 60}m` : m > 0 ? `${m}m ${s % 60}s` : `${s}s`;
+}
+
+let lastState = null;
+
+function averageDuration(entries) {
+  const done = entries.filter(e => typeof e.duration_s === "number");
+  if (!done.length) return null;
+  return done.reduce((sum, e) => sum + e.duration_s, 0) / done.length;
+}
+
+function render(data) {
+  lastState = data;
+  const slot = data.slot, queue = data.queue, speed = data.speed, gpu = data.gpu;
+
+  // Altbestand-Banner
+  const banner = document.getElementById("altbestand");
+  if (slot.legacy !== null && slot.legacy > 0) {
+    banner.textContent =
+      `Altbestand: ${slot.legacy} Requests vor Aktivierung der Log-Events - ` +
+      `Halter unbekannt, bis die Queue auf 0 ist.`;
+    banner.classList.remove("hidden");
+  } else {
+    banner.classList.add("hidden");
+  }
+
+  // KPI
+  const labels = { busy: "BELEGT", free: "FREI", unknown: "UNBEKANNT" };
+  document.getElementById("k-slot").innerHTML = `<span class="unknown">${labels[slot.state]}</span>`;
+  document.getElementById("k-wait").innerHTML = fmt(queue.waiting);
+  // Eigene Kachel, eigene Zahl: `open_count` zaehlt die offenen rid(s) im Log
+  // und ist **nicht** die Warteschlange. Gemessen 35 zu 1 Verbindung bei 180
+  // zu 1492 Wartenden. Beischaetzt ergaebe es eine Zustaendigkeit, die nicht
+  // belegt ist, deshalb stehen die beiden Zahlen getrennt.
+  document.getElementById("k-conn").innerHTML = fmt(slot.open_count);
+  document.getElementById("k-tps").innerHTML = fmt(
+    speed.tok_per_s === null ? null : speed.tok_per_s.toFixed(1));
+  document.getElementById("k-gpu").innerHTML = fmt(gpu.util === null ? null : gpu.util + " %");
+  document.getElementById("k-vram").innerHTML = fmt(gpu.used_mb === null ? null
+    : (gpu.used_mb / 1024).toFixed(1) + " GB");
+  // Schaetzung aus Queue mal mittlerer Slot-Dauer, sonst aus der Laufzeit des
+  // laufenden Slots. Ohne beide Quellen "-" statt einer erfundenen Zahl.
+  const avgDur = averageDuration(data.history);
+  const waitSeconds = (avgDur === null ? slot.duration_s : avgDur) * (queue.waiting || 0);
+  document.getElementById("k-wait-time").innerHTML = waitSeconds > 0
+    ? duration(waitSeconds) + " (Schaetzung)" : "-";
+
+  // Slot-Karte
+  const card = document.getElementById("slot-card");
+  card.className = "card slot" + (slot.state === "busy" ? " busy" : "");
+  const badge = document.getElementById("slot-badge");
+  badge.className = "badge " + slot.state;
+  badge.textContent = slot.state === "busy" ? "HAT DEN SLOT"
+    : slot.state === "free" ? "FREI" : "UNBEKANNT";
+  document.getElementById("slot-system").textContent = slot.system || "unbekannt";
+  document.getElementById("slot-ip").textContent = slot.ip_port
+    ? slot.ip_port : (slot.state === "busy" ? "IP noch nicht abgeschlossen" : "");
+  document.getElementById("slot-rid").textContent = slot.rid ? "rid " + slot.rid : "";
+  document.getElementById("s-dur").textContent = duration(slot.duration_s) || "-";
+  document.getElementById("s-tps").textContent = speed.tok_per_s === null ? "-"
+    : speed.tok_per_s.toFixed(1);
+  document.getElementById("s-ctx").textContent = speed.ctx_tokens === null ? "-"
+    : speed.ctx_tokens.toLocaleString("de-DE");
+  document.getElementById("s-out").textContent = speed.output_pct === null ? "-"
+    : speed.output_pct.toFixed(2) + " %";
+  document.getElementById("s-bar").style.width =
+    Math.min(100, speed.output_pct || 0) + "%";
+  // slot-note: Prioritaetskette. `reason` ist die belegte Begruendung des
+  // Collectors und hat Vorrang vor jedem generischen Satz - ein `unknown` ohne
+  // sichtbaren Grund ist im Dashboard von einem echten Leerlauf nicht zu
+  // unterscheiden, und genau diese Verwechslung hat den Phantom-Halter aus
+  // Runde 2 glaubhaft gemacht. Erst wenn `reason` fehlt, darf der
+  // Altbestand-Satz stehen; bei `complete` wird gar nichts behauptet.
+  const note = document.getElementById("slot-note");
+  if (typeof slot.reason === "string" && slot.reason !== "") {
+    note.textContent = slot.reason;
+  } else if (slot.complete === false) {
+    note.textContent = "Der Halter ist erst bestimmbar, wenn kein Altbestand "
+      + "mehr in der Queue liegt.";
+  } else {
+    note.textContent = "";
+  }
+
+  // Verlaufstabelle
+  const rows = data.history.slice().reverse().map(entry => `
+    <tr>
+      <td>${entry.system || entry.ip_port || "unbekannt"}</td>
+      <td class="num">${duration(entry.duration_s) || "-"}</td>
+      <td class="num">${fmt(entry.prompt_tokens)}</td>
+      <td class="num">${fmt(entry.completion_tokens)}</td>
+      <td class="num">${fmt(entry.cached_tokens)}</td>
+      <td class="muted">${new Date(entry.ended_at * 1000).toLocaleTimeString("de-DE")}</td>
+    </tr>`).join("");
+  document.getElementById("history-rows").innerHTML = rows ||
+    '<tr><td colspan="6" class="muted">Noch keine abgeschlossenen Slots.</td></tr>';
+
+  // Summen
+  document.getElementById("h-count").textContent = data.history.length;
+  document.getElementById("h-avg").textContent = duration(avgDur) || "-";
+  document.getElementById("h-queue").textContent = queue.waiting === null ? "-" : queue.waiting;
+  document.getElementById("h-tps").textContent = speed.tok_per_s === null ? "-"
+    : speed.tok_per_s.toFixed(1);
+
+  // Sparkline
+  if (speed.tok_per_s !== null) sparkline.push(speed.tok_per_s);
+  if (sparkline.length > 60) sparkline.shift();
+  const peak = Math.max(1, ...sparkline);
+  document.getElementById("spark").innerHTML = sparkline
+    .map(v => `<div style="display:inline-block;width:3px;height:${v / peak * 100}%;
+                background:var(--ok);vertical-align:bottom;margin-right:1px"></div>`).join("");
+
+  // Zeitstrahl
+  document.getElementById("timeline").innerHTML = data.history.slice().reverse().map(entry => `
+    <div style="border-left:3px solid var(--idle);padding:6px 0 6px 10px;margin-bottom:6px">
+      <strong>${entry.system || "unbekannt"}</strong>
+      <span class="muted"> - ${duration(entry.duration_s) || "-"}
+      - ${fmt(entry.completion_tokens)} tok
+      - ${new Date(entry.ended_at * 1000).toLocaleTimeString("de-DE")}</span>
+      ${entry.system === null && entry.ip_port === null
+        ? '<span class="muted"> - Name nachtraeglich</span>' : ""}
+    </div>`).join("");
+}
+
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    document.querySelectorAll("section").forEach(s => s.classList.add("hidden"));
+    tab.classList.add("active");
+    document.getElementById("tab-" + tab.dataset.tab).classList.remove("hidden");
+    sessionStorage.setItem("slotmon.tab", tab.dataset.tab);
+  });
+});
+
+const saved = sessionStorage.getItem("slotmon.tab");
+if (saved && saved !== "now") document.querySelector(`[data-tab="${saved}"]`).click();
+
+fetch("/api/state").then(r => r.json()).then(render);
+
+const source = new EventSource("/api/stream");
+source.onmessage = event => render(JSON.parse(event.data));
+</script>
+</body>
+</html>
