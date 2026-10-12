@@ -1,0 +1,13 @@
+[Unit]
+Description=GPU-Slot-Monitor (slotmon)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/user/small_qwen/monitor.sh start-systemd
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

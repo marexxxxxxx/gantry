@@ -54,7 +54,7 @@ STOP_GRACE="${STOP_GRACE:-20}"
 START_WAIT="${START_WAIT:-20}"
 
 usage() {
-    echo "usage: $0 {start|stop|status|restart}"
+    echo "usage: $0 {start|start-systemd|stop|status|restart}"
     echo "  start     Monitor im Hintergrund starten und auf /health warten"
     echo "  stop      Monitor beenden (TERM, ${STOP_GRACE}s, dann KILL)"
     echo "  status    Zustand lesen, Exit 1 wenn der Monitor nicht laeuft"
@@ -320,10 +320,20 @@ print("[slotmon] Slot={} rid={} system={} wartend={} altbestand={}".format(
     fi
 }
 
+# Vordergrund fuer systemd: systemd ueberwacht den Prozess selbst und startet
+# ihn bei Absturz neu. Im Hintergrund wuerde `start` sofort zurueckkehren, und
+# systemd saehe einen Erfolg ohne ueberwachbaren Prozess.
+start_systemd() {
+    cd "$REPO"
+    export PYTHONUNBUFFERED=1 PORT API MONITOR_LOG
+    exec -a "slotmon-server:$PORT" "$PYTHON" -B -m slotmon.server
+}
+
 case "${1:-}" in
-    start)   start ;;
-    stop)    stop ;;
-    status)  status ;;
-    restart) stop; start ;;
-    *)       usage ;;
+    start)          start ;;
+    start-systemd)  start_systemd ;;
+    stop)           stop ;;
+    status)         status ;;
+    restart)        stop; start ;;
+    *)              usage ;;
 esac
