@@ -17,9 +17,12 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
+import httpx
 from fastapi.testclient import TestClient
 
+from slotmon import abort
 from slotmon.collector import Collector
 from slotmon.config import Config, load_config
 from slotmon.server import create_app
@@ -1283,6 +1286,111 @@ class TestOpenCount(unittest.TestCase):
                                   queue={"waiting": 180}))
         self.assertEqual(dom["k-wait"]["html"], "180")
         self.assertNotIn("k-conn", dom)
+
+
+class AbortCollector:
+    """Attrappe fuer den Abbruch-Endpunkt: fester Zustand, echte Konfiguration.
+
+    `state()` liefert, was der Test hineinlegt. So ist pruefbar, dass die Route
+    den letzten Zustand liest und nichts erfindet. Ein `tick()` gibt es hier
+    nicht - die Route soll nie selbst lesen.
+    """
+
+    def __init__(self, state):
+        self.cfg = Config(api="http://127.0.0.1:1", auth="Bearer marec")
+        self.zustand = state
+
+    def state(self):
+        return self.zustand
+
+
+class TestAbortEndpunkte(unittest.TestCase):
+    """Die beiden Abbruch-Routen: lesen den letzten Zustand, senden hoechstens einen Abbruch.
+
+    `httpx.post` in `abort` ist fuer jeden Test gemockt. Der Port 1 in der
+    Konfiguration ist die zweite Sicherung: fiele der Mock weg, schluege der
+    Aufruf fehl, statt den Server auf Port 30000 zu erreichen.
+    """
+
+    def setUp(self):
+        patcher = mock.patch.object(abort.httpx, "post")
+        self.post = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.post.return_value = mock.Mock(status_code=200)
+        self.zustand = {
+            "slot": {"state": "busy", "rid": "aaa111", "legacy": 0, "reason": None},
+            "queue": {"waiting": 2, "running": 1, "waiting_list": [
+                {"position": 1, "rid": "bbb222", "waiting_since": 90.0,
+                 "system": None},
+                {"position": 2, "rid": "ccc333", "waiting_since": 80.0,
+                 "system": "Laptop"},
+            ]},
+        }
+        self.collector = AbortCollector(self.zustand)
+        self.client = TestClient(create_app(self.collector))
+
+    def test_holder_route_bricht_den_laufenden_auftrag_ab(self):
+        antwort = self.client.post("/api/abort--holder")
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(antwort.json(),
+                         {"aborted": True, "rid": "aaa111", "reason": "abgebrochen"})
+        self.post.assert_called_once()
+        self.assertEqual(self.post.call_args.kwargs["json"], {"rid": "aaa111"})
+
+    def test_holder_route_nimmt_keinen_parameter_an(self):
+        """`?rid=` ist die Tuer, die die Spec verbietet. Die Route ignoriert sie."""
+        antwort = self.client.post("/api/abort--holder?rid=bbb222")
+        self.assertEqual(antwort.json()["rid"], "aaa111")
+        self.assertEqual(self.post.call_args.kwargs["json"], {"rid": "aaa111"})
+
+    def test_waiting_route_ohne_body_antwortet_200_mit_grund(self):
+        antwort = self.client.post("/api/abort--waiting")
+        self.assertEqual(antwort.status_code, 200)
+        self.assertFalse(antwort.json()["aborted"])
+        self.assertIn("keine Zahl", antwort.json()["reason"])
+        self.post.assert_not_called()
+
+    def test_waiting_route_position_eins_nimmt_die_rid_aus_der_liste(self):
+        antwort = self.client.post("/api/abort--waiting", json={"position": 1})
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(antwort.json()["rid"], "bbb222")
+        self.assertEqual(self.post.call_args.kwargs["json"], {"rid": "bbb222"})
+
+    def test_waiting_route_position_zwei_nimmt_den_zweiten_eintrag(self):
+        antwort = self.client.post("/api/abort--waiting", json={"position": 2})
+        self.assertEqual(antwort.json()["rid"], "ccc333")
+        self.assertEqual(self.post.call_args.kwargs["json"], {"rid": "ccc333"})
+
+    def test_waiting_route_position_als_text_wird_abgelehnt(self):
+        antwort = self.client.post("/api/abort--waiting", json={"position": "x"})
+        self.assertEqual(antwort.status_code, 200)
+        self.assertFalse(antwort.json()["aborted"])
+        self.post.assert_not_called()
+
+    def test_routen_erfinden_nichts_und_rufen_den_server_nicht_zum_lesen(self):
+        """Ist der Halter frei, gibt es nichts zu senden. Eine Position hinter
+        dem Listenende ebenso. Und die Route liest nie selbst von sglang."""
+        self.zustand["slot"]["state"] = "free"
+        self.zustand["slot"]["rid"] = None
+        with mock.patch.object(httpx, "get") as lesen:
+            self.assertFalse(self.client.post("/api/abort--holder").json()["aborted"])
+            self.assertFalse(self.client.post(
+                "/api/abort--waiting", json={"position": 5}).json()["aborted"])
+        lesen.assert_not_called()
+        self.post.assert_not_called()
+
+    def test_routen_lesen_den_zustand_des_letzten_ticks(self):
+        """Was im Collector steht, ist der Zustand, auf den der Klick geht."""
+        self.zustand["queue"]["waiting_list"][0]["rid"] = "neu999"
+        self.client.post("/api/abort--waiting", json={"position": 1})
+        self.assertEqual(self.post.call_args.kwargs["json"], {"rid": "neu999"})
+
+    def test_toter_server_antwortet_200_mit_aborted_false(self):
+        self.post.side_effect = httpx.ConnectError("down")
+        antwort = self.client.post("/api/abort--holder")
+        self.assertEqual(antwort.status_code, 200)
+        self.assertFalse(antwort.json()["aborted"])
+        self.assertIn("nicht erreichbar", antwort.json()["reason"])
 
 
 if __name__ == "__main__":

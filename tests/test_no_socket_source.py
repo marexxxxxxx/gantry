@@ -81,6 +81,45 @@ class TestNoSocketSource(unittest.TestCase):
                         "Kein Modul nennt die Socket-Methode als widerlegt.")
 
 
+class TestNurAbortSchreibt(unittest.TestCase):
+    """Genau eine Datei schreibt je zum Server: `abort.py`.
+
+    Bisher prueft der Test, dass niemand `/abort_request` aufruft. Jetzt gilt
+    das Gegenteil: `abort.py` darf es, und sonst niemand. Der Test wird
+    strenger, nicht weicher - ein `POST` in einem anderen Modul ist jetzt ein
+    Fehler, wo es vorher nur unerwuenscht war.
+
+    `@app.post(...)` ist der Routen-Dekorator des Monitors selbst und kein
+    Aufruf zum Server. Genau diese Form ist ausgenommen, sonst meldete der Test
+    `server.py` als schreibend.
+    """
+
+    POST_ZEUGEN = ("httpx.post", "requests.post", "urlopen", ".post(")
+    ROUTEN_DEKORATOR = "@app.post("
+
+    def test_genau_ein_modul_schreibt(self):
+        schreibend = []
+        for pfad in sorted(glob.glob(os.path.join(SLOTMON, "*.py"))):
+            if self._schreibt(_read(pfad)):
+                schreibend.append(os.path.basename(pfad))
+        self.assertEqual(schreibend, ["abort.py"],
+                         f"mehr als eine Datei schreibt zum Server: {schreibend}")
+
+    def test_das_dashboard_nutzt_keine_python_schreibbibliothek(self):
+        html = _read(os.path.join(SLOTMON, "dashboard.html"))
+        for zeuge in ("httpx.post", "requests.post", "urlopen"):
+            self.assertNotIn(zeuge, html)
+
+    @classmethod
+    def _schreibt(cls, quelle):
+        for zeile in quelle.split("\n"):
+            if zeile.lstrip().startswith(cls.ROUTEN_DEKORATOR):
+                continue
+            if any(zeuge in zeile for zeuge in cls.POST_ZEUGEN):
+                return True
+        return False
+
+
 class TestMonitorStaysAwayFromTheServer(unittest.TestCase):
     """`monitor.sh` fasst den sglang-Server nicht an.
 

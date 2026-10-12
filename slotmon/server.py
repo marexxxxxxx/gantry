@@ -26,6 +26,8 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 
+from slotmon import abort
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -117,6 +119,19 @@ def create_app(collector):
     @app.get("/health")
     def health():
         return {"ok": True}
+
+    # `def` statt `async def`: der Abbruch wartet blockierend auf den Server.
+    # In einer async-Route wuerde das die Schleife bis zu zehn Sekunden
+    # anhalten - SSE und alle anderen Anfragen mit.
+    @app.post("/api/abort--holder")
+    def abort_holder():
+        """Bricht den laufenden Auftrag ab. Ohne Parameter - mit Absicht."""
+        return abort.abort_holder(collector.cfg, collector.state())
+
+    @app.post("/api/abort--waiting")
+    def abort_waiting(payload: dict | None = None):
+        return abort.abort_waiting(collector.cfg, collector.state(),
+                                   (payload or {}).get("position"))
 
     return app
 
