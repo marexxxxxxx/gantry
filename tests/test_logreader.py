@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import tempfile
@@ -746,6 +747,89 @@ class TestTruncation(ReaderCase):
     def test_missing_file_is_not_fatal(self):
         events = self.reader.poll()
         self.assertEqual(events, [])
+
+
+class TestUnhashableRid(ReaderCase):
+    """Eine `rid`, die kein Text ist, darf nichts nach ihr verlieren.
+
+    `json.loads` akzeptiert `{"rid": {"x": 1}}`. Solange die `rid` nur
+    durchgereicht wird, faellt es erst in `_apply()` auf - dort bei
+    `self.state["seen"].add(rid)` mit `TypeError: unhashable type`.
+
+    Der Schaden ist nicht der Fehler: **der Leser-Offset ist da schon
+    weitergewandert**. Er ist auf `os.path.getsize()` gesprungen, also ist die
+    Zeile fuer immer gelesen - und alles, was danach kommt, ebenfalls nie.
+
+    Gemessen: Log mit `received aaa`, dann `rid={"x":1}`, dann `received ddd`,
+    dann `finished aaa`. Ergebnis war `open=['aaa']`, Offset 297/297, und nach
+    Anhaengen des Abschlusses weiterhin `open=[]` ohne `finished`. `ddd` war
+    nie gesehen worden, und der Abschluss von `aaa` fuer immer verloren.
+
+    Die Folge im Betrieb: `aaa` bleibt ewig offen, `evaluate()` waehlt es als
+    Halter, und `duration_s` waechst unbegrenzt.
+    """
+
+    def _write(self, *records):
+        with open(self.path, "w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+
+    def _received(self, rid, second):
+        return {"event": "request.received", "rid": rid,
+                "timestamp": f"2026-10-12T10:00:{second:02d}.000000", "obj": {}}
+
+    def _finished(self, rid, second):
+        return {"event": "request.finished", "rid": rid,
+                "timestamp": f"2026-10-12T10:00:{second:02d}.000000", "obj": {}}
+
+    def test_the_lines_after_a_dict_rid_are_still_read(self):
+        self._write(self._received("aaa", 0),
+                    self._received({"x": 1}, 1),
+                    self._received("ddd", 2))
+        events = self.reader.poll()
+        self.assertEqual(sorted(e.rid for e in events), ["aaa", "ddd"])
+
+    def test_a_list_rid_is_also_survivable(self):
+        self._write(self._received("aaa", 0),
+                    self._received(["y"], 1),
+                    self._received("ddd", 2))
+        events = self.reader.poll()
+        self.assertEqual(sorted(e.rid for e in events), ["aaa", "ddd"])
+
+    def test_a_dict_rid_is_not_reported_as_an_event(self):
+        """Die kaputte Zeile wird verworfen, nicht als Ereignis gemeldet.
+
+        Sonst gaebe `seen` eine unhashbare rid weiter und der Fehler waere nur
+        verschoben.
+        """
+        self._write(self._received({"x": 1}, 0), self._received("ddd", 1))
+        events = self.reader.poll()
+        self.assertEqual([e.rid for e in events], ["ddd"])
+
+    def test_a_completion_after_a_dict_rid_is_not_lost(self):
+        """Der eigentliche Schaden: der Abschluss verschwindet.
+
+        Ohne diese Zeile ist der Halter `aaa` ewig offen und `duration_s`
+        waechst ohne Ende.
+
+        Geprueft wird ueber `events` und `open`, nicht ueber ein
+        `state["finished"]`: das gibt es nicht, abgeschlossene Zeilen
+        verschwinden aus `open` und stehen nur noch in `seen`.
+        """
+        self._write(self._received("aaa", 0),
+                    self._received({"x": 1}, 1),
+                    self._finished("aaa", 2))
+        events = self.reader.poll()
+        self.assertEqual([e.rid for e in events], ["aaa", "aaa"],
+                         "erwartet: received aaa, finished aaa")
+        self.assertNotIn("aaa", self.reader.state["open"],
+                         "der rid blieb offen, sein Abschluss ging verloren")
+
+    def test_a_numeric_rid_is_also_rejected(self):
+        """`12345` ist unhashbar falsch behandelt: es ist eine Zahl, kein Text."""
+        self._write(self._received(12345, 0), self._received("ddd", 1))
+        events = self.reader.poll()
+        self.assertEqual([e.rid for e in events], ["ddd"])
 
 
 if __name__ == "__main__":

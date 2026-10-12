@@ -318,7 +318,23 @@ class LogReader:
 
         kind_name = record.get("event")
         rid = record.get("rid")
-        if not rid or kind_name not in ("request.received", "request.finished"):
+        # **Vor** der Offset-Weiterschaltung pruefen, ob die `rid` ueberhaupt
+        # ein Text ist.
+        #
+        # JSON laesst `{"rid": {"x": 1}}` zu. Wird die `rid` nur durchgereicht,
+        # faellt sie erst in `_apply()` auf - bei `seen.add(rid)` mit
+        # `TypeError: unhashable type`. Bis dahin ist der Leser-Offset aber
+        # schon auf `getsize()` gesprungen: die Zeile ist damit fuer immer
+        # gelesen, und alles dahinter auch. Gemessen: nach `received aaa`,
+        # `rid={"x":1}`, `received ddd`, `finished aaa` blieb `aaa` ewig offen
+        # und `ddd` wurde nie gesehen.
+        #
+        # `12345` ist der zweite Fall und der unauffaelligere: hashbar, also
+        # kein `TypeError`, aber trotzdem keine Kennung. `isinstance` faengt
+        # beides in einer Zeile.
+        if not isinstance(rid, str) or not rid:
+            return None
+        if kind_name not in ("request.received", "request.finished"):
             return None
 
         stamp = record.get("timestamp", "")
