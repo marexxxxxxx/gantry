@@ -37,7 +37,17 @@ PIDFILE="${PIDFILE:-/tmp/slotmon.pid}"
 # echten Prozess. Der Default fasst jeden `slotmon.server` - auch einen, den
 # jemand von Hand gestartet hat. Wer einen Monitor auf einem zweiten Port
 # daneben laesst, grenzt das Muster selbst ein.
-PATTERN="${SLOTMON_PATTERN:-[s]lotmon.server}"
+# `:-` reicht hier nicht: das ist "unset ODER leer", ein **leeres**
+# SLOTMON_PATTERN waere gesetzt und kaeme durch. Ein leeres Muster ist bei
+# `pgrep -f` kein "kein Treffer", sondern "alles": gemessen lieferte
+# `pgrep -f ""` jeden Kernel-Thread der Maschine, bis hinauf zu PID 1. Mit
+# `pkill -f ""` waere `stop` ein Systembefehl. Ein leerer Wert wird deshalb
+# abgewiesen, nicht stillschweigend zum Default.
+if [ -n "${SLOTMON_PATTERN:-}" ]; then
+    PATTERN="$SLOTMON_PATTERN"
+else
+    PATTERN='[s]lotmon.server'
+fi
 # 20 s sind die Grenze aus dem Muster. Ueberschreibbar, damit ein Test nicht
 # 20 s auf das Beenden wartet.
 STOP_GRACE="${STOP_GRACE:-20}"
@@ -76,6 +86,51 @@ monitor_pids() {
     pgrep -f "$PATTERN" 2>/dev/null | tr '\n' ' '
 }
 
+# `pgrep -f` vergleicht die **ganze Kommandozeile**, nicht den Prozessnamen.
+# Das heisst: jeder Prozess, der das Muster nur *nennt*, gilt als Treffer -
+# auch die Shell, in der `monitor.sh stop` getippt wurde, auch ein `grep`, auch
+# eine Editor-Vorschau. Gemessen: `pgrep -f '[s]lotmon.server'` lieferte die
+# eigene Aufruf-Shell mit, und `pkill -f` haette sie beendet.
+#
+# Der zweite Filter ist deshalb nicht Kosmetik, sondern die Grenze zwischen
+# "Monitor beenden" und "fremden Prozess beenden". Geprueft wird die Kommandozeile
+# **wortweise**: `-m slotmon.server` ist der Aufruf, den `slotmon/server.py`
+# selbst dokumentiert; ein blosses Nennen genuegt nicht.
+is_monitor_cmdline() {
+    tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null |
+        grep -qE -- '(^|[[:space:]])-m[[:space:]]+slotmon\.server([[:space:]]|$)'
+}
+
+is_running() {
+    local pid
+    for pid in $(pgrep -f "$PATTERN" 2>/dev/null); do
+        if is_monitor_cmdline "$pid"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+monitor_pids() {
+    local pid
+    for pid in $(pgrep -f "$PATTERN" 2>/dev/null); do
+        if is_monitor_cmdline "$pid"; then
+            printf '%s ' "$pid"
+        fi
+    done
+}
+
+# Genau die *Monitor*-PIDs. `pkill -f` kann nicht filtern - es beendet alles mit
+# passendem Text, und dieser Text steht in Kommandozeilen fremder Prozesse.
+# `monitor_pids` + `kill_one` statt `pkill`.
+signal_monitors() {
+    local sig=$1 pid any=0
+    for pid in $(monitor_pids); do
+        kill -"$sig" "$pid" 2>/dev/null && any=1
+    done
+    return $((1 - any))
+}
+
 # Die PID-Datei ist kein Buch ueber den Zustand - sie ist ein Ziel fuer `stop`.
 # `is_running` fragt `pgrep`, weil ein Monitor auch ohne Datei laufen kann (von
 # Hand, aus einer anderen Shell, nach einem reboot ohne /tmp). Benutzt wird sie
@@ -95,7 +150,7 @@ read_pidfile() {
 # wie `is_running`.
 owned_by_us() {
     kill -0 "$1" 2>/dev/null || return 1
-    pgrep -f "$PATTERN" 2>/dev/null | grep -qx -- "$1"
+    is_monitor_cmdline "$1"
 }
 
 # Genau einen Prozess beenden: TERM, warten, KILL. Ohne Muster, ohne Nachbarn -
@@ -197,10 +252,15 @@ stop() {
 
     # Sicherheitsnetz fuer Prozesse ohne (richtigen) Eintrag in der PID-Datei:
     # ein zweiter Monitor, oder einer, der zwischen Datei und Prozessliste
-    # aufgetaucht ist. Nur, was zum Muster passt - `pkill -f` ohne Muster
-    # waere ein Massaker.
+    # aufgetaucht ist.
+    #
+    # Hier stand vorher `pkill -TERM -f "$PATTERN"`. Das ist trotz Muster ein
+    # Massaker: `pgrep -f` sieht die ganze Kommandozeile, also trifft es jede
+    # Shell, die `slotmon.server` nur irgendwo nennt - die Shell, in der
+    # `stop` getippt wurde, eingeschlossen. `signal_monitors` filtert vorher
+    # auf echte Aufrufe von `-m slotmon.server`.
     if is_running; then
-        pkill -TERM -f "$PATTERN" 2>/dev/null || true
+        signal_monitors TERM || true
         local waited=0
         while is_running && [ "$waited" -lt "$STOP_GRACE" ]; do
             sleep 1
@@ -209,7 +269,7 @@ stop() {
     fi
     if is_running; then
         echo "[slotmon] nach ${STOP_GRACE}s noch aktiv: $(monitor_pids)- sende KILL" >&2
-        pkill -KILL -f "$PATTERN" 2>/dev/null || true
+        signal_monitors KILL || true
         sleep 1
     fi
 

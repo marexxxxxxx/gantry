@@ -31,6 +31,20 @@ export PORT="$TEST_PORT"
 export MONITOR_LOG="$WORKDIR/slotmon.log"
 export PIDFILE="$WORKDIR/monitor.pid"
 export HISTORY="$WORKDIR/history.jsonl"
+# Das Muster muss die **volle Kommandozeile** treffen. `exec -a` in
+# `monitor.sh` setzt argv[0] auf `slotmon-server:$PORT`, aber argv[0] steht in
+# `/proc/PID/cmdline` nur noch an erster Stelle und ohne Trennzeichen - ein
+# Muster mit Doppelpunkt trifft es nur, wenn es nicht auf ein Wortende achtet.
+# Der Teil nach argv[0] ist aber immer `-B -m slotmon.server`, und darauf
+# gruendet auch `is_monitor_cmdline`. Das Muster muss deshalb den **echten**
+# Aufruf treffen und den Port als Wortgrenze:
+# Das Muster muss die **volle Kommandozeile** treffen, denn `pgrep -f`
+# vergleicht sie. `monitor.sh` startet seinen Monitor mit
+# `exec -a "slotmon-server:$PORT"`, und argv[0] steht nachweislich als erstes
+# NUL-getrenntes Feld in `/proc/PID/cmdline`. Gemessen: `pgrep -f
+# '[s]lotmon-server:9099'` findet den Prozess. Port-Isolierung funktioniert
+# also ueber das Muster; `own_pid` bevorzugt zusaetzlich die PID-Datei, weil
+# ein `pgrep`-Treffer allein keine Zugehoerigkeit beweist.
 export SLOTMON_PATTERN="[s]lotmon-server:$TEST_PORT"
 
 FAILURES=0
@@ -50,7 +64,16 @@ cleanup() {
     if [ -f "$MONITOR" ]; then
         "$MONITOR" stop >/dev/null 2>&1
     fi
-    pkill -f "$SLOTMON_PATTERN" >/dev/null 2>&1
+    # Nur Prozesse mit eigener Monitor-Kommandozeile. `pkill -f` allein
+    # wuerde hier jede Shell mitnehmen, die das Muster nur nennt - auch
+    # die, in der dieser Test laeuft.
+    for _pid in $(pgrep -f "$SLOTMON_PATTERN" 2>/dev/null); do
+        if tr '\0' ' ' <"/proc/$_pid/cmdline" 2>/dev/null |
+            grep -qE -- '(^|[[:space:]])-m[[:space:]]+slotmon\.server([[:space:]]|$)'; then
+            kill -TERM "$_pid" 2>/dev/null || true
+        fi
+    done
+    [ -n "${DECOY:-}" ] && kill -TERM "$DECOY" 2>/dev/null
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -60,9 +83,39 @@ trap 'exit 130' INT TERM
 REAL_MONITOR_BEFORE=$(pgrep -f "[s]lotmon.server" | tr '\n' ' ')
 REAL_HISTORY_BEFORE=$(stat -c '%s %Y' /tmp/slotmon/history.jsonl 2>/dev/null || echo "-")
 SERVER_BEFORE=$(pgrep -f "[s]glang.launch_server" | tr '\n' ' ')
-REAL_MONITOR_STATE_BEFORE=$(ps -o lstart= -p 52264 2>/dev/null || echo "-")
+# Keine festverdrahtete PID: sie stimmt nur, bis der Monitor einmal neu
+# gestartet wurde. Geprueft wird die **Startzeit**, und die wird fuer jeden
+# gefundenen Monitor mitgeschrieben - ein Restart aendert sie.
+REAL_MONITOR_STARTS_BEFORE=$(for p in $(pgrep -f "[s]lotmon.server"); do echo "$p $(ps -o lstart= -p $p)"; done)
 
-own_pid() { pgrep -f "$SLOTMON_PATTERN" 2>/dev/null | head -1; }
+
+own_pid() {
+    local pid
+    # 1) Die PID-Datei. Sie ist der einzige Weg, der den eigenen Monitor vom
+    #    echten auf 8090 unterscheidet: das Suchmuster kann den Port nicht
+    #    treffen, weil er nur in argv[0] steht. Ohne diesen Schritt wuerde
+    #    `own_pid` hier den echten Monitor melden und der Test toete ihn.
+    if [ -r "$PIDFILE" ]; then
+        pid=$(head -n 1 -- "$PIDFILE" 2>/dev/null)
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null &&
+            tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null |
+                grep -qE -- '(^|[[:space:]])-m[[:space:]]+slotmon\.server([[:space:]]|$)'; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    fi
+    # 2) Sonst der erste Prozess mit echter `-m slotmon.server`-Kommandozeile.
+    #    Wie `monitor.sh`: nicht der erste Treffer von `pgrep`, denn das waere
+    #    jeder Prozess, der das Muster nur irgendwo nennt.
+    for pid in $(pgrep -f "$SLOTMON_PATTERN" 2>/dev/null); do
+        if tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null |
+            grep -qE -- '(^|[[:space:]])-m[[:space:]]+slotmon\.server([[:space:]]|$)'; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    done
+    return 1
+}
 port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$TEST_PORT") 2>/dev/null; }
 
 # --- Formales ---------------------------------------------------------------
@@ -192,9 +245,37 @@ if ! port_busy; then pass "Port nach fehlgeschlagenem Start wieder frei"; else f
 
 # --- status mit kaputter JSON-Antwort ---------------------------------------
 # Ein /api/state, das kein JSON ist, darf status nicht zum Absturz bringen.
-cat >"$WORKDIR/fake_monitor.py" <<'PY'
-"""Kein echter Monitor: /health sagt 200, /api/state liefert Muell."""
-import sys
+#
+# Der Prozess muss an **beides** erfuellen: `pgrep -f` muss ihn ueber argv[0]
+# finden, und `is_monitor_cmdline` in `monitor.sh` verlangt wortweise
+# `-m slotmon.server` in der Kommandozeile.
+#
+# Drei Fehlversuche, alle lehrreich:
+#   * `python -m slotmon.server <datei>` erfuellt die Kommandozeile, startet
+#     aber das **echte** Paket und laesst `<datei>` als Argument liegen;
+#   * ein `fake_monitor.py` ohne `-m slotmon.server` wird von `status` seit dem
+#     Fremdprozess-Fix gar nicht erst als Monitor erkannt;
+#   * `PYTHONPATH` allein genuegt nicht: mit `''` (das Arbeitsverzeichnis) an
+#     erster Stelle im `sys.path` gewinnt aus dem Repo das echte Paket. Der
+#     Shim muss deshalb aus einem **anderen** Verzeichnis gestartet werden -
+#     gemessen: aus `$REPO` band auf 8090, aus `/tmp` lieferte er Muell.
+#
+# Der Aufruf bleibt woertlich `python -m slotmon.server`.
+mkdir -p "$WORKDIR/shim/slotmon"
+: > "$WORKDIR/shim/slotmon/__init__.py"
+cat > "$WORKDIR/shim/slotmon/server.py" <<'SHIM'
+"""Kein echter Monitor: /health sagt 200, /api/state liefert Muell.
+
+Ersetzt `slotmon.server` im PYTHONPATH. Aufgerufen als `python -m
+slotmon.server`, damit die Kommandozeile der des echten Monitors gleicht -
+`is_monitor_cmdline` in `monitor.sh` prueft genau darauf.
+
+Der Port kommt aus `FAKE_PORT`, nicht aus `sys.argv`: bei `python -m` ist
+`sys.argv[0]` der Modulpfad, und der Port waere `sys.argv[1]` - laesst man ihn
+weg, gibt es keins, und `int(sys.argv[1])` waere ein `IndexError`, kein
+Server.
+"""
+import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
@@ -210,21 +291,140 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-HTTPServer(("127.0.0.0", int(sys.argv[1])), Handler).serve_forever()
-PY
-# argv[0] nennt den Port, damit das Suchmuster des Tests diesen Prozess findet
-# - genau so startet monitor.sh seinen eigenen.
-nohup bash -c 'exec -a "$0" "$1" "$2" "$3"' \
-    "slotmon-server:$TEST_PORT" "$PYTHON" "$WORKDIR/fake_monitor.py" "$TEST_PORT" \
+# `127.0.0.1`, nicht `0.0.0.0`: gemessen lieferte `0.0.0.0` einen
+# LISTEN-Socket, den kein Client erreichte - `Connection refused` bei
+# `ss` mit sauberem LISTEN. Auf `127.0.0.1` antwortet derselbe Server.
+HTTPServer(("127.0.0.1", int(os.environ["FAKE_PORT"])), Handler).serve_forever()
+SHIM
+# `cd "$WORKDIR"` - nicht nur ein gesetztes PYTHONPATH, siehe die Warnung oben.
+# Und `export` statt `env` davor: `env` steht als Kommando **vor** `exec -a`
+# und macht den Namen wieder rueckgaengig - gemessen, argv[0] war danach
+# wieder `python3.12`.
+nohup bash -c 'cd "$1"; export PYTHONPATH="$2" FAKE_PORT="$3"; exec -a "$0" "$4" -B -m slotmon.server' \
+    "slotmon-server:$TEST_PORT" "$WORKDIR" "$WORKDIR/shim" "$TEST_PORT" "$PYTHON" \
     >/dev/null 2>&1 &
-for _ in $(seq 1 50); do curl -sf -o /dev/null "http://127.0.0.1:$TEST_PORT/health" && break; sleep 0.2; done
+FAKE=$!
+for _ in $(seq 1 60); do curl -sf -o /dev/null "http://127.0.0.1:$TEST_PORT/health" && break; sleep 0.2; done
 out=$("$MONITOR" status 2>&1); rc=$?
 if [ "$rc" -eq 0 ]; then pass "status liefert 0, auch wenn /api/state Muell liefert"; else fail "status liefert $rc statt 0: $out"; fi
 case "$out" in *JSON*) pass "status sagt, dass keine JSON-Antwort kam" ;; *) fail "status sagt nichts zur kaputten Antwort: $out" ;; esac
 case "$out" in *Traceback*) fail "status ist abgestuerzt: $out" ;; *) pass "status stuerzt nicht ab" ;; esac
-pkill -f "$SLOTMON_PATTERN" >/dev/null 2>&1
+# Kein `pkill -f`: das Muster steht in fremden Kommandozeilen, ein Test, der
+# damit aufraeumt, koennte den Monitor auf 8090 mitnehmen.
+kill -TERM "$FAKE" 2>/dev/null
+for _ in $(seq 1 30); do kill -0 "$FAKE" 2>/dev/null || break; sleep 0.2; done
+
+
+# --- Fremdprozess, der das Muster nur NENNT ----------------------------------
+#
+# `pgrep -f` vergleicht die ganze Kommandozeile. Jeder Prozess, der
+# `slotmon.server` irgendwo nur erwaehnt, ist damit ein Treffer - die eigene
+# Aufruf-Shell, ein `grep`, eine Editor-Vorschau. Mit `pkill -TERM -f` hat
+# `monitor.sh stop` solche Prozesse abgeschossen. Gemessen, nicht vermutet:
+# `pkill` lieferte die eigene Shell mit im Ziel.
+#
+# Der Test startet deshalb einen Prozess, der das Muster im Text fuehrt, aber
+# **kein** Monitor ist, und prueft danach, ob er noch lebt.
+# Der Prozess muss das **Test-Muster** `[s]lotmon-server:$TEST_PORT` in seiner
+# Kommandozeile fuehren - genau das ist der Fehler, den `monitor.sh` nicht mehr
+# machen darf: `pgrep -f` vergleicht die ganze Zeile, also trifft es jeden
+# Prozess, der das Muster nur irgendwo nennt.
+#
+# Er traegt das Muster als Argument, aber **kein** `-m slotmon.server`, weil er
+# sonst wie ein echter Monitor aussaehe und `is_monitor_cmdline` ihn behielte.
+#
+# Vier Fehlversuche, alle lehrreich:
+#   * ein Argument an `sleep`: `sleep` nimmt keins und stirbt sofort;
+#   * `setsid` davor: `$!` ist dann die PID des Setsid-Wrappers, nicht die des
+#     Prozesses, und der ist schon wieder weg;
+#   * `exec -a` allein: setzt nur argv[0];
+#   * die Klammern aus dem Muster gehoeren **nicht** ins Argument: `[s]lotmon`
+#     ist fuer `pgrep` eine Zeichenklasse, nicht ein Literal, und der Prozess
+#     wird dann nicht gefunden - der Test prueft ins Leere.
+bash -c 'trap "exit 0" TERM; while :; do sleep 1; done' \
+    "slotmon-server:$TEST_PORT decoy" \
+    >/dev/null 2>&1 &
+DECOY=$!
+sleep 1
+if ! kill -0 "$DECOY" 2>/dev/null; then
+    fail "der Fremdprozess startet gar nicht erst (PID $DECOY)"
+else
+    # `stop` darf ihn nicht fuer einen Monitor halten ...
+    out=$("$MONITOR" stop 2>&1)
+    if kill -0 "$DECOY" 2>/dev/null; then
+        pass "stop laesst einen Prozess leben, der das Muster nur nennt"
+    else
+        fail "stop hat einen Fremdprozess getoetet, der das Muster nur nennt: $out"
+    fi
+    # ... und `start` darf sich durch ihn nicht blockieren lassen.
+    "$MONITOR" start >/dev/null 2>&1
+    if own_pid >/dev/null 2>&1 && [ "$(own_pid)" != "$DECOY" ]; then
+        pass "start startet trotz eines Prozesses, der das Muster nur nennt"
+    else
+        fail "start hat sich von einem Fremdprozess blockieren lassen: $out"
+    fi
+fi
+"$MONITOR" stop >/dev/null 2>&1
+kill -TERM "$DECOY" 2>/dev/null || true
+
+# --- leeres SLOTMON_PATTERN ---------------------------------------------------
+#
+# `${VAR:-default}` greift bei einem **leeren** VAR nicht: leer ist gesetzt.
+# Ein leeres Muster ist bei `pgrep -f` nicht "kein Treffer", sondern "alles" -
+# gemessen lieferte `pgrep -f ""` jeden Kernel-Thread bis hinauf zu PID 1. Mit
+# `pkill -f ""` waere `stop` ein Systembefehl.
+#
+# Der Test setzt die Variable bewusst auf "" und prueft, dass der Default
+# greift.
+# Der entscheidende Fall: **kein** Monitor laeuft, und das Muster ist leer.
+# Dann ist das richtige Ergebnis "laeuft nicht" - unter einem leeren Muster
+# waere `pgrep -f ""` jeder Prozess der Maschine, auch PID 1.
+#
+# Wichtig: dieser Aufruf bekommt bewusst das **Default**-Muster, nicht das
+# port-eingeschraenkte des Tests. Der echte Monitor auf 8090 faellt darunter -
+# und genau deshalb kann der Test nicht "nichts laeuft" erwarten, solange er
+# laeuft. Geprueft wird deshalb die andere, schaerfere Aussage: die PID-Liste
+# von `status` enthaelt **keine** Prozesse, die keine echte
+# `-m slotmon.server`-Kommandozeile haben.
+"$MONITOR" stop >/dev/null 2>&1
+out=$(SLOTMON_PATTERN="" "$MONITOR" status 2>&1); rc=$?
+echo "  info: leeres Muster, status rc=$rc: $(printf '%s' "$out" | head -1)"
+# Die eigentliche Behauptung: `status` nennt nur Prozesse mit echter
+# Kommandozeile. Wuerde ein leeres Muster durchgerutscht, waeren hier die
+# Kernel-Threads gelistet.
+listed=$(printf '%s' "$out" | sed -n 's/.*PID[s]* \([0-9 ]*\).*/\1/p')
+bad=""
+for pid in $listed; do
+    c=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)
+    printf '%s' "$c" | grep -qE -- '(^|[[:space:]])-m[[:space:]]+slotmon\.server([[:space:]]|$)' ||
+        bad="$bad $pid"
+done
+if [ -z "$bad" ]; then
+    pass "leeres SLOTMON_PATTERN listet nur echte Monitore (geprueft: '$listed')"
+else
+    fail "leeres SLOTMON_PATTERN listet Fremdprozesse: $bad"
+fi
+# Und mit gesetztem Default-Muster dasselbe Bild - ein Monitor, der laeuft,
+# wird gefunden, ein leeres Muster findet nichts:
+if [ -n "$(own_pid 2>/dev/null)" ]; then
+    fail "Test-Monitor laeuft noch, der Fall ist nicht pruefbar"
+else
+    pass "Vorbedingung: kein Test-Monitor laeuft"
+fi
 
 # --- fremde Dienste unberuehrt ----------------------------------------------
+
+# Gegenprobe: mit gesetztem Muster findet `status` einen Monitor. Sie steht
+# **hier**, nach dem Leer-Pattern-Fall und vor dem Aufraeumen: waere sie dort
+# stehen geblieben, wuerde ihr eigener Monitor in `REAL_MONITOR_AFTER` als
+# "fremder Monitor" mitzaehlen und der Vergleich unten immer fehlschlagen.
+"$MONITOR" start >/dev/null 2>&1
+if "$MONITOR" status >/dev/null 2>&1; then
+    pass "Gegenprobe: mit gesetztem Muster findet status einen Monitor (rc=0)"
+else
+    fail "Gegenprobe fehlt: mit gesetztem Muster findet status keinen Monitor"
+fi
+"$MONITOR" stop >/dev/null 2>&1
 
 REAL_MONITOR_AFTER=$(pgrep -f "[s]lotmon.server" | tr '\n' ' ')
 if [ "$REAL_MONITOR_BEFORE" = "$REAL_MONITOR_AFTER" ]; then
@@ -232,11 +432,11 @@ if [ "$REAL_MONITOR_BEFORE" = "$REAL_MONITOR_AFTER" ]; then
 else
     fail "echter Monitor veraendert: vorher '$REAL_MONITOR_BEFORE', nachher '$REAL_MONITOR_AFTER'"
 fi
-REAL_MONITOR_STATE_AFTER=$(ps -o lstart= -p 52264 2>/dev/null || echo "-")
-if [ "$REAL_MONITOR_STATE_BEFORE" = "$REAL_MONITOR_STATE_AFTER" ]; then
+REAL_MONITOR_STARTS_AFTER=$(for p in $(pgrep -f "[s]lotmon.server"); do echo "$p $(ps -o lstart= -p $p)"; done)
+if [ "$REAL_MONITOR_STARTS_BEFORE" = "$REAL_MONITOR_STARTS_AFTER" ]; then
     pass "echter Monitor nicht neu gestartet"
 else
-    fail "echter Monitor neu gestartet: '$REAL_MONITOR_STATE_BEFORE' zu '$REAL_MONITOR_STATE_AFTER'"
+    fail "echter Monitor neu gestartet: '$REAL_MONITOR_STARTS_BEFORE' zu '$REAL_MONITOR_STARTS_AFTER'"
 fi
 REAL_HISTORY_AFTER=$(stat -c '%s %Y' /tmp/slotmon/history.jsonl 2>/dev/null || echo "-")
 if [ "$REAL_HISTORY_BEFORE" = "$REAL_HISTORY_AFTER" ]; then
