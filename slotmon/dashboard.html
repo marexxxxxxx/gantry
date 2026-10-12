@@ -70,6 +70,8 @@
     <div class="kpi"><div class="label">Wartezeit</div><div class="value" id="k-wait-time">-</div></div>
   </div>
 
+  <div class="note" id="source-age"></div>
+
   <div class="card slot" id="slot-card">
     <div><span class="badge unknown" id="slot-badge">-</span>
       <strong id="slot-system">-</strong></div>
@@ -261,6 +263,33 @@ function renderLogNotices(logState, slot) {
 
 let lastState = null;
 
+// Der Poll-Takt des Servers, **gemessen** an `data.at` zweier
+// aufeinanderfolgender Zustaende. Der Zustand traegt kein `poll_interval`,
+// und eine eigene Zahl im Client waere eine Annahme ueber den Server. Der
+// Startwert ist der dokumentierte Default (`POLL_INTERVAL=2`) und gilt, bis
+// zwei Zustaende eingetroffen sind.
+let tickIntervalS = 2.0;
+let lastAt = null;
+
+// Quellenalter (Spec Z. 313). Gebaut wird ausschliesslich aus `connected`,
+// `load_error` und `age_s` - fuer `/metrics` und `nvidia-smi` liefert der
+// Zustand kein Alter, also steht hier keines. Eine erfundene Zahl waere
+// schlimmer als ein Strich: `null` heisst "nicht gemessen".
+function renderSourceAge(server) {
+  const measured = (typeof server.age_s === "number" && isFinite(server.age_s));
+  const age = measured ? server.age_s.toFixed(1) + " s" : DASH;
+  const parts = ["/get_load"];
+  if (server.connected === false) parts.push("nicht erreichbar");
+  if (server.load_error) parts.push(String(server.load_error));
+  parts.push(`Alter ${age}`);
+  // Drei Poll-Intervalle. Die Zahl bleibt stehen und wird nur markiert -
+  // wegschneiden waere ein Datenverlust, Markieren eine Aussage.
+  if (server.connected === true && measured && server.age_s > 3 * tickIntervalS) {
+    parts.push("veraltet");
+  }
+  document.getElementById("source-age").textContent = "Quellen: " + parts.join(" - ");
+}
+
 function averageDuration(entries) {
   const done = entries.filter(e => typeof e.duration_s === "number");
   if (!done.length) return null;
@@ -283,8 +312,22 @@ function render(data) {
   }
 
   // KPI
+  const server = data.server;
+  if (typeof data.at === "number" && typeof lastAt === "number" && data.at > lastAt) {
+    tickIntervalS = data.at - lastAt;
+  }
+  lastAt = typeof data.at === "number" ? data.at : lastAt;
+
   const labels = { busy: "BELEGT", free: "FREI", unknown: "UNBEKANNT" };
-  document.getElementById("k-slot").innerHTML = `<span class="unknown">${labels[slot.state]}</span>`;
+  // Das SLOT-Feld traegt den Verbindungszustand mit (Spec Z. 313): ist
+  // `/get_load` tot, gibt es keinen belegten Halter, und ein `BELEGT` waere
+  // eine Behauptung aus einem Widerspruch. Grau (`--idle`), nicht `--warn` -
+  // "Achtung" waere hier eine Behauptung ueber einen Zustand, den es nicht
+  // gibt. Mit Verbindung steht wie bisher der Slot-Zustand.
+  document.getElementById("k-slot").innerHTML = server.connected === false
+    ? '<span style="color:var(--idle)">verbunden mit Server: nein</span>'
+    : `<span class="unknown">${labels[slot.state]}</span>`;
+  renderSourceAge(server);
   document.getElementById("k-wait").innerHTML = fmt(queue.waiting);
   // `open_count` wird bewusst nicht angezeigt. Die Zahl der offenen rid(s) im
   // Log bildet die Warteschlange nicht ab (gemessen: 35 zu 1 Verbindung bei 180

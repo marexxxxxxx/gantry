@@ -383,10 +383,17 @@ function __dump() {
 
 #: Nach `render()`: den DOM-Zustand als JSON ausgeben. Genau das, was der
 #: Betrachter im Browser sieht - nicht die Quelltext-Zeile, die es erzeugt.
+#: Mehrere Zustaende hintereinander sind eine Liste: Puffer wie die Sparkline
+#: brauchen mehrere `render()`-Aufrufe. Der Zwischenstand wird mit
+#: ausgegeben, sonst koennte der Test nur den **letzten** Zustand pruefen -
+#: und genau der ist bei einem Puffer der interessanteste.
 RUNNER = """
-const __state = JSON.parse(require("fs").readFileSync(process.argv[2], "utf8"));
-render(__state);
-process.stdout.write(JSON.stringify(__dump()));
+const __states = JSON.parse(require("fs").readFileSync(process.argv[2], "utf8"));
+const __list = Array.isArray(__states);
+const __states_ = __list ? __states : [__states];
+const __dumps = [];
+for (const state of __states_) { render(state); __dumps.push(__dump()); }
+process.stdout.write(JSON.stringify(__list ? __dumps : __dumps[0]));
 """
 
 #: `node` oder `nodejs`. Ohne einen davon laeuft der `render()`-Test nicht -
@@ -394,7 +401,7 @@ process.stdout.write(JSON.stringify(__dump()));
 NODE = shutil.which("node") or shutil.which("nodejs")
 
 
-def render(state):
+def render(state, more=()):
     """`render()` aus `dashboard.html` mit einem DOM-Stub ausfuehren.
 
     Der HTML-Text wird nicht geparst und nicht mit `assertIn` abgetastet:
@@ -402,6 +409,12 @@ def render(state):
     Elementen steht. Geprueft wird damit das Verhalten und nicht eine
     Formulierung im Quelltext - ein umbenanntes `id` faellt sofort auf, ein
     umgestellter `if` nicht.
+
+    `more` sind weitere Zustaende in Reihenfolge. Sie sind noetig, wo etwas
+    **im Dokument** ueber die Aufrufe hinweg liegt: die Sparkline ist ein
+    Puffer, und der gemessene Poll-Takt braucht zwei `data.at`. Der
+    Rueckgabewert ist dann eine **Liste** mit einem Eintrag je `render()`,
+    sonst ein einzelnes Element-Objekt.
     """
     html = read_dashboard()
     match = SCRIPT_BLOCK.search(html)
@@ -415,7 +428,7 @@ def render(state):
         with open(script, "w", encoding="utf-8") as handle:
             handle.write(program)
         with open(payload, "w", encoding="utf-8") as handle:
-            json.dump(state, handle)
+            json.dump([state, *more] if more else state, handle)
         done = subprocess.run([NODE, script, payload, json.dumps(ids)],
                               capture_output=True, text=True, timeout=30)
     if done.returncode != 0:
@@ -805,6 +818,100 @@ class TestLogNotices(unittest.TestCase):
         for ident in ("log-warn", "log-truncated", "log-error"):
             self.assertTrue(hidden(dom, ident), ident)
             self.assertEqual(dom[ident]["text"], "", ident)
+
+
+@unittest.skipUnless(NODE, "kein node/nodejs im PATH - render() wird nicht ausgefuehrt")
+class TestSourceAge(unittest.TestCase):
+    """`data.server` wird gelesen: Verbindung und Alter sind sichtbar.
+
+    Spec Z. 313: "Quellen als **getrennte Altersangaben** fuehren. Ist nur eine
+    tot, zeigen die uebrigen Kacheln weiter; das Slot-Feld wird grau mit
+    'verbunden mit Server: nein'."
+
+    Gebaut wird nur aus `server.connected`, `server.load_error` und
+    `server.age_s` - die Felder, die `collector.py` wirklich liefert. Fuer
+    `/metrics` und `nvidia-smi` gibt es im Zustand kein Alter, also steht hier
+    auch keines.
+    """
+
+    def test_slot_tile_reports_a_lost_connection_in_grey(self):
+        dom = render(sample_state(server={"connected": False,
+                                          "load_error": "ConnectError: [Errno 111]",
+                                          "age_s": None}))
+        html = dom["k-slot"]["html"]
+        self.assertIn("verbunden mit Server: nein", html)
+        # Grau ist `--idle`. `--warn` waere "Achtung", nicht "nicht da".
+        self.assertIn("var(--idle)", html)
+        self.assertNotIn("var(--warn)", html)
+
+    def test_a_connected_slot_keeps_its_state_word(self):
+        for state, word in (("busy", "BELEGT"), ("free", "FREI"),
+                            ("unknown", "UNBEKANNT")):
+            dom = render(sample_state(slot={"state": state},
+                                      server={"connected": True}))
+            self.assertEqual(dom["k-slot"]["html"],
+                             f'<span class="unknown">{word}</span>')
+
+    def test_the_other_tiles_keep_showing_their_values(self):
+        """Nur eine Quelle ist tot - die uebrigen Kacheln laufen weiter."""
+        dom = render(sample_state(server={"connected": False,
+                                          "load_error": "weg", "age_s": None}))
+        self.assertEqual(dom["k-gpu"]["html"], "97 %")
+        self.assertEqual(dom["k-wait"]["html"], "3")
+
+    def test_a_dead_source_names_its_error_and_invents_no_age(self):
+        dom = render(sample_state(server={"connected": False,
+                                          "load_error": "ConnectError: [Errno 111]",
+                                          "age_s": None}))
+        text = dom["source-age"]["text"]
+        self.assertIn("ConnectError: [Errno 111]", text)
+        self.assertIn("Alter -", text)
+        self.assertNotIn("0.0 s", text)
+
+    def test_load_error_is_named_even_when_connected_is_true(self):
+        dom = render(sample_state(server={"connected": True,
+                                          "load_error": "OSError: kaputt",
+                                          "age_s": 0.1}))
+        self.assertIn("OSError: kaputt", dom["source-age"]["text"])
+
+    def test_a_fresh_source_shows_its_age_without_a_flag(self):
+        dom = render(sample_state(server={"connected": True, "load_error": None,
+                                          "age_s": 0.1}))
+        text = dom["source-age"]["text"]
+        self.assertIn("0.1 s", text)
+        self.assertNotIn("veraltet", text)
+
+    def test_an_old_source_keeps_its_number_and_is_flagged(self):
+        """Die Zahl bleibt stehen, sie wird nur als veraltet gekennzeichnet.
+
+        Die Schwelle liegt bei drei Poll-Intervallen. Der erste Zustand kennt
+        den Takt noch nicht, also gilt der dokumentierte Default von 2 s.
+        """
+        dom = render(sample_state(server={"connected": True, "load_error": None,
+                                          "age_s": 12.0}))
+        text = dom["source-age"]["text"]
+        self.assertIn("12.0 s", text)
+        self.assertIn("veraltet", text)
+
+    def test_the_threshold_follows_the_measured_tick(self):
+        """Der Client misst den Takt an `data.at`, statt ihn zu erfinden.
+
+        Drei Zustaende, 10 s auseinander. Der erste kennt den Takt noch nicht
+        und rechnet mit dem Default von 2 s (Schwelle 6 s). Danach ist der
+        Takt gemessen: die Schwelle liegt bei 30 s. Dasselbe Alter von 12.0 s
+        ist also einmal "veraltet" und einmal nicht - mit einer festen Zahl im
+        Client waere das nicht moeglich.
+        """
+        first, second, third = render(
+            sample_state(at=1000.0, server={"connected": True, "age_s": 12.0}),
+            [sample_state(at=1010.0, server={"connected": True, "age_s": 12.0}),
+             sample_state(at=1020.0, server={"connected": True, "age_s": 40.0})])
+        self.assertIn("12.0 s", first["source-age"]["text"])
+        self.assertIn("veraltet", first["source-age"]["text"])
+        self.assertIn("12.0 s", second["source-age"]["text"])
+        self.assertNotIn("veraltet", second["source-age"]["text"])
+        self.assertIn("40.0 s", third["source-age"]["text"])
+        self.assertIn("veraltet", third["source-age"]["text"])
 
 
 class TestOpenCount(unittest.TestCase):
