@@ -926,7 +926,7 @@ class TestSourceAge(unittest.TestCase):
         dom = render(sample_state(server={"connected": True, "load_error": None,
                                           "age_s": 0.1}))
         text = dom["source-age"]["text"]
-        self.assertIn("0.1 s", text)
+        self.assertIn("0.10 s", text)
         self.assertNotIn("veraltet", text)
 
     def test_an_old_source_keeps_its_number_and_is_flagged(self):
@@ -938,7 +938,7 @@ class TestSourceAge(unittest.TestCase):
         dom = render(sample_state(server={"connected": True, "load_error": None,
                                           "age_s": 12.0}))
         text = dom["source-age"]["text"]
-        self.assertIn("12.0 s", text)
+        self.assertIn("12 s", text)
         self.assertIn("veraltet", text)
 
     def test_the_threshold_follows_the_measured_tick(self):
@@ -954,11 +954,11 @@ class TestSourceAge(unittest.TestCase):
             sample_state(at=1000.0, server={"connected": True, "age_s": 12.0}),
             [sample_state(at=1010.0, server={"connected": True, "age_s": 12.0}),
              sample_state(at=1020.0, server={"connected": True, "age_s": 40.0})])
-        self.assertIn("12.0 s", first["source-age"]["text"])
+        self.assertIn("12 s", first["source-age"]["text"])
         self.assertIn("veraltet", first["source-age"]["text"])
-        self.assertIn("12.0 s", second["source-age"]["text"])
+        self.assertIn("12 s", second["source-age"]["text"])
         self.assertNotIn("veraltet", second["source-age"]["text"])
-        self.assertIn("40.0 s", third["source-age"]["text"])
+        self.assertIn("40 s", third["source-age"]["text"])
         self.assertIn("veraltet", third["source-age"]["text"])
 
 

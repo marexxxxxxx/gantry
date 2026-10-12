@@ -318,7 +318,13 @@ let lastGoodAt = null;
 
 function renderSourceAge(server) {
   const measured = (typeof server.age_s === "number" && isFinite(server.age_s));
-  const age = measured ? server.age_s.toFixed(1) + " s" : DASH;
+  // Zwei Nachkommastellen unterhalb einer Sekunde: ein Alter von 30 ms als
+  // "0.0 s" zu schreiben waere genau die Verwechslung, die die ganze Kachel
+  // vermeiden soll - es liest sich wie "nichts gemessen".
+  const age = !measured ? DASH
+    : server.age_s < 10 ? server.age_s.toFixed(2) + " s"
+    : server.age_s < 600 ? Math.round(server.age_s) + " s"
+    : duration(server.age_s);
   const parts = ["/get_load"];
   if (server.connected === false) parts.push("nicht erreichbar");
   if (server.load_error) parts.push(String(server.load_error));
