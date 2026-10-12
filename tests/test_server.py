@@ -965,7 +965,7 @@ class TestQueueFootnote(unittest.TestCase):
         note = render(sample_state())["queue-note"]["text"]
         self.assertIn("Einzelne Wartende lassen sich keinem System zuordnen",
                       note)
-        self.assertIn("keine Zuordnung", note)
+        self.assertIn("eine Zuordnung wird nicht behauptet", note)
         self.assertIn("kein Prompt-Text", note)
 
     def test_the_note_does_not_mention_a_connection_count(self):

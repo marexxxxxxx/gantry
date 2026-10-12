@@ -94,11 +94,7 @@
         <th class="num">Antwort</th><th class="num">Cache</th><th>Ende</th></tr></thead>
       <tbody id="history-rows"></tbody>
     </table>
-    <div class="note">Einzelne Wartende lassen sich keinem System zuordnen - die
-      Warteschlange des Servers ist laenger als die Zahl offener Verbindungen
-      (gemessen: 35 zu 1 Verbindung bei 180 zu 1492 Wartenden). Angezeigt wird
-      deshalb nur die Zahl aus <code>/get_load</code>, ohne behauptete Zuordnung.
-      Es stehen hier nur Token-Zahlen, kein Prompt-Text.</div>
+    <div class="note" id="queue-note"></div>
   </div>
 </section>
 
@@ -268,6 +264,16 @@ function renderLogNotices(logState, slot) {
 // an der WARTEND-Kachel. Der Satz steht an beiden Orten: der `title` erscheint
 // nur mit der Maus, und gerade in diesem Zustand schaut niemand auf die
 // Kachel.
+// Der Pflichtsatz zur Nicht-Zuordenbarkeit (Spec Z. 294-296). Die alte
+// Fassung begruendete ihn mit der Zahl offener Verbindungen - die gibt es
+// seit `36840ab` nicht mehr, und eine Begruendung, die auf etwas nicht
+// Existierendes zeigt, ist keine Begruendung. Der Satz selbst ist geblieben:
+// er sagt, dass nur die Zahl aus `/get_load` gezeigt wird und keine
+// Zuordnung behauptet ist.
+const QUEUE_NOTE = "Einzelne Wartende lassen sich keinem System zuordnen - "
+  + "angezeigt wird deshalb nur die Zahl aus /get_load, eine Zuordnung wird "
+  + "nicht behauptet. Es stehen hier nur Token-Zahlen, kein Prompt-Text.";
+
 const HOLD_SWITCH_NOTE =
   "Der Halter-Wechsel wird erst erkannt, wenn der naechste Halter "
   + "tatsaechlich sendet - im Extremfall steht der alte Name wenige "
@@ -343,6 +349,7 @@ function render(data) {
   document.getElementById("k-wait").innerHTML = fmt(queue.waiting);
   document.getElementById("k-wait").setAttribute("title", HOLD_SWITCH_NOTE);
   document.getElementById("wait-footnote").textContent = HOLD_SWITCH_NOTE;
+  document.getElementById("queue-note").textContent = QUEUE_NOTE;
   // `open_count` wird bewusst nicht angezeigt. Die Zahl der offenen rid(s) im
   // Log bildet die Warteschlange nicht ab (gemessen: 35 zu 1 Verbindung bei 180
   // zu 1492 Wartenden), und die Spec hat die Kachel dafuer ausdruecklich
