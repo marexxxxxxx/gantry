@@ -2526,5 +2526,178 @@ class TestUnknownReasonIsNamed(CollectorCase):
                 self.assertIn(expected, state["slot"]["reason"])
 
 
+# ======================================================================
+# Die Warteschlangenliste (Task 1)
+# ======================================================================
+#
+# `queue.build()` ist rein und wird hier nur verdrahtet geprueft. Die
+# beiden Tests, die der Plan verlangt, sind die Reihenfolge und die
+# Altbestand-Sperre; die weiteren sind die Nahte, an denen eine Verdrahtung
+# sonst still falsch steht.
+
+
+class TestWaitingList(CollectorCase):
+    """`state["queue"]["waiting_list"]`, aus dem Log gelesen.
+
+    Der gemessene Zustand vom 2026-10-12 ist die Form aller Fixtures
+    hier: `num_reqs` = offene rids im Log, `num_waiting_reqs` = davon
+    einer weniger, weil der aelteste offene rid gerade laeuft.
+    """
+
+    def with_queue(self, num_reqs, num_waiting_reqs):
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": num_reqs, "num_waiting_reqs": num_waiting_reqs})
+        return collector
+
+    def test_the_list_has_one_entry_per_waiting_request(self):
+        """Drei Wartende, vier offene rids: drei Eintraege, Position 1-3."""
+        collector = self.with_queue(num_reqs=4, num_waiting_reqs=3)
+        # Absichtlich in falscher Reihenfolge ins Log geschrieben: die Liste
+        # sortiert nach Empfangszeit, nicht nach Schreibreihenfolge.
+        self.append(received(rid="wartet2", at=RECEIVED_AT + 2.0))
+        self.append(received(rid="laeuft", at=RECEIVED_AT))
+        self.append(received(rid="wartet3", at=RECEIVED_AT + 3.0))
+        self.append(received(rid="wartet1", at=RECEIVED_AT + 1.0))
+        state = collector.tick()
+        liste = state["queue"]["waiting_list"]
+        self.assertEqual([e["rid"] for e in liste],
+                         ["wartet1", "wartet2", "wartet3"])
+        self.assertEqual([e["position"] for e in liste], [1, 2, 3])
+        self.assertEqual([e["waiting_since"] for e in liste],
+                         [RECEIVED_AT + 1.0, RECEIVED_AT + 2.0,
+                          RECEIVED_AT + 3.0])
+
+    def test_the_running_holder_is_not_in_the_list(self):
+        """Der Halter steht im Slot, nicht auf Position 1."""
+        collector = self.with_queue(num_reqs=4, num_waiting_reqs=3)
+        self.append(received(rid="laeuft", at=RECEIVED_AT))
+        self.append(received(rid="wartet1", at=RECEIVED_AT + 1.0))
+        self.append(received(rid="wartet2", at=RECEIVED_AT + 2.0))
+        self.append(received(rid="wartet3", at=RECEIVED_AT + 3.0))
+        state = collector.tick()
+        self.assertEqual(state["slot"]["rid"], "laeuft")
+        self.assertNotIn("laeuft",
+                         [e["rid"] for e in state["queue"]["waiting_list"]])
+
+    def test_legacy_empties_the_list(self):
+        """Altbestand > 0: offene rids da, Liste trotzdem leer.
+
+        Sonst wuerde die Liste aus den offenen rids gebaut, obwohl der
+        Server mehr Wartende meldet als das Log zeigt. Die Zahl stimmt
+        dann nicht, und jede Position ist geraten.
+        """
+        collector = self.with_queue(num_reqs=2302, num_waiting_reqs=2301)
+        self.append(received(rid="aaa"))
+        state = collector.tick()
+        self.assertEqual(state["slot"]["legacy"], 2300)
+        self.assertEqual(state["queue"]["waiting_list"], [])
+
+    def test_no_queue_before_the_first_tick(self):
+        """/api/state liefert `state()`. Vor dem ersten Poll gibt es keine
+        Liste - aber die Schluessel muss es geben."""
+        self.assertEqual(self.make().state()["queue"]["waiting_list"], [])
+
+    def test_no_list_while_the_server_is_down(self):
+        """Ohne `/get_load` ist die Warteschlangenlaenge `None`, und eine
+        Liste daraus waere geraten."""
+        collector = self.make()
+        collector.sources.read_load = lambda **kw: Sample(None, None, "down")
+        self.append(received(rid="aaa"))
+        state = collector.tick()
+        self.assertIsNone(state["queue"]["waiting"])
+        self.assertEqual(state["queue"]["waiting_list"], [])
+
+    def test_no_list_when_nobody_waits(self):
+        collector = self.with_queue(num_reqs=1, num_waiting_reqs=0)
+        self.append(received(rid="aaa"))
+        state = collector.tick()
+        self.assertEqual(state["queue"]["waiting_list"], [])
+
+    def test_a_waiting_request_has_no_name(self):
+        """Kein erfundener Name.
+
+        Ein Wartender traegt keine IP, und ein frueher abgeschlossener rid ist
+        ein **anderer** rid. Aus einem Abschluss von 192.168.9.2 folgt fuer
+        den Wartenden `wartet1` nichts - die Zuordnung gibt es nicht, und sie
+        wird auch nicht geraten.
+        """
+        collector = self.with_queue(num_reqs=2, num_waiting_reqs=1)
+        self.append(received(rid="aaa", at=RECEIVED_AT))
+        collector.tick()
+        self.append(finished(rid="aaa"), access())
+        self.append(received(rid="wartet1", at=RECEIVED_AT + 1.0))
+        state = collector.tick()
+        self.assertEqual(state["history"][0]["system"], "Laptop")
+        liste = state["queue"]["waiting_list"]
+        self.assertEqual([e["rid"] for e in liste], ["wartet1"])
+        self.assertIsNone(liste[0]["system"])
+
+    def test_a_known_ip_port_shows_the_name(self):
+        """Der Namens-Rueckfall, an der einen Stelle verdrahtet.
+
+        `_known_ips` ist die Zuordnung aus **abgeschlossenen** Eintraegen
+        (`rid -> ip_port`); `_queue_name` schlaegt darin nach und gibt den
+        Namen aus `systems.json` weiter. Der Wartende traegt selbst keine IP -
+        was hier bekannt ist, kommt aus einem frueheren Abschluss.
+        """
+        collector = self.with_queue(num_reqs=2, num_waiting_reqs=1)
+        self.append(received(rid="laeuft", at=RECEIVED_AT))
+        self.append(received(rid="wartet1", at=RECEIVED_AT + 1.0))
+        collector._known_ips["wartet1"] = "192.168.9.2:44444"
+        state = collector.tick()
+        liste = state["queue"]["waiting_list"]
+        self.assertEqual([e["rid"] for e in liste], ["wartet1"])
+        self.assertEqual(liste[0]["system"], "Laptop")
+
+    def test_an_unknown_ip_port_is_not_a_name(self):
+        """Eine IP, die nicht in `systems.json` steht, ist kein Name.
+
+        `names.resolve()` liefert dann die rohe IP zurueck. Die zeigt der
+        Collector als Name an - der Betrachter erkennt sie wieder. Der
+        Monitor behauptet damit nichts Falsches.
+        """
+        collector = self.make(names={})
+        collector.sources.read_load = lambda **kw: self.sample(
+            {"num_reqs": 2, "num_waiting_reqs": 1})
+        self.append(received(rid="laeuft", at=RECEIVED_AT))
+        self.append(received(rid="wartet1", at=RECEIVED_AT + 1.0))
+        collector._known_ips["wartet1"] = "10.9.9.9:1111"
+        state = collector.tick()
+        self.assertEqual(state["queue"]["waiting_list"][0]["system"],
+                         "10.9.9.9")
+
+    def test_a_completed_request_remembers_its_ip_port(self):
+        """`_known_ips` wird aus dem Abschluss gefuellt, sonst waere die
+        Verdrahtung in `_queue_name` tote Schrift."""
+        collector = self.with_queue(num_reqs=1, num_waiting_reqs=0)
+        self.append(received(rid="aaa"))
+        collector.tick()
+        self.append(finished(rid="aaa"), access())
+        collector.tick()
+        self.assertEqual(collector._known_ips.get("aaa"), "192.168.9.2:44444")
+
+    def test_the_ip_port_memory_stays_bounded(self):
+        """Ein Monitor laeuft wochenlang.
+
+        `_known_ips` waere sonst ein Dict, das mit jedem Abschluss waechst und
+        nie etwas loescht. Die Grenze ist gross genug fuer die Queue (die
+        Zustaende kommen aus `request.finished`) und klein genug, um keine
+        Leckstelle zu sein.
+        """
+        from slotmon import collector as collector_modul
+        collector = self.with_queue(num_reqs=1, num_waiting_reqs=0)
+        for index in range(collector_modul.KNOWN_IPS_MAX + 5):
+            collector._known_ips[f"rid{index:06d}"] = "192.168.9.2:44444"
+        self.append(received(rid="neu"))
+        collector.tick()
+        self.append(finished(rid="neu"), access())
+        collector.tick()
+        self.assertEqual(len(collector._known_ips),
+                         collector_modul.KNOWN_IPS_MAX)
+        self.assertIn("neu", collector._known_ips)
+        self.assertNotIn("rid000000", collector._known_ips)
+
+
 if __name__ == "__main__":
     unittest.main()

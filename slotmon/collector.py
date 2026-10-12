@@ -47,6 +47,7 @@ from slotmon.history import History
 from slotmon.logreader import FINISHED, RECEIVED, LogReader
 from slotmon.logrotate import LogRotator
 from slotmon.names import resolve
+from slotmon.queue import build as build_queue
 from slotmon.slot import count_of, evaluate
 from slotmon.sources import ServerSources
 
@@ -83,6 +84,14 @@ BATCH_TOKENS = re.compile(r"#full token:\s*(\d+)")
 #: Wahrheit: der Wert aus /metrics hat Vorrang, die Logzeile ist der Fallback,
 #: wenn /metrics schweigt.
 BATCH_THROUGHPUT = re.compile(r"gen throughput \(token/s\):\s*([\d.]+)")
+
+#: So viele `rid -> ip_port`-Zustaende aus abgeschlossenen Requests werden
+#: gehalten. `_queue_name()` schlaegt darin nach, wenn ein Wartender einen
+#: Namen bekommen soll. Der Monitor laeuft wochenlang, die Zahl der
+#: Abschluesse nicht begrenzt - ohne diese Grenze waere es ein Dict, das nur
+#: waechst. 500 ist um mehr als eine Groessenordnung groesser, als eine
+#: Warteschlange braucht (gemessen 34).
+KNOWN_IPS_MAX = 500
 
 
 def host_of(ip_port):
@@ -140,6 +149,13 @@ class Collector:
         self.compact_every_s = COMPACT_EVERY_S
         self.max_req_input_len = None
         self.finished = {}
+        #: rid -> ip_port, ausschliesslich aus **abgeschlossenen** Requests
+        #: (`request.finished`). Das ist die einzige Stelle, an der eine IP
+        #: ueberhaupt im Log steht. Ein wartender Request traegt keine
+        #: (gemessen an 61 ueber alle Felder von `request.received`: null
+        #: Treffer), deshalb ist dies eine Naht fuer einen Rueckfall und
+        #: keine Zuordnung, mit der sich die Queue bestimmen laesst.
+        self._known_ips = {}
         #: rid -> Unix-Zeit des `request.received`. Aus `state["open"]` geht das
         #: nicht mehr hervor, sobald der Reader die rid beim `finished` entfernt.
         self.received_at = {}
@@ -212,7 +228,7 @@ class Collector:
                 # noch niemand gefragt.
                 "reason": "noch kein Messwert - der erste Poll steht aus",
             },
-            "queue": {"waiting": None, "running": None},
+            "queue": {"waiting": None, "running": None, "waiting_list": []},
             "speed": {"tok_per_s": None, "ctx_tokens": None,
                       "max_req_input_len": self.max_req_input_len,
                       "output_pct": None},
@@ -382,6 +398,20 @@ class Collector:
             ended = record.get("ended_at")
             record["duration_s"] = self._duration(started, ended, now)
             record["system"] = resolve(self.names, host_of(record.get("ip_port")))
+            # Die `ip_port` merken, **bevor** geschrieben wird: der
+            # Historienschlag kann fehlschlagen, die IP steht trotzdem im Log.
+            # `_queue_name()` liest dieses Dict; ohne den Eintrag waere der
+            # Namens-Rueckfall der Warteschlange tote Schrift.
+            ip_port = record.get("ip_port")
+            if ip_port:
+                # `while`, nicht `if`: ein einzelner `pop` haelt ein Dict, das
+                # bereits ueber der Grenze liegt, nicht darueber - es waechst
+                # dann mit jedem Abschluss weiter.
+                while len(self._known_ips) >= KNOWN_IPS_MAX:
+                    # Dicts behalten die Einfuegereihenfolge;
+                    # `next(iter(...))` ist damit der aelteste Eintrag.
+                    self._known_ips.pop(next(iter(self._known_ips)))
+                self._known_ips[rid] = ip_port
             self._append(record)
             if self._history_error is None:
                 written.append(record)
@@ -434,6 +464,28 @@ class Collector:
         if not isinstance(started, (int, float)):
             return None
         return max(0.0, float(start_point) - float(started))
+
+    def _queue_name(self, rid):
+        """Der Anzeigename eines Wartenden, oder `None`.
+
+        `queue.build()` ruft das **je Position** auf und bekommt die rid. Die
+        Aufloesung bleibt hier: `queue.py` weiss nichts ueber `systems.json`
+        und muss es auch nicht wissen.
+
+        **Was hier nicht passiert:** die Access-Zeile des Lesers wird nicht
+        angefasst. Die gehoert dem Halter und wird erst bei
+        `request.finished` verbraucht (`logreader.py:359`, `_attach_ip`) -
+        waere sie hier abgegriffen, verloere der gerade laufende Auftrag
+        seinen Namen.
+
+        Im Regelfall kommt `None` heraus: `_known_ips` enthaelt `rid`s, die
+        **fertig** sind, und ein Wartender ist per Definition nicht fertig.
+        Das ist keine halbe Sache, sondern die Grenze der Datenlage.
+        """
+        ip_port = self._known_ips.get(rid)
+        if not ip_port:
+            return None
+        return resolve(self.names, host_of(ip_port))
 
     # ------------------------------------------------------------------
     # Quellen
@@ -820,7 +872,15 @@ class Collector:
             "complete": slot_state.complete,
             "reason": reason,
         }
-        state["queue"] = {"waiting": waiting, "running": running}
+        state["queue"] = {
+            "waiting": waiting,
+            "running": running,
+            # Nach `evaluate()`, weil `legacy` von dort kommt: ein Altbestand
+            # schliesst die Liste. `open_rids` ist die gefilterte Kopie aus
+            # diesem Takt, Geister sind draussen.
+            "waiting_list": build_queue(open_rids, waiting,
+                                        slot_state.legacy, self._queue_name),
+        }
         state["speed"] = {
             "tok_per_s": tok_per_s,
             "ctx_tokens": ctx,
