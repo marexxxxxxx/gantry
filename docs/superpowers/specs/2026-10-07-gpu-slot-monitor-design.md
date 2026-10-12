@@ -277,9 +277,12 @@ Zwei Reiter. Der Reiterwechsel ändert nur die Ansicht, nicht die Daten; die Wer
 aktualisieren sich im Hintergrund weiter. „Verlauf" merkt sich seine Position.
 
 **Reiter „Jetzt"**
-- KPI-Raster (5): SLOT (BELEGT/frei), WARTEND (`num_waiting_reqs`), TOK/S, GPU,
+- KPI-Raster (6): SLOT (BELEGT/frei), WARTEND (`num_waiting_reqs`), TOK/S, GPU, VRAM,
   WARTEZEIT. Eine Kachel VERBINDUNGEN gibt es nicht mehr — sie beruhte auf der
   widerlegten Socket-Annahme.
+  *(Zählung nachträglich von 5 auf 6 korrigiert: die Fehlerbehandlungstabelle unten
+  verlangt eine VRAM-Kachel, die hier ursprünglich fehlte. Der Satz war in sich
+  widersprüchlich.)*
 - **Altbestand-Banner**, nur sichtbar wenn `altbestand_offen > 0`: orangefarbene Warnzeile
   `Altbestand: 2301 Requests vor Aktivierung der Log-Events — Halter unbekannt, bis die
   Queue auf 0 ist`. Der Grund steht dabei, nicht nur die Zahl.
