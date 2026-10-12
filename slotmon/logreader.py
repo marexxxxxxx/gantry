@@ -14,7 +14,7 @@ Bekannte Grenze: IP-Zuordnung ist nicht rueckwirkend
 ----------------------------------------------------
 Ein ``finished``-Event bekommt seine IP nur, wenn die zugehoerige Access-Zeile
 bereits im selben oder einem frueheren ``poll()`` gesehen wurde. Taucht die
-Access-Zeile erst in einem *spaeteren* ``poll()`` auf, ist das Event längst
+Access-Zeile erst in einem *spaeteren* ``poll()`` auf, ist das Event laengst
 an den Aufrufer (Task 8 Collector) ausgeliefert und bleibt bei ``ip_port=None``.
 Das entspricht der Logreihenfolge (uvicorn loggt die Access-Zeile beim
 Abschluss, das JSON-``request.finished`` kurz danach), ist aber nicht
