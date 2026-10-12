@@ -70,13 +70,13 @@ def received(rid="aaa", at=RECEIVED_AT, monotonic=MONOTONIC):
 
 
 def finished(rid="aaa", at=FINISHED_AT, monotonic=MONOTONIC,
-             prompt=100, completion=50, cached=0):
+             prompt=100, completion=50, cached=0, reason="stop"):
     return json.dumps({
         "timestamp": stamp(at),
         "event": "request.finished",
         "rid": rid,
         "obj": {"rid": rid, "received_time": monotonic},
-        "out": {"meta_info": {"id": rid, "finish_reason": {"type": "stop"},
+        "out": {"meta_info": {"id": rid, "finish_reason": {"type": reason},
                               "prompt_tokens": prompt,
                               "completion_tokens": completion,
                               "cached_tokens": cached}},
@@ -425,6 +425,25 @@ class TestCompletion(CollectorCase):
         self.assertIsNone(entry["ip_port"])
         self.assertIsNone(entry["system"])
         self.assertEqual(entry["prompt_tokens"], 100)
+
+    def test_abbruch_wird_markiert_und_bleibt_in_der_historie(self):
+        """Ein Abbruch ist ein Ereignis in der Historie, kein verworfener Abschluss."""
+        collector = self.make()
+        self.append(received())
+        collector.tick()
+        self.append(finished(reason="abort"), access())
+        state = collector.tick()
+        self.assertEqual(len(state["history"]), 1)
+        self.assertIs(state["history"][0]["aborted"], True)
+        self.assertIs(self.history_lines()[0]["aborted"], True)
+
+    def test_normaler_abschluss_ist_nicht_markiert(self):
+        collector = self.make()
+        self.append(received())
+        collector.tick()
+        self.append(finished(), access())
+        entry = collector.tick()["history"][0]
+        self.assertIs(entry["aborted"], False)
 
     def test_finished_twice_is_not_written_twice(self):
         collector = self.make()

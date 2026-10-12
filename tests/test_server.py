@@ -1288,6 +1288,31 @@ class TestOpenCount(unittest.TestCase):
         self.assertNotIn("k-conn", dom)
 
 
+@unittest.skipUnless(NODE, "kein node/nodejs im PATH - render() wird nicht ausgefuehrt")
+class TestAbgebrochenInDerMittleren(unittest.TestCase):
+    """Ein Abbruch zaehlt als Uebergabe, aber nicht in die mittlere Dauer.
+
+    Ein abgebrochener Auftrag ist keine gemessene Laufzeit. Wuerde er als
+    Laufzeit zaehlen, verfaelschte jeder Abbruch die mittlere Dauer - und die
+    Schaetzung der Restwartezeit rechnet mit dieser Zahl weiter.
+    """
+
+    def test_abbruch_zaehlt_als_uebergabe_aber_nicht_in_die_mittlere_dauer(self):
+        dom = render(sample_state(history=[
+            entry(duration_s=10.0),
+            entry(duration_s=100.0, aborted=True),
+        ]))
+        self.assertEqual(dom["h-count"]["text"], 2)
+        self.assertEqual(dom["h-avg"]["text"], "10s")
+
+    def test_die_restwartezeit_rechnet_ohne_den_abbruch(self):
+        dom = render(sample_state(queue={"waiting": 3}, history=[
+            entry(duration_s=10.0),
+            entry(duration_s=100.0, aborted=True),
+        ]))
+        self.assertEqual(dom["k-wait-time"]["html"], "30s (Schaetzung)")
+
+
 class AbortCollector:
     """Attrappe fuer den Abbruch-Endpunkt: fester Zustand, echte Konfiguration.
 

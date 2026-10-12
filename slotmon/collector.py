@@ -412,6 +412,10 @@ class Collector:
                     # `next(iter(...))` ist damit der aelteste Eintrag.
                     self._known_ips.pop(next(iter(self._known_ips)))
                 self._known_ips[rid] = ip_port
+            # Ein Abbruch bleibt in der Historie, zaehlt aber nicht in die
+            # mittlere Dauer - das Dashboard filtert danach.
+            aborted = record.get("finish_reason") == "abort"
+            record["aborted"] = aborted
             self._append(record)
             if self._history_error is None:
                 written.append(record)

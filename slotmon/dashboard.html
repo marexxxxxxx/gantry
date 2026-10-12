@@ -366,8 +366,10 @@ function noteStreamError(message) {
   renderSourceAge(lastState.server);
 }
 
+// Ein Abbruch ist keine gemessene Laufzeit. Er zaehlt in "Uebergaben", aber
+// nicht in die mittlere Dauer.
 function averageDuration(entries) {
-  const done = entries.filter(e => typeof e.duration_s === "number");
+  const done = entries.filter(e => typeof e.duration_s === "number" && !e.aborted);
   if (!done.length) return null;
   return done.reduce((sum, e) => sum + e.duration_s, 0) / done.length;
 }
