@@ -1,5 +1,6 @@
 """Tests fuer den Metrik-Parser (Prometheus, nvidia-smi) und extract_sample."""
 
+import json
 import unittest
 
 from aiserver_monitor.metrics_parse import (
@@ -44,6 +45,23 @@ class TestParsePrometheus(unittest.TestCase):
     def test_unlesbare_werte_werden_verworfen(self):
         parsed = parse_prometheus("kaputt kein_wert\nsglang:num_running_reqs 1\n")
         self.assertEqual(parsed, {"sglang:num_running_reqs": 1.0})
+
+    def test_nan_wird_verworfen(self):
+        # NaN ist im Prometheus-Format gueltig, aber kein brauchbarer Messwert;
+        # gueltige Samples derselben Metrik zaehlen weiter.
+        parsed = parse_prometheus(
+            "sglang:num_running_reqs 1\nsglang:num_running_reqs NaN\n")
+        self.assertEqual(parsed, {"sglang:num_running_reqs": 1.0})
+
+    def test_inf_werte_werden_verworfen(self):
+        parsed = parse_prometheus(
+            "sglang:gen_throughput +Inf\n"
+            "sglang:token_usage -Inf\n"
+            "sglang:num_queue_reqs Inf\n"
+        )
+        self.assertNotIn("sglang:gen_throughput", parsed)
+        self.assertNotIn("sglang:token_usage", parsed)
+        self.assertNotIn("sglang:num_queue_reqs", parsed)
 
     def test_leerer_text_ergibt_leeres_dict(self):
         self.assertEqual(parse_prometheus(""), {})
@@ -105,6 +123,21 @@ class TestExtractSample(unittest.TestCase):
         for key in ("waiting", "throughput", "token_usage", "max_tokens",
                     "vram_used_mb", "vram_total_mb"):
             self.assertNotIn(key, sample)
+
+    def test_nicht_finite_werte_erreichen_das_sample_nicht(self):
+        # NaN/+Inf aus dem Prometheus-Text werden verworfen; extract_sample
+        # bleibt crashfrei (int(nan)/int(inf)) und liefert strenges JSON.
+        parsed = parse_prometheus(
+            "sglang:num_running_reqs NaN\n"
+            "sglang:num_queue_reqs +Inf\n"
+            "sglang:gen_throughput 1.5\n"
+        )
+        sample = extract_sample(parsed, GpuSample(None, None, None),
+                                ts=1.0, available=True)
+        self.assertEqual(sample["throughput"], 1.5)
+        self.assertNotIn("running", sample)
+        self.assertNotIn("waiting", sample)
+        json.dumps(sample, allow_nan=False)     # wirft bei NaN/Infinity
 
     def test_metriknamen_mapping(self):
         self.assertEqual(METRIC_NAMES, {

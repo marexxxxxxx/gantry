@@ -5,6 +5,7 @@ Reine Funktionen ohne I/O: Der Metrik-Sammler holt die Rohdaten und baut mit
 "Nicht gemessen" heisst None bzw. fehlender Key, nie 0.
 """
 
+import math
 import re
 from dataclasses import dataclass
 
@@ -27,8 +28,10 @@ def parse_prometheus(text: str) -> dict[str, float]:
     """Summiert die Samples je Metrikname; Labels werden entfernt.
 
     Kommentar- (``#``) und Leerzeilen werden ignoriert. Werte, die ``float``
-    nicht lesen kann, werden verworfen. Metriken, die im Text nicht vorkommen,
-    fehlen im Ergebnis ("nicht gemessen", nie 0.0).
+    nicht lesen kann, werden verworfen; ebenso nicht-finite Werte (``NaN``,
+    ``+Inf``, ``-Inf``), die im Prometheus-Format gueltig sind, aber weder in
+    int-Zaehler noch in strenges JSON passen. Metriken, die danach keinen
+    brauchbaren Wert haben, fehlen im Ergebnis ("nicht gemessen", nie 0.0).
     """
     totals: dict[str, float] = {}
     for line in text.splitlines():
@@ -41,6 +44,8 @@ def parse_prometheus(text: str) -> dict[str, float]:
         try:
             value = float(match.group("value"))
         except ValueError:
+            continue
+        if not math.isfinite(value):
             continue
         name = match.group("name")
         totals[name] = totals.get(name, 0.0) + value
