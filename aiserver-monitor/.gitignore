@@ -1,0 +1,5 @@
+__pycache__/
+data/
+webapp/node_modules/
+aiserver_monitor/static/
+*.log

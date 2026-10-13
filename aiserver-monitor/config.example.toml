@@ -1,0 +1,30 @@
+# Beispielkonfiguration fuer aiserver-monitor.
+# Alle Felder sind optional; die Werte in den Kommentaren sind die Defaults.
+# Umgebungsvariablen ueberschreiben die Datei: AISERVER_MONITOR_<FELDNAME>
+# in Grossbuchstaben, z. B. AISERVER_MONITOR_LISTEN_PORT=39999.
+
+# --- Netzwerk ---
+# listen_host = "0.0.0.0"
+# listen_port = 30000
+# upstream_base = "http://127.0.0.1:30001"
+
+# --- Pfade ---
+# db_path = "data/monitor.db"
+# log_path = "data/aiserver-monitor.log"
+
+# --- Intervalle und Timeouts (Sekunden) ---
+# heartbeat_s = 15.0
+# poll_interval_s = 2.0
+# connect_timeout_s = 10.0
+
+# --- Vorschau (maximale Zeichen im RAM) ---
+# preview_max_chars = 4096
+# prompt_start_chars = 100
+
+# --- Retention (Tage) ---
+# retention_jobs_days = 30
+# retention_series_days = 7
+
+# --- Sonstiges ---
+# nonstream_keepalive = true
+# gpu_cmd = "nvidia-smi"
