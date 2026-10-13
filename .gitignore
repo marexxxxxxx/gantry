@@ -6,3 +6,4 @@ otp.json
 nohup.out
 __pycache__/
 .superpowers/
+.worktrees/
