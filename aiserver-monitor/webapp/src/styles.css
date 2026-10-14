@@ -663,3 +663,162 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+/* --- Dediziertes Panel "Aktueller Job" (Live-Tab) --- */
+
+.current-job {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  min-height: 300px;
+  margin-bottom: 1rem;
+  padding: 0.85rem 1rem 1rem;
+  background: var(--farbe-flaeche);
+  border: 1px solid var(--farbe-rand);
+  border-left: 3px solid var(--farbe-rand);
+  border-radius: var(--radius);
+  font-size: 0.95rem;
+}
+
+.current-job-running {
+  border-left-color: var(--farbe-gruen);
+}
+
+.current-job-waiting {
+  border-left-color: var(--farbe-gelb);
+}
+
+.current-kopf {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.35rem 1.1rem;
+}
+
+.current-titel {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.current-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.current-quelle,
+.current-laufzeit {
+  color: var(--farbe-text-gedimmt);
+  font-size: 0.9rem;
+}
+
+.current-laufzeit {
+  font-variant-numeric: tabular-nums;
+}
+
+.current-zeiten {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 1.4rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.current-wartete {
+  color: var(--farbe-text-gedimmt);
+}
+
+.current-ctx {
+  margin: 0;
+  color: var(--farbe-text-gedimmt);
+  font-variant-numeric: tabular-nums;
+}
+
+.current-bereiche {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.7rem;
+  min-height: 0;
+}
+
+.current-bereich {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.current-bereich-titel {
+  margin: 0 0 0.25rem;
+  color: var(--farbe-text-gedimmt);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* Denken und Antwort: je scrollbar und in der Hoehe begrenzt, damit das
+   Panel die Seite nicht sprengt. */
+.current-text {
+  height: 8rem;
+  margin: 0;
+  padding: 0.6rem 0.7rem;
+  overflow-y: auto;
+  background: var(--farbe-hintergrund);
+  border: 1px solid var(--farbe-rand);
+  border-radius: var(--radius);
+  font-family: var(--schrift);
+  font-size: 0.9rem;
+  line-height: 1.45;
+  overflow-wrap: break-word;
+  white-space: pre-wrap;
+}
+
+.current-aktionen {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+}
+
+.current-abbrechen {
+  appearance: none;
+  border: 1px solid var(--farbe-rot);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--farbe-rot);
+  padding: 0.35rem 1.1rem;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.current-abbrechen:hover:not(:disabled) {
+  background: var(--farbe-rot);
+  color: #ffffff;
+}
+
+.current-abbrechen:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.current-hinweis {
+  color: var(--farbe-rot);
+  font-size: 0.85rem;
+}
+
+.current-platzhalter {
+  margin: 0;
+  color: var(--farbe-text-gedimmt);
+}
+
+/* Ab ~900px stehen Denken und Antwort nebeneinander. */
+@media (min-width: 900px) {
+  .current-bereiche {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .current-text {
+    height: 10rem;
+  }
+}

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { Job, Sample } from "./api";
+import CurrentJobPanel from "./CurrentJobPanel";
 import JobTable from "./JobTable";
 
 export interface LiveViewProps {
@@ -153,6 +154,8 @@ export default function LiveView({
 
   return (
     <div className="live-ansicht">
+      <CurrentJobPanel jobs={jobs} jetztMs={jetztMs} />
+
       <section
         className="queue-leiste"
         data-testid="queue-stats"
