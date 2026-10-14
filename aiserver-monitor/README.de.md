@@ -132,7 +132,13 @@ Umgebungsvariablen.
   `upstream_base`, `db_path`, `log_path`, `heartbeat_s`, `poll_interval_s`,
   `connect_timeout_s`, `preview_max_chars`, `prompt_start_chars`,
   `retention_jobs_days`, `retention_series_days`, `nonstream_keepalive`,
-  `gpu_cmd`.
+  `gpu_cmd`, `abort_on_disconnect`.
+
+Standardmäßig (`abort_on_disconnect = true`) überwacht das Gateway die
+Client-Verbindung: verschwindet ein Client, während sein Job noch wartet,
+wird der wartende Upstream-Aufruf abgebrochen und der Job als `aborted`
+abgeschlossen (best effort `abort_request` an SGLang), während `false` das
+alte Verhalten herstellt, in dem jeder Job zu Ende läuft.
 
 `db_path` und `log_path` sind relativ zum Arbeitsverzeichnis. `run.sh`
 wechselt zuerst in das Projektverzeichnis, deshalb zeigen die Defaults auf

@@ -28,3 +28,9 @@
 # --- Sonstiges ---
 # nonstream_keepalive = true
 # gpu_cmd = "nvidia-smi"
+
+# Verwaiste Jobs bei Client-Abbruch aufraeumen: bricht der Client die
+# Verbindung ab, wird der wartende Upstream-Aufruf gecancelt und der Job als
+# "aborted" abgeschlossen (dazu best effort abort_request an SGLang).
+# false = altes Verhalten: Jobs laufen immer zu Ende.
+# abort_on_disconnect = true

@@ -492,6 +492,22 @@ class TestCollectorImHintergrund(AppTestCase):
         # Shutdown raeumt den Task ab (kein Zombie-Task).
         self.assertTrue(task.done())
 
+    def test_eigener_collector_client_und_shutdown_schliesst_beide(self):
+        # R5/R7-6: der Sammler hat einen EIGENEN httpx-Client (eigener Pool);
+        # die Lifespan schliesst beim Shutdown beide Clients.
+        app = self.app(transport=_metrik_transport(), enable_background=False)
+        client = app.state.deps.client
+        collector_client = app.state.collector_client
+        self.assertIsNot(collector_client, client)
+        self.assertFalse(client.is_closed)
+        self.assertFalse(collector_client.is_closed)
+
+        with TestClient(app):
+            self.assertFalse(client.is_closed)
+
+        self.assertTrue(client.is_closed)
+        self.assertTrue(collector_client.is_closed)
+
 
 class TestLifespanRecoveryUndCleanup(AppTestCase):
     def test_running_job_wird_beim_start_error(self):

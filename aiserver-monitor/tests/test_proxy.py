@@ -18,6 +18,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import httpx
 from starlette.requests import Request
@@ -39,14 +40,20 @@ PING = b": ping\n\n"
 
 def _request(methode: str, pfad: str, body: dict | None = None, *,
              roh: bytes | None = None, query: str = "",
-             client_ip: str | None = "10.0.0.5") -> Request:
+             client_ip: str | None = "10.0.0.5",
+             kanal: "_ClientKanal | None" = None) -> Request:
     """Baut eine Starlette-Anfrage ohne ASGI-Lauf.
 
     ``body`` wird zu JSON kodiert; ``roh`` ersetzt das durch exakte Bytes
-    (z. B. fuer einen Nicht-JSON-Body).
+    (z. B. fuer einen Nicht-JSON-Body). ``kanal`` ist die steuerbare
+    receive-Queue der Disconnect-Tests; ohne ihn bleibt die Verbindung nach
+    dem Body offen (kein Disconnect).
     """
     if roh is None:
         roh = b"" if body is None else json.dumps(body).encode("utf-8")
+    if kanal is None:
+        kanal = _ClientKanal()
+    kanal.fuellen(roh)
     scope = {
         "type": "http",
         "http_version": "1.1",
@@ -60,16 +67,31 @@ def _request(methode: str, pfad: str, body: dict | None = None, *,
         "client": None if client_ip is None else (client_ip, 4711),
         "server": ("testserver", 80),
     }
-    ausgeliefert = False
+    return Request(scope, kanal.receive)
 
-    async def receive():
-        nonlocal ausgeliefert
-        if ausgeliefert:
-            return {"type": "http.disconnect"}
-        ausgeliefert = True
-        return {"type": "http.request", "body": roh, "more_body": False}
 
-    return Request(scope, receive)
+class _ClientKanal:
+    """Steuerbare receive-Queue einer Anfrage (Disconnect-Tests).
+
+    ``fuellen`` legt den Request-Body als erste Nachricht ab; ``abmelden``
+    speist ``http.disconnect`` ein (Client weg). Danach blockiert die Queue
+    wieder wie eine offene Verbindung.
+    """
+
+    def __init__(self) -> None:
+        self._queue: asyncio.Queue[dict] = asyncio.Queue()
+
+    def fuellen(self, roh: bytes) -> None:
+        """Legt den Body als erste receive-Nachricht ab."""
+        self._queue.put_nowait(
+            {"type": "http.request", "body": roh, "more_body": False})
+
+    def abmelden(self) -> None:
+        """Der Client schliesst: ``http.disconnect`` einspielen."""
+        self._queue.put_nowait({"type": "http.disconnect"})
+
+    async def receive(self) -> dict:
+        return await self._queue.get()
 
 
 async def _body(antwort) -> bytes:
@@ -123,7 +145,8 @@ class ProxyTestBasis(unittest.IsolatedAsyncioTestCase):
 
     def deps(self, transport, *, history=None, heartbeat_s: float = 15.0,
              connect_timeout_s: float = 5.0,
-             nonstream_keepalive: bool = True) -> Deps:
+             nonstream_keepalive: bool = True,
+             abort_on_disconnect: bool = True) -> Deps:
         """Deps mit dem gegebenen Transport; der Client wird am Testende geschlossen."""
         if self._client is None:
             self._client = httpx.AsyncClient(transport=transport)
@@ -131,7 +154,8 @@ class ProxyTestBasis(unittest.IsolatedAsyncioTestCase):
         return Deps(
             config=Config(heartbeat_s=heartbeat_s,
                           connect_timeout_s=connect_timeout_s,
-                          nonstream_keepalive=nonstream_keepalive),
+                          nonstream_keepalive=nonstream_keepalive,
+                          abort_on_disconnect=abort_on_disconnect),
             registry=self.registry,
             hub=self.hub,
             history=history,
@@ -244,11 +268,14 @@ class TestStreamRelay(ProxyTestBasis):
         self.assertIsNone(self.registry.get("bad-1"))   # kein SSE, kein Job
 
     async def test_client_abbruch_job_laeuft_zu_ende(self):
+        # Altverhalten (abort_on_disconnect=false): der Client-Abbruch stoert
+        # nicht, der Job laeuft zu Ende (done); Ruling R4.
         schritte = [(0.0, fakes.chat_chunk({"content": "A"})),
                     (0.3, fakes.chat_chunk({"content": "B"})),
                     (0.0, fakes.chat_chunk({}, finish_reason="stop")),
                     (0.0, fakes.DONE)]
-        deps = self.deps(fakes.skript_transport(schritte))
+        deps = self.deps(fakes.skript_transport(schritte),
+                         abort_on_disconnect=False)
 
         antwort = await handle_v1(
             _request("POST", "/v1/chat/completions",
@@ -610,6 +637,303 @@ class TestNichtstreamPfad(ProxyTestBasis):
         self.assertIs(job.status, JobStatus.DONE)
         self.assertIsNone(job.prompt_tokens)            # ohne usage: null, nie 0
         self.assertIsNone(job.completion_tokens)
+
+
+class _WartenderUpstream:
+    """MockTransport-Handler: der Upstream antwortet nie (nur Abbrueche).
+
+    ``/abort_request`` wird protokolliert und mit 200 beantwortet; jede
+    andere Anfrage merkt den Eintritt und wartet endlos, bis sie (durch den
+    Disconnect-Pfad) abgebrochen wird. ``abbruch_fehler`` laesst stattdessen
+    genau den Abbruch-Aufruf scheitern.
+    """
+
+    def __init__(self, *, abbruch_fehler: Exception | None = None):
+        self.anfragen: list[httpx.Request] = []
+        self.eingetreten = asyncio.Event()
+        self.abgebrochen = asyncio.Event()
+        self._abbruch_fehler = abbruch_fehler
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.anfragen.append(request)
+        if request.url.path == "/abort_request":
+            if self._abbruch_fehler is not None:
+                raise self._abbruch_fehler
+            return httpx.Response(200, json={"status": "ok"})
+        self.eingetreten.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.abgebrochen.set()
+            raise
+
+    @property
+    def abbrueche(self) -> list[dict]:
+        return [json.loads(request.content) for request in self.anfragen
+                if request.url.path == "/abort_request"]
+
+    @property
+    def abbrueche_versuche(self) -> int:
+        """Zahl der versuchten Abbrueche (auch die gescheiterten)."""
+        return sum(1 for request in self.anfragen
+                   if request.url.path == "/abort_request")
+
+
+class _AbbruchRecorder:
+    """MockTransport-Handler: zeichnet Anfragen auf, streamt das SSE-Skript.
+
+    Alle Pfade ausser ``/abort_request`` liefern die Skript-Schritte als
+    zeitgetreuen SSE-Strom; Abbrueche werden protokolliert (und optional mit
+    ``abbruch_fehler`` beantwortet).
+    """
+
+    def __init__(self, schritte=(), *, abbruch_fehler: Exception | None = None):
+        self.anfragen: list[httpx.Request] = []
+        self._schritte = list(schritte)
+        self._abbruch_fehler = abbruch_fehler
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.anfragen.append(request)
+        if request.url.path == "/abort_request":
+            if self._abbruch_fehler is not None:
+                raise self._abbruch_fehler
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"},
+            stream=fakes.SkriptStream(self._schritte))
+
+    @property
+    def abbrueche(self) -> list[dict]:
+        return [json.loads(request.content) for request in self.anfragen
+                if request.url.path == "/abort_request"]
+
+
+class TestDisconnectAufraeumen(ProxyTestBasis):
+    """Client-Disconnect: Aufraeumen verwaister Jobs (nur mit Flag, Ruling R3).
+
+    Der Disconnect kommt ueber eine steuerbare receive-Queue (``_ClientKanal``);
+    erkannt wird er vom Watcher im Testintervall (``_DISCONNECT_CHECK_S``
+    gepatcht).
+    """
+
+    async def test_nichtstream_disconnect_bricht_wartenden_job_ab(self):
+        # flag=true, Disconnect waehrend der Upstream-Wartezeit: die pending
+        # Aufgabe wird gecancelt, der Job sofort aborted + publiziert, ein
+        # abort_request mit der rid geht raus; kein done.
+        upstream = _WartenderUpstream()
+        kanal = _ClientKanal()
+        deps = self.deps(httpx.MockTransport(upstream), heartbeat_s=0.5)
+        queue = self.hub.subscribe()
+
+        with mock.patch("aiserver_monitor.proxy._DISCONNECT_CHECK_S", 0.05):
+            aufgabe = asyncio.create_task(handle_v1(
+                _request("POST", "/v1/chat/completions",
+                         {"rid": "disc-ns", "stream": False,
+                          "messages": [{"role": "user", "content": "Hi"}]},
+                         kanal=kanal),
+                deps))
+            await asyncio.wait_for(upstream.eingetreten.wait(), 2.0)
+            kanal.abmelden()
+            antwort = await asyncio.wait_for(aufgabe, 2.0)
+
+        self.assertTrue(
+            await _warte_bis(lambda: upstream.abgebrochen.is_set()),
+            "der wartende Upstream-Aufruf wurde nicht abgebrochen")
+        await _warte_bis(lambda: upstream.abbrueche)
+        self.assertEqual(upstream.abbrueche,
+                         [{"rid": "disc-ns", "abort_all": False}])
+        job = self.registry.get("disc-ns")
+        self.assertIs(job.status, JobStatus.ABORTED)
+        self.assertIsNone(job.error)                    # aborted, nie error
+        self.assertEqual([rahmen["status"] for rahmen in _rahmen_lesen(queue)],
+                         ["waiting", "aborted"])
+        # Die Antwort erreicht den Client nicht mehr; kein Traceback.
+        self.assertNotIsInstance(antwort, StreamingResponse)
+        self.assertEqual(antwort.status_code, 499)
+
+    async def test_nichtstream_disconnect_im_streaming_teil_raeumt_ab(self):
+        # Disconnect erst, wenn die Antwort schon als Streaming laeuft: der
+        # Generator endet ohne Traceback, der Job bleibt aborted.
+        upstream = _WartenderUpstream()
+        kanal = _ClientKanal()
+        deps = self.deps(httpx.MockTransport(upstream), heartbeat_s=0.05)
+        queue = self.hub.subscribe()
+
+        with mock.patch("aiserver_monitor.proxy._DISCONNECT_CHECK_S", 0.05):
+            aufgabe = asyncio.create_task(handle_v1(
+                _request("POST", "/v1/chat/completions",
+                         {"rid": "disc-ns-spaet", "stream": False},
+                         kanal=kanal),
+                deps))
+            await asyncio.wait_for(upstream.eingetreten.wait(), 2.0)
+            antwort = await asyncio.wait_for(aufgabe, 2.0)
+            self.assertIsInstance(antwort, StreamingResponse)
+            kanal.abmelden()
+            roh = await asyncio.wait_for(_body(antwort), 2.0)
+
+        self.assertEqual(roh.strip(), b"")              # nur evtl. Keepalives
+        await _warte_bis(lambda: upstream.abbrueche)
+        self.assertEqual(upstream.abbrueche,
+                         [{"rid": "disc-ns-spaet", "abort_all": False}])
+        job = self.registry.get("disc-ns-spaet")
+        self.assertIs(job.status, JobStatus.ABORTED)
+        self.assertEqual([rahmen["status"] for rahmen in _rahmen_lesen(queue)],
+                         ["waiting", "aborted"])
+
+    async def test_nichtstream_disconnect_ohne_flag_laeuft_zu_ende(self):
+        # flag=false == Altverhalten: der Disconnect stoert nicht, der Job
+        # laeuft zu Ende (done); kein abort_request.
+        roh_upstream = b'{"choices": [{"message": {"content": "spaet"}}]}'
+        kanal = _ClientKanal()
+        deps = self.deps(fakes.json_transport(roh_upstream, pause=0.2),
+                         heartbeat_s=0.05, abort_on_disconnect=False)
+        queue = self.hub.subscribe()
+
+        with mock.patch("aiserver_monitor.proxy._DISCONNECT_CHECK_S", 0.05):
+            aufgabe = asyncio.create_task(handle_v1(
+                _request("POST", "/v1/chat/completions",
+                         {"rid": "disc-aus", "stream": False}, kanal=kanal),
+                deps))
+            await asyncio.sleep(0.05)
+            kanal.abmelden()
+            antwort = await asyncio.wait_for(aufgabe, 2.0)
+            roh = await _body(antwort)
+
+        self.assertEqual(json.loads(roh)["choices"][0]["message"]["content"],
+                         "spaet")
+        self.assertIs(self.registry.get("disc-aus").status, JobStatus.DONE)
+        self.assertEqual([rahmen["status"] for rahmen in _rahmen_lesen(queue)],
+                         ["waiting", "done"])
+
+    async def test_stream_disconnect_bricht_laufenden_job_ab(self):
+        # flag=true, Disconnect waehrend der laufenden Antwort: abort_request
+        # mit der rid, Job aborted, Relay beendet, kein done-Frame.
+        schritte = [(0.0, fakes.chat_chunk({"content": "A"})),
+                    (5.0, fakes.chat_chunk({"content": "B"})),
+                    (0.0, fakes.chat_chunk({}, finish_reason="stop")),
+                    (0.0, fakes.DONE)]
+        recorder = _AbbruchRecorder(schritte)
+        kanal = _ClientKanal()
+        deps = self.deps(httpx.MockTransport(recorder), heartbeat_s=0.05)
+        queue = self.hub.subscribe()
+
+        with mock.patch("aiserver_monitor.proxy._DISCONNECT_CHECK_S", 0.05):
+            antwort = await asyncio.wait_for(handle_v1(
+                _request("POST", "/v1/chat/completions",
+                         {"rid": "disc-stream", "stream": True}, kanal=kanal),
+                deps), 2.0)
+            self.assertIsInstance(antwort, StreamingResponse)
+            await _warte_bis(lambda: self.registry.get(
+                "disc-stream").status is JobStatus.RUNNING)
+            kanal.abmelden()
+            fertig = await _warte_bis(lambda: self.registry.get(
+                "disc-stream").status is JobStatus.ABORTED)
+            self.assertTrue(fertig, "Job blieb haengen (Zombie)")
+            # Relay beendet: der Generator laeuft aus, ohne weiterzulesen.
+            roh = await asyncio.wait_for(_body(antwort), 2.0)
+            await _warte_bis(lambda: recorder.abbrueche)
+
+        self.assertNotIn(b'"B"', roh)
+        self.assertNotIn(fakes.DONE, roh)
+        self.assertEqual(recorder.abbrueche,
+                         [{"rid": "disc-stream", "abort_all": False}])
+        job = self.registry.get("disc-stream")
+        self.assertIs(job.status, JobStatus.ABORTED)
+        self.assertIsNone(job.error)
+        status = [rahmen["status"] for rahmen in _rahmen_lesen(queue)]
+        self.assertEqual(status[0], "waiting")
+        self.assertEqual(status[-1], "aborted")
+        self.assertNotIn("done", status)
+
+    async def test_stream_disconnect_vor_der_kopfzeile_bricht_ab(self):
+        # Der Upstream liefert noch keine Kopfzeile: der Disconnect bricht den
+        # wartenden Aufruf ab, abort_request geht mit der bekannten rid raus;
+        # es entsteht kein Job und die Funktion kehrt ohne Traceback zurueck.
+        upstream = _WartenderUpstream()
+        kanal = _ClientKanal()
+        deps = self.deps(httpx.MockTransport(upstream), heartbeat_s=0.5)
+
+        with mock.patch("aiserver_monitor.proxy._DISCONNECT_CHECK_S", 0.05):
+            aufgabe = asyncio.create_task(handle_v1(
+                _request("POST", "/v1/chat/completions",
+                         {"rid": "disc-kopf", "stream": True}, kanal=kanal),
+                deps))
+            await asyncio.wait_for(upstream.eingetreten.wait(), 2.0)
+            kanal.abmelden()
+            antwort = await asyncio.wait_for(aufgabe, 2.0)
+
+        self.assertTrue(upstream.abgebrochen.is_set())
+        await _warte_bis(lambda: upstream.abbrueche)
+        self.assertEqual(upstream.abbrueche,
+                         [{"rid": "disc-kopf", "abort_all": False}])
+        self.assertIsNone(self.registry.get("disc-kopf"))
+        self.assertNotIsInstance(antwort, StreamingResponse)
+        self.assertEqual(antwort.status_code, 499)
+
+    async def test_stream_disconnect_beim_kopfzeilenwechsel_kein_zombie(self):
+        # Der Disconnect rennt mit dem Kopfzeilen-Empfang: der Job wird noch
+        # angelegt und sofort als aborted abgeschlossen (kein Zombie). Der
+        # doppelte abort_request ist idempotent.
+        recorder = _AbbruchRecorder([(5.0, fakes.chat_chunk({"content": "B"}))])
+        kanal = _ClientKanal()
+        # Anfrage bauen (Body), dann ist der Client schon weg.
+        request = _request("POST", "/v1/chat/completions",
+                           {"rid": "disc-wechsel", "stream": True},
+                           kanal=kanal)
+        kanal.abmelden()
+        deps = self.deps(httpx.MockTransport(recorder), heartbeat_s=0.05)
+        queue = self.hub.subscribe()
+
+        def job_abortiert() -> bool:
+            job = self.registry.get("disc-wechsel")
+            return job is not None and job.status is JobStatus.ABORTED
+
+        with mock.patch("aiserver_monitor.proxy._DISCONNECT_CHECK_S", 0.05):
+            antwort = await asyncio.wait_for(handle_v1(request, deps), 2.0)
+            fertig = await _warte_bis(job_abortiert)
+            self.assertTrue(fertig, "Job blieb haengen (Zombie)")
+            await asyncio.wait_for(_body(antwort), 2.0)  # Relay endet sofort
+            await _warte_bis(lambda: recorder.abbrueche)
+
+        job = self.registry.get("disc-wechsel")
+        self.assertIs(job.status, JobStatus.ABORTED)
+        self.assertIn({"rid": "disc-wechsel", "abort_all": False},
+                      recorder.abbrueche)
+        status = [rahmen["status"] for rahmen in _rahmen_lesen(queue)]
+        self.assertEqual(status[0], "waiting")
+        self.assertEqual(status[-1], "aborted")
+        self.assertNotIn("done", status)
+
+    async def test_abort_fehler_beim_disconnect_wird_nur_geloggt(self):
+        # R3d: scheitert abort_request, wird das nur geloggt; der Abbruch
+        # selbst (Task canceln, Job aborted, publish) laeuft weiter.
+        upstream = _WartenderUpstream(
+            abbruch_fehler=httpx.ConnectError("upstream weg"))
+        kanal = _ClientKanal()
+        deps = self.deps(httpx.MockTransport(upstream), heartbeat_s=0.5)
+        queue = self.hub.subscribe()
+
+        with self.assertLogs("aiserver_monitor.proxy", level="WARNING") as cm:
+            with mock.patch("aiserver_monitor.proxy._DISCONNECT_CHECK_S", 0.05):
+                aufgabe = asyncio.create_task(handle_v1(
+                    _request("POST", "/v1/chat/completions",
+                             {"rid": "disc-fehler", "stream": False},
+                             kanal=kanal),
+                    deps))
+                await asyncio.wait_for(upstream.eingetreten.wait(), 2.0)
+                kanal.abmelden()
+                antwort = await asyncio.wait_for(aufgabe, 2.0)
+                await _warte_bis(lambda: upstream.abbrueche_versuche >= 1)
+
+        self.assertTrue(any("disc-fehler" in zeile for zeile in cm.output),
+                        "Abort-Fehler wurde nicht geloggt")
+        self.assertTrue(upstream.abgebrochen.is_set())
+        job = self.registry.get("disc-fehler")
+        self.assertIs(job.status, JobStatus.ABORTED)
+        self.assertEqual([rahmen["status"] for rahmen in _rahmen_lesen(queue)],
+                         ["waiting", "aborted"])
+        self.assertNotIsInstance(antwort, StreamingResponse)
+        self.assertEqual(antwort.status_code, 499)
 
 
 class TestJobTracking(ProxyTestBasis):

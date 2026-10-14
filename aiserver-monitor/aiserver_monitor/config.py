@@ -31,6 +31,7 @@ class Config:
     nonstream_keepalive: bool = True
     gpu_cmd: str = "nvidia-smi"
     connect_timeout_s: float = 10.0
+    abort_on_disconnect: bool = True
 
     def __post_init__(self) -> None:
         """Weist nicht-positive Intervalle ab (sie waeren Busy-Loops).

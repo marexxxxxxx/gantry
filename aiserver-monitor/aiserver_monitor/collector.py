@@ -14,6 +14,8 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 
+import httpx
+
 from .config import Config
 from .metrics_parse import (
     GpuSample,
@@ -95,16 +97,19 @@ async def _nvidia_smi_lesen(config: Config) -> GpuSample:
 class Collector:
     """Metrik-Sammler: ein Durchlauf je Aufruf, ``run`` als Endlosschleife.
 
-    ``deps`` liefert Config, History, Hub und den gemeinsamen httpx-Client
-    (siehe :class:`aiserver_monitor.proxy.Deps`). Ein injizierter
+    ``deps`` liefert Config, History und Hub; der httpx-Client kommt aus
+    ``deps.client`` oder als eigener ``client`` (eigener Pool, damit volle
+    Proxy-Pools die Messung nicht blockieren). Ein injizierter
     ``gpu_reader`` ersetzt den nvidia-smi-Aufruf vollstaendig; ohne ihn liest
     :func:`_nvidia_smi_lesen` die GPU.
     """
 
     def __init__(self, deps: Deps, *,
-                 gpu_reader: Callable[[], Awaitable[GpuSample]] | None = None):
+                 gpu_reader: Callable[[], Awaitable[GpuSample]] | None = None,
+                 client: httpx.AsyncClient | None = None):
         self._deps = deps
         self._gpu_reader = gpu_reader
+        self._client = deps.client if client is None else client
 
     async def _gpu_lesen(self) -> GpuSample:
         """GPU-Messwerte: injizierter Reader oder ``config.gpu_cmd``."""
@@ -121,9 +126,9 @@ class Collector:
         """
         basis = self._deps.config.upstream_base.rstrip("/")
         try:
-            metrik_antwort = await self._deps.client.get(
+            metrik_antwort = await self._client.get(
                 f"{basis}/metrics", timeout=_HTTP_TIMEOUT_S)
-            health_antwort = await self._deps.client.get(
+            health_antwort = await self._client.get(
                 f"{basis}/health", timeout=_HTTP_TIMEOUT_S)
         except Exception as exc:
             logger.warning("Upstream nicht erreichbar: %s: %s",

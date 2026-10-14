@@ -132,7 +132,13 @@ variables.
   `upstream_base`, `db_path`, `log_path`, `heartbeat_s`, `poll_interval_s`,
   `connect_timeout_s`, `preview_max_chars`, `prompt_start_chars`,
   `retention_jobs_days`, `retention_series_days`, `nonstream_keepalive`,
-  `gpu_cmd`.
+  `gpu_cmd`, `abort_on_disconnect`.
+
+By default (`abort_on_disconnect = true`) the gateway watches the client
+connection: if a client disappears while its job is still waiting, the
+pending upstream call is cancelled and the job is finished as `aborted`
+(best-effort `abort_request` at SGLang), while `false` restores the old
+behaviour where every job runs to the end.
 
 `db_path` and `log_path` are relative to the working directory. `run.sh`
 changes into the project directory first, so the defaults resolve to

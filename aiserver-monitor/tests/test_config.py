@@ -20,6 +20,7 @@ class TestLoadConfig(unittest.TestCase):
         self.assertEqual(cfg.retention_jobs_days, 30)
         self.assertEqual(cfg.retention_series_days, 7)
         self.assertIs(cfg.nonstream_keepalive, True)
+        self.assertIs(cfg.abort_on_disconnect, True)
         self.assertEqual(cfg.gpu_cmd, "nvidia-smi")
         self.assertAlmostEqual(cfg.connect_timeout_s, 10.0)
 
@@ -44,6 +45,21 @@ class TestLoadConfig(unittest.TestCase):
         self.assertAlmostEqual(cfg.connect_timeout_s, 2.5)
         self.assertEqual(cfg.retention_series_days, 4)
         self.assertIsInstance(cfg.retention_series_days, int)
+
+    def test_abort_on_disconnect_override(self):
+        # Default true (Disconnect-Aufraeumen); ENV und TOML koennen auf
+        # false stellen (= Altverhalten, Jobs laufen zu Ende).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.toml")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("abort_on_disconnect = false\n")
+            cfg = load_config(path=path, env={})
+        self.assertIs(cfg.abort_on_disconnect, False)
+
+        cfg = load_config(env={"AISERVER_MONITOR_ABORT_ON_DISCONNECT": "false"})
+        self.assertIs(cfg.abort_on_disconnect, False)
+        cfg = load_config(env={"AISERVER_MONITOR_ABORT_ON_DISCONNECT": "true"})
+        self.assertIs(cfg.abort_on_disconnect, True)
 
     def test_leerer_env_wert_gilt_als_nicht_gesetzt(self):
         cfg = load_config(env={"AISERVER_MONITOR_GPU_CMD": ""})

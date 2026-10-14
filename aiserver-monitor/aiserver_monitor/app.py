@@ -148,6 +148,11 @@ def create_app(config: Config, *,
                       retention_jobs_days=config.retention_jobs_days,
                       retention_series_days=config.retention_series_days)
     client = httpx.AsyncClient(transport=transport)
+    # Der Sammler bekommt einen EIGENEN Client (eigener Pool): sind die
+    # Proxy-Verbindungen voll (wartende Jobs), laufen die Metrik-GETs nicht
+    # mehr in den PoolTimeout und das Dashboard meldet SGLang nicht
+    # faelschlich als nicht erreichbar.
+    collector_client = httpx.AsyncClient(transport=transport)
     deps = Deps(
         config=config,
         registry=registry,
@@ -155,7 +160,7 @@ def create_app(config: Config, *,
         history=history,
         client=client,
     )
-    collector = Collector(deps, gpu_reader=gpu_reader)
+    collector = Collector(deps, gpu_reader=gpu_reader, client=collector_client)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -180,12 +185,14 @@ def create_app(config: Config, *,
                 except asyncio.CancelledError:
                     pass
             await client.aclose()
+            await collector_client.aclose()
             history.close()
 
     app = FastAPI(title="aiserver-monitor", lifespan=lifespan)
     app.add_middleware(_CfClientMiddleware)
     app.state.deps = deps
     app.state.collector_task = None
+    app.state.collector_client = collector_client
 
     async def _abbrechen(*, rid: str | None, abort_all: bool) -> bool:
         """``abort_request`` mit Fehler-Mapping: Netzfehler -> False (geloggt)."""

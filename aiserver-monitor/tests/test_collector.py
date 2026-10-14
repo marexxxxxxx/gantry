@@ -213,6 +213,33 @@ class TestSampleOnce(CollectorTestBasis):
         self.assertEqual(_frames(self.queue), [("event: stats", sample)])
 
 
+class TestEigenerClient(CollectorTestBasis):
+    """R5: der Sammler kann einen eigenen httpx-Client (eigener Pool) nutzen."""
+
+    async def test_injizierter_client_nutzt_dessen_transport(self):
+        # Der Sammler geht ueber seinen eigenen Client; der Transport von
+        # deps.client bleibt komplett unberuehrt (kein geteilter Pool).
+        fake = fakes.FakeSglang()
+        eigener = httpx.AsyncClient(transport=httpx.ASGITransport(app=fake.app))
+        self.addAsyncCleanup(eigener.aclose)
+        aufrufe: list[str] = []
+
+        def fremder_handler(request: httpx.Request) -> httpx.Response:
+            aufrufe.append(str(request.url))
+            return httpx.Response(404)          # nur der Fake misst richtig
+
+        collector = Collector(self.deps(httpx.MockTransport(fremder_handler)),
+                              gpu_reader=_FakeGpuReader(1, 2, 3),
+                              client=eigener)
+
+        sample = await collector.sample_once()
+
+        self.assertEqual(fake.pfade, ["/metrics", "/health"])
+        self.assertIs(sample["available"], True)
+        self.assertEqual(sample["running"], 3)
+        self.assertEqual(aufrufe, [])           # deps.client blieb unberuehrt
+
+
 class TestStandardGpuReader(CollectorTestBasis):
     async def test_gpu_cmd_liefert_auslastung_und_vram(self):
         """Standard-Reader: CSV-Ausgabe von config.gpu_cmd wird zum GpuSample.
