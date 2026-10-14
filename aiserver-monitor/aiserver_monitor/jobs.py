@@ -122,8 +122,15 @@ class JobRegistry:
     def finish(self, rid: str, status: JobStatus, *, prompt_tokens: int | None = None,
                completion_tokens: int | None = None, error: str | None = None,
                now: float) -> None:
-        """Schliesst den Job ab; usage-Werte schlagen die Fallback-Zaehlung."""
+        """Schliesst den Job ab; usage-Werte schlagen die Fallback-Zaehlung.
+
+        First-wins: ist der Job schon terminal (done/aborted/error), passiert
+        nichts mehr. Damit kann weder ein Relay-close einen Abbruch
+        ueberschreiben noch umgekehrt.
+        """
         job = self._require(rid)
+        if job.status not in ACTIVE_STATUSES:
+            return
         job.status = status
         job.finished_at = now
         if prompt_tokens is not None:

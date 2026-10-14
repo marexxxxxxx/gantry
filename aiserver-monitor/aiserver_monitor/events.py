@@ -10,7 +10,7 @@ in der Regel sofort).
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 
 def format_sse(event: str, data: dict) -> str:
@@ -59,16 +59,19 @@ class EventHub:
             queue.put_nowait(frame)
 
 
-async def sse_stream(hub: EventHub, initial: list[str],
+async def sse_stream(hub: EventHub, initial: list[str] | Callable[[], list[str]],
                      heartbeat_s: float) -> AsyncIterator[str]:
     """Liefert erst ``initial``, dann Live-Frames; Leerlauf -> ``: ping``.
 
     Die Anmeldung am Hub passiert beim ersten ``anext`` (async generator);
     beim Schliessen des Generators (Client weg) wird automatisch abgemeldet.
+    ``initial`` darf ein Callable sein: es wird erst NACH ``hub.subscribe()``
+    ausgewertet, damit ein zwischen Snapshot-Bau und Abo publiziertes Ereignis
+    nicht verloren geht (Live vor Snapshot waere sonst moeglich).
     """
     queue = hub.subscribe()
     try:
-        for frame in initial:
+        for frame in initial() if callable(initial) else initial:
             yield frame
         while True:
             try:

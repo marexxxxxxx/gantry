@@ -141,6 +141,28 @@ class TestJobRegistry(unittest.TestCase):
         reg = JobRegistry(preview_max_chars=5)
         self.assertIsNone(reg.get("gibt-es-nicht"))
 
+    def test_finish_ist_first_wins(self):
+        # R-B: der erste Abschluss gewinnt; Cancel-Route und Relay-close
+        # duerfen sich nicht gegenseitig ueberschreiben.
+        reg = JobRegistry(preview_max_chars=5)
+        reg.register("h8", source="s", model="m", full_prompt="p", now=10.0)
+        reg.finish("h8", JobStatus.ABORTED, now=11.0)
+        reg.finish("h8", JobStatus.DONE, completion_tokens=9, now=12.0)
+        d = job_to_dict(reg.get("h8"))
+        self.assertEqual(d["status"], "aborted")
+        self.assertEqual(d["duration_ms"], 1000.0)     # erstes finish zaehlt
+        self.assertIsNone(d["completion_tokens"])      # spaeteres finish ignoriert
+        self.assertIsNone(d["error"])
+
+    def test_finish_nach_error_bleibt_error(self):
+        reg = JobRegistry(preview_max_chars=5)
+        reg.register("i9", source="s", model="m", full_prompt="p", now=10.0)
+        reg.finish("i9", JobStatus.ERROR, error="upstream weg", now=11.0)
+        reg.finish("i9", JobStatus.DONE, now=12.0)
+        d = job_to_dict(reg.get("i9"))
+        self.assertEqual((d["status"], d["error"]), ("error", "upstream weg"))
+        self.assertEqual(d["duration_ms"], 1000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

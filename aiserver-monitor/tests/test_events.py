@@ -123,6 +123,25 @@ class TestSseStream(unittest.IsolatedAsyncioTestCase):
             format_sse("b", {"n": 2}))
         await stream.aclose()
 
+    async def test_lazy_initial_wird_erst_nach_dem_abonnieren_gebaut(self):
+        # R-E: der Builder (Callable) laeuft erst nach hub.subscribe(); sonst
+        # koennte ein Ereignis zwischen Snapshot-Bau und Abo verloren gehen.
+        hub = EventHub()
+        gesehen: list[int] = []
+
+        def builder() -> list[str]:
+            gesehen.append(hub.subscriber_count)
+            return ["snapshot"]
+
+        stream = sse_stream(hub, builder, heartbeat_s=0.05)
+        self.assertEqual(await anext(stream), "snapshot")
+        self.assertEqual(gesehen, [1])              # Abo stand vor dem Bau
+        hub.publish("job", {"rid": "a"})
+        self.assertEqual(
+            await asyncio.wait_for(anext(stream), timeout=0.3),
+            format_sse("job", {"rid": "a"}))
+        await stream.aclose()
+
     async def test_aclose_meldet_den_abonnenten_ab(self):
         hub = EventHub()
         stream = sse_stream(hub, [], heartbeat_s=0.05)

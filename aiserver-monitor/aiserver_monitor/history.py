@@ -197,6 +197,31 @@ class History:
             "buckets": buckets,
         }
 
+    def last_sample(self) -> dict | None:
+        """Letzte Sample-Zeile als dict (gleiche Keys wie die query_stats-Buckets).
+
+        ``available`` ist bool, fehlende Spalten sind None; eine leere Tabelle
+        ergibt None. Dient dem SSE-Snapshot, damit das Dashboard sofort den
+        letzten bekannten Stand zeigt.
+        """
+        zeile = self._conn.execute(
+            "SELECT ts, available, running, waiting, throughput, token_usage,"
+            " gpu_util, vram_used_mb, vram_total_mb"
+            " FROM samples ORDER BY ts DESC LIMIT 1").fetchone()
+        if zeile is None:
+            return None
+        return {
+            "ts": zeile[0],
+            "available": bool(zeile[1]),
+            "running": zeile[2],
+            "waiting": zeile[3],
+            "throughput": zeile[4],
+            "token_usage": zeile[5],
+            "gpu_util": zeile[6],
+            "vram_used_mb": zeile[7],
+            "vram_total_mb": zeile[8],
+        }
+
     def cleanup(self, now: float) -> tuple[int, int]:
         """Loescht Jobs/Samples aelter als die Retention (Stichtag exklusiv).
 

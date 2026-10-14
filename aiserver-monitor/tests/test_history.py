@@ -297,6 +297,39 @@ class TestQueryStats(HistoryTestCase):
         with self.assertRaises(ValueError):
             self.history.query_stats(0.0, 100.0, 0)
 
+
+class TestLastSample(HistoryTestCase):
+    """R-F: letztes Sample fuer den SSE-Snapshot (gleiche Keys wie Buckets)."""
+
+    def test_leere_tabelle_ist_none(self):
+        self.assertIsNone(self.history.last_sample())
+
+    def test_liefert_die_letzte_zeile(self):
+        self.history.record_sample(self.sample(
+            100.0, running=2, waiting=1, throughput=41.5, token_usage=0.25,
+            gpu_util=12, vram_used_mb=3456, vram_total_mb=16384))
+        self.history.record_sample(self.sample(
+            200.0, available=False, running=5, waiting=3, throughput=10.0,
+            token_usage=0.5, gpu_util=80, vram_used_mb=4096,
+            vram_total_mb=16384))
+        self.assertEqual(self.history.last_sample(), {
+            "ts": 200.0, "available": False, "running": 5, "waiting": 3,
+            "throughput": 10.0, "token_usage": 0.5, "gpu_util": 80,
+            "vram_used_mb": 4096, "vram_total_mb": 16384})
+
+    def test_fehlende_werte_sind_none_und_available_ist_bool(self):
+        self.history.record_sample(self.sample(300.0))
+        letzte = self.history.last_sample()
+        self.assertEqual(letzte["running"], None)
+        self.assertEqual(letzte["token_usage"], None)
+        self.assertIs(letzte["available"], True)
+
+    def test_keys_deckungsgleich_mit_bucket_eintraegen(self):
+        self.history.record_sample(self.sample(100.0, running=2))
+        letzte = self.history.last_sample()
+        bucket = self.history.query_stats(0.0, 200.0, 60)["buckets"][0]
+        self.assertEqual(set(letzte), set(bucket))
+
     def test_buckets_nur_im_fenster(self):
         self.history.record_sample(self.sample(99.0, running=1))
         self.history.record_sample(self.sample(100.0, running=2))
