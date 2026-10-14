@@ -20,6 +20,7 @@ import httpx
 import uvicorn
 from fastapi.testclient import TestClient
 
+import fakes
 from aiserver_monitor.app import _CfClientMiddleware, client_source, create_app
 from aiserver_monitor.config import Config
 from aiserver_monitor.history import History
@@ -318,6 +319,37 @@ class TestCancelRouten(AppTestCase):
         self.assertEqual(fake.koerper,
                          [{"rid": "gibt-es-nicht", "abort_all": False}])
 
+    def test_einzelabbruch_setzt_das_lokale_signal(self):
+        # R5: die Route setzt zusaetzlich das lokale Abbruch-Signal des Jobs;
+        # nur damit beendet der Non-Stream-Pfad seinen laufenden Lauf.
+        fake = _AbortFake()
+        app = self.app(transport=httpx.MockTransport(fake))
+        with TestClient(app) as c:
+            self._registriere(c, "sig-1")
+            signal = c.app.state.deps.registry.abort_signal("sig-1")
+            self.assertFalse(signal.is_set())
+            antwort = c.post("/monitor/jobs/sig-1/cancel")
+            self.assertEqual(antwort.json(), {"ok": True})
+            self.assertTrue(signal.is_set())
+
+    def test_einzelabbruch_nach_done_ist_ein_noop(self):
+        # R7.7 (first-wins): ein Abbruch nach dem Abschluss aendert den Job
+        # nicht und erzeugt kein aborted-Ereignis.
+        fake = _AbortFake()
+        app = self.app(transport=httpx.MockTransport(fake))
+        with TestClient(app) as c:
+            reg = c.app.state.deps.registry
+            self._registriere(c, "fertig-1")
+            reg.finish("fertig-1", JobStatus.DONE, completion_tokens=9,
+                       now=1002.0)
+            queue = c.app.state.deps.hub.subscribe()
+            antwort = c.post("/monitor/jobs/fertig-1/cancel")
+            self.assertEqual(antwort.status_code, 200)
+            self.assertEqual(antwort.json(), {"ok": True})
+            self.assertIs(reg.get("fertig-1").status, JobStatus.DONE)
+            self.assertEqual(reg.get("fertig-1").completion_tokens, 9)
+            self.assertTrue(queue.empty())              # kein zweites Ereignis
+
     def test_einzelabbruch_ohne_upstream_ok_job_bleibt(self):
         # Upstream antwortet mit Status != 200: ok False, Job unangetastet.
         fake = _AbortFake(status=500)
@@ -376,6 +408,91 @@ class TestCancelRouten(AppTestCase):
             self.assertEqual(antwort.json(), {"ok": False})
             self.assertIs(c.app.state.deps.registry.get("rid-4").status,
                           JobStatus.RUNNING)
+
+
+class TestNonstreamLiveIntegration(AppTestCase):
+    """R5 komplett: die Cancel-Route beendet einen laufenden Chat wirklich.
+
+    Der Upstream streamt langsam; der HTTP-Client haengt, waehrend der Job als
+    ``running`` sichtbar ist. Der Cancel-Aufruf setzt das Signal, die Route
+    markiert aborted, der wartende Client bekommt 499 mit ``aborted``-JSON
+    und der Thread endet (kein Zombie).
+    """
+
+    def test_cancel_route_beendet_laufenden_chat_und_antwortet_499(self):
+        schritte = [
+            (0.0, fakes.chat_chunk({"role": "assistant", "content": ""})),
+            (0.0, fakes.chat_chunk({"content": "A"})),
+            (5.0, fakes.chat_chunk({"content": "B"})),
+            (0.0, fakes.chat_chunk({}, finish_reason="stop")),
+            (0.0, fakes.DONE),
+        ]
+        abbrueche: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/abort_request":
+                abbrueche.append(json.loads(request.content))
+                return httpx.Response(200, json={"status": "ok"})
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"},
+                stream=fakes.SkriptStream(schritte))
+
+        app = self.app(transport=httpx.MockTransport(handler),
+                       heartbeat_s=15.0)
+        with TestClient(app) as c:
+            ergebnis: dict = {}
+
+            def chat() -> None:
+                try:
+                    antwort = c.post("/v1/chat/completions", json={
+                        "model": "fake-modell", "rid": "live-int-1",
+                        "stream": False,
+                        "messages": [{"role": "user", "content": "Hi"}]})
+                except Exception as exc:     # z. B. Gateway-Shutdown im Test
+                    ergebnis["fehler"] = f"{type(exc).__name__}: {exc}"
+                    return
+                ergebnis["status"] = antwort.status_code
+                ergebnis["body"] = antwort.json()
+
+            thread = threading.Thread(target=chat, daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(
+                    self._warte_auf_status(c, "live-int-1", "running"),
+                    "Job wurde nicht als running sichtbar")
+
+                antwort = c.post("/monitor/jobs/live-int-1/cancel")
+                self.assertEqual(antwort.status_code, 200)
+                self.assertEqual(antwort.json(), {"ok": True})
+
+                thread.join(timeout=3.0)
+                self.assertFalse(thread.is_alive(), "der Client haengt noch")
+                self.assertNotIn("fehler", ergebnis)
+                self.assertEqual(ergebnis["status"], 499)
+                self.assertEqual(ergebnis["body"], {
+                    "error": {"message": "Job wurde abgebrochen",
+                              "type": "aborted"}})
+                job = c.app.state.deps.registry.get("live-int-1")
+                self.assertIs(job.status, JobStatus.ABORTED)
+                # abort_request ging raus (ggf. doppelt: Route und Pfad sind
+                # beide best effort, SGLang vertraegt das).
+                self.assertGreaterEqual(len(abbrueche), 1)
+                for eintrag in abbrueche:
+                    self.assertEqual(eintrag, {"rid": "live-int-1",
+                                               "abort_all": False})
+            finally:
+                thread.join(timeout=3.0)
+
+    def _warte_auf_status(self, c, rid: str, status: str) -> bool:
+        """Pollt den Job-Snapshot bis zum Status (kurze Deadline)."""
+        ende = time.monotonic() + 3.0
+        while time.monotonic() < ende:
+            jobs = {eintrag["rid"]: eintrag
+                    for eintrag in c.get("/monitor/jobs").json()["jobs"]}
+            if jobs.get(rid, {}).get("status") == status:
+                return True
+            time.sleep(0.02)
+        return False
 
 
 class TestStatsRoute(AppTestCase):

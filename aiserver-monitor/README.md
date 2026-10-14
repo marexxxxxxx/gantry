@@ -8,6 +8,11 @@ on the Cloudflare route, and serves a dashboard for queue state, live
 per-job previews, single cancel / "cancel all" and statistics. One process,
 one uvicorn worker.
 
+Non-streaming chat requests (`stream=false`) are streamed internally: they
+show up live in the dashboard (running, TTFT, growing previews, tokens) and
+the cancel button really stops the running request; the client still
+receives a valid chat completion JSON.
+
 The planned rollout flips the ports: the gateway takes `0.0.0.0:30000` and
 SGLang moves to `127.0.0.1:30001` (details in the design document, see
 [Further reading](#further-reading)). Until the cutover nothing changes —

@@ -8,6 +8,11 @@ auf der Cloudflare-Strecke offen und liefert ein Dashboard für den
 Warteschlangen-Zustand, Live-Einblick je Job, Einzelabbruch/„Alles stoppen“
 und Statistiken. Ein Prozess, ein uvicorn-Worker.
 
+Nicht-streamende Chat-Anfragen (`stream=false`) werden intern als Stream
+abgewickelt: Sie erscheinen live im Dashboard (laufend, TTFT, wachsende
+Vorschauen, Tokens) und lassen sich wirklich abbrechen; der Client bekommt
+weiterhin gültiges Chat-Completion-JSON.
+
 Der geplante Rollout tauscht die Ports: Das Gateway übernimmt
 `0.0.0.0:30000`, SGLang zieht auf `127.0.0.1:30001` (Details im
 Design-Dokument, siehe [Weiterlesen](#weiterlesen)). Bis zum Cutover bleibt

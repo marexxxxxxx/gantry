@@ -10,16 +10,23 @@ zum Client, inklusive ``[DONE]``.
 Nebenbei misst das Relay jeden Byte-Chunk (``SSEByteParser`` +
 ``summarize_chunk``): TTFT, Vorschau, Tokenzaehler und gedrosselte
 Live-Ereignisse am Hub; beim Abschluss genau ein ``history.record_job``.
-Voller Prompt und Vorschauen bleiben im RAM. POSTs mit JSON-Body und
-``stream != true`` laufen ueber den Nicht-Stream-Pfad: eigener Job, je
-Heartbeat ein einzelnes Leerzeichen (WS-Keepalive, abschaltbar) und am
-Ende der komplette JSON-Body; ist der Upstream weg, kommt 502. Faellt der
-Upstream erst nach dem Antwortstart aus, folgt der 502-Koerper als JSON
-hinter den Leerzeichen ("spaeter" Transportfehler). GETs und POSTs ohne
-JSON-Objekt bleiben ein getreuer, gepufferter Passthrough. Anfragen mit
-Punkt-Segmenten im Pfad (``.``/``..``) werden vor jedem Upstream-Kontakt
-mit 404 abgewiesen: httpx wuerde sie normalisieren und damit SGLang-Admin-
-Routen am Job-Tracking vorbei erreichbar machen.
+Voller Prompt und Vorschauen bleiben im RAM. POSTs auf ``chat/completions``
+mit JSON-Body und ``stream != true`` werden intern als Stream abgewickelt:
+der Upstream bekommt eine Body-Kopie mit ``stream=true`` und
+``stream_options.include_usage``, die SSE-Antwort wird live verfolgt und am
+Ende zu einem OpenAI-ChatCompletion-JSON reassembliert (bewusst ohne das
+SGLang-``meta_info``). Ist das Ergebnis innerhalb von ``heartbeat_s`` da,
+geht es als einzelne Response ohne Leerzeichen raus; sonst folgen je
+Heartbeat Leerzeichen (WS-Keepalive, abschaltbar) vor dem JSON. Ein
+Abbruch-Signal je Job (Cancel-Route) beendet den lokalen Lauf wirklich: 499
+mit ``aborted``-JSON vor dem Antwortstart, sonst dasselbe JSON hinter den
+Leerzeichen. Andere JSON-POSTs (z. B. ``/v1/embeddings``), GETs und POSTs
+ohne JSON-Objekt bleiben der getreue, gepufferte Byte-Passthrough ohne Job.
+Faellt der Upstream vor dem Antwortstart aus, kommt 502; ein spaeter
+erkannter Transportfehler steht als 502-Koerper hinter den Leerzeichen.
+Anfragen mit Punkt-Segmenten im Pfad (``.``/``..``) werden vor jedem
+Upstream-Kontakt mit 404 abgewiesen: httpx wuerde sie normalisieren und
+damit SGLang-Admin-Routen am Job-Tracking vorbei erreichbar machen.
 
 Mit ``abort_on_disconnect`` (Default true) wacht je getracktem Request ein
 ``_DisconnectWatcher`` ueber die Client-Verbindung
@@ -60,10 +67,17 @@ _DISCONNECT_CHECK_S = 1.0
 #: Keepalive-Kommentar, wie er zwischen den Original-Bytes zum Client geht.
 _PING = format_comment("ping").encode("utf-8")
 
+#: Pfad-Suffix, dessen Non-Stream-Anfragen intern gestreamt werden (R1).
+_CHAT_COMPLETIONS = "chat/completions"
+
 #: Antwortkoerper, wenn der Upstream nicht erreichbar ist (SGLang aus).
 _BODY_NICHT_ERREICHBAR = (
     b'{"error": {"message": "sglang nicht erreichbar", '
     b'"type": "upstream_unavailable"}}')
+
+#: Antwortkoerper eines lokal abgebrochenen Jobs (Cancel-Route).
+_BODY_ABGEBROCHEN = (
+    b'{"error": {"message": "Job wurde abgebrochen", "type": "aborted"}}')
 
 #: Antwortkoerper auf Pfade mit Punkt-Segmenten (Traversal-Versuch).
 _BODY_UNGUELTIGER_PFAD = (
@@ -212,25 +226,22 @@ def _json_koerper(roh: bytes) -> dict | None:
     return koerper if isinstance(koerper, dict) else None
 
 
-def _tokenzahl(wert: object) -> int | None:
-    """Ganzzahlige Tokenzahl oder None; bool und Fremdtypen zaehlen nicht."""
-    if isinstance(wert, bool) or not isinstance(wert, int):
-        return None
-    return wert
+def _stream_body(koerper: dict) -> bytes:
+    """Body-Kopie fuer den internen Chat-Stream (Ruling R2).
 
-
-def _usage_aus_json(inhalt: bytes) -> tuple[int | None, int | None]:
-    """``(prompt_tokens, completion_tokens)`` aus dem JSON-Body.
-
-    Nicht-streamende Antworten tragen die usage direkt; fehlende oder
-    fremdartige Werte bleiben None ("nicht gemessen" heisst None, nie 0).
+    ``stream`` wird auf true gesetzt und ``stream_options.include_usage``
+    gemergt (vorhandene Optionen bleiben), damit SGLang die usage im letzten
+    SSE-Chunk mitschickt. Sonst bleiben die Felder unveraendert; die rid hat
+    ``ensure_rid`` vorher in den Originalbody geschrieben.
     """
-    koerper = _json_koerper(inhalt)
-    usage = koerper.get("usage") if koerper is not None else None
-    if not isinstance(usage, dict):
-        return None, None
-    return (_tokenzahl(usage.get("prompt_tokens")),
-            _tokenzahl(usage.get("completion_tokens")))
+    kopie = dict(koerper)
+    kopie["stream"] = True
+    optionen = kopie.get("stream_options")
+    if isinstance(optionen, dict):
+        kopie["stream_options"] = {**optionen, "include_usage": True}
+    else:
+        kopie["stream_options"] = {"include_usage": True}
+    return json.dumps(kopie, ensure_ascii=False).encode("utf-8")
 
 
 def _finish_job(deps: Deps, job: Job, status: JobStatus, *,
@@ -384,22 +395,35 @@ class _JobTracker:
     gedrosselte Live-Ereignisse), ``close`` schliesst genau einmal ab
     (Registry, History, finales Ereignis). Beides ruft die Lesetask auf,
     nicht der Client-Generator; so endet der Job auch nach einem
-    Client-Abbruch sauber.
+    Client-Abbruch sauber. Mit ``sammeln`` legt der Tracker zusaetzlich den
+    vollen Text und die rohe usage ab: die Ringe sind gekuerzt, der
+    Non-Stream-Pfad braucht aber den kompletten Inhalt fuer die
+    reassemblierte ChatCompletion-Antwort.
     """
 
-    def __init__(self, deps: Deps, job: Job):
+    def __init__(self, deps: Deps, job: Job, *, sammeln: bool = False):
         self.job = job
         self._deps = deps
+        self._sammeln = sammeln
         self._parser = SSEByteParser()
         self._last_publish: float | None = None
         self._finish_reason: str | None = None
         self._inhalt_gesehen = False
         self.prompt_tokens: int | None = None
         self.completion_tokens: int | None = None
+        #: Voller Text bzw. letzte rohe usage (nur mit ``sammeln``).
+        self.content_teile: list[str] = []
+        self.reasoning_teile: list[str] = []
+        self.usage: dict | None = None
 
     @property
     def rid(self) -> str:
         return self.job.rid
+
+    @property
+    def finish_reason(self) -> str | None:
+        """Letztes gesehenes ``finish_reason`` (None: keins gesehen)."""
+        return self._finish_reason
 
     def absorb(self, chunk: bytes) -> None:
         """Ein Upstream-Chunk: messen, Vorschau fuellen, gedrosselt melden."""
@@ -413,6 +437,15 @@ class _JobTracker:
                 self._deps.registry.add_text(
                     self.rid, content=summary.content,
                     reasoning=summary.reasoning)
+                if self._sammeln:
+                    if summary.content:
+                        self.content_teile.append(summary.content)
+                    if summary.reasoning:
+                        self.reasoning_teile.append(summary.reasoning)
+            if self._sammeln:
+                usage = obj.get("usage")
+                if isinstance(usage, dict) and usage:
+                    self.usage = usage
             if summary.prompt_tokens is not None:
                 self.prompt_tokens = summary.prompt_tokens
             if summary.completion_tokens is not None:
@@ -540,156 +573,286 @@ class _Relay:
             self._client_ab = True
 
 
-async def _hole_nichtstream(deps: Deps, job: Job, url: str,
-                            kopf: dict[str, str], inhalt: bytes,
-                            wache: _DisconnectWatcher | None = None
-                            ) -> httpx.Response | Exception:
-    """Upstream-POST ohne Stream; schliesst den Job immer selbst ab.
+class _InternerStream:
+    """Interner Upstream-Stream einer Non-Stream-Chat-Anfrage.
 
-    Die Aufgabe laeuft auch nach einem Client-Abbruch zu Ende und
-    hinterlaesst keinen Zombie (wie ``_Relay``); bei einem Disconnect
-    cancelt die ``wache`` sie und schliesst den Job ab. Ein Fehler wird als
-    Wert zurueckgegeben statt geworfen: findet ihn der Client-Generator nicht
-    mehr (Client weg), entsteht kein un-abgeholter Task-Fehler. Der Job ist
-    fertig, wenn die Aufgabe endet: ``done`` mit usage aus dem JSON-Body,
-    sonst ``error`` mit Statustext bzw. Meldung. Ohne Chunks gibt es kein
-    erstes Token: der Job springt von ``waiting`` auf ``done``/``error``
-    (TTFT bleibt None, "nicht gemessen").
+    Die Aufgabe stellt den Upstream-Aufruf mit ``stream=true`` und liest die
+    SSE-Antwort bis zum Ende; der ``_JobTracker`` (``sammeln=True``) misst
+    mit und sammelt den vollen Text. Daraus baut die Aufgabe am Ende die
+    reassemblierte ChatCompletion-Antwort (Ruling R4). ``beenden`` ist das
+    Analogon zu ``_Relay.beenden``: Cancelt die Lesetask, wartet ihr Ende ab
+    und schliesst die Upstream-Antwort. Den Job schliesst in diesem Fall der
+    Aufrufer ab (``_beende_abgebrochen``); nach einem sauberen Lauf
+    schliesst ihn die Lesetask selbst (``close_clean``, genau ein
+    History-Eintrag).
     """
-    try:
-        antwort = await deps.client.request(
-            "POST", url, headers=kopf, content=inhalt,
-            timeout=_timeout(deps.config))
-    except Exception as exc:
-        logger.warning("Upstream-Fehler bei rid=%s: %s: %s",
-                       job.rid, type(exc).__name__, exc)
-        _finish_job(deps, job, JobStatus.ERROR,
-                    error=f"{type(exc).__name__}: {exc}")
-        return exc
-    finally:
-        # Der wartende Upstream-Aufruf ist vorbei: die Wache hat hier nichts
-        # mehr zu cancelln (nach einem Treffer laeuft ihr Handler noch).
-        if wache is not None:
-            wache.stop()
-    if antwort.status_code >= 400:
-        _finish_job(deps, job, JobStatus.ERROR,
-                    error=f"upstream {antwort.status_code}")
-    else:
-        prompt_tokens, completion_tokens = _usage_aus_json(antwort.content)
-        _finish_job(deps, job, JobStatus.DONE,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens)
-    return antwort
 
+    def __init__(self, deps: Deps, job: Job, *, url: str, kopf: dict[str, str],
+                 inhalt: bytes, model: str):
+        self.job = job
+        self._deps = deps
+        self._url = url
+        self._kopf = kopf
+        self._inhalt = inhalt
+        self._model = model
+        self._tracker = _JobTracker(deps, job, sammeln=True)
+        self._antwort: httpx.Response | None = None
+        self._aufgabe: asyncio.Task | None = None
+        #: Fehler des Upstream-Aufrufs/Reads (None: sauber durchgelaufen).
+        self.fehler: BaseException | None = None
+        #: Antwortstatus >= 400 samt unveraendertem Body und Kopfzeilen.
+        self.kopf_status: int | None = None
+        self.kopf_body: bytes = b""
+        self.kopf_headers: dict[str, str] = {}
+        #: Fertige Client-Antwort, sobald der Lauf durch ist (Ruling R4).
+        self.body: bytes | None = None
 
-async def _nichtstream_langsam(deps: Deps,
-                               aufgabe: asyncio.Task,
-                               wache: _DisconnectWatcher | None = None
-                               ) -> AsyncIterator[bytes]:
-    """Client-Seite des Nicht-Stream-Pfads: WS-Keepalives, dann der Body.
+    def start(self) -> asyncio.Task:
+        """Startet die Lesetask (einmal je Anfrage) und gibt sie zurueck."""
+        self._aufgabe = asyncio.create_task(
+            self._lauf(), name=f"nichtstream-live-{self.job.rid}")
+        return self._aufgabe
 
-    Je Heartbeat ohne Upstream-Antwort geht ein einzelnes Leerzeichen raus
-    (nur wenn ``config.nonstream_keepalive``); der komplette JSON-Body folgt,
-    sobald die Aufgabe fertig ist. Den Job schliesst die Aufgabe ab, nicht
-    dieser Generator: ein Client-Abbruch laesst sie unberuehrt weiterlaufen.
-    Scheitert die Aufgabe erst nach dem Antwortstart (spaeter
-    Transportfehler), folgt der 502-Koerper hinter den Leerzeichen: so
-    bleibt der Gesamtbody parsebares JSON statt "Leerzeichen und nichts".
-    Hat die ``wache`` einen Disconnect erkannt, ist der Job schon
-    abgeschlossen und die Aufgabe gecancelt: der Generator endet ohne Body,
-    ohne die CancelledError zu heben.
-    """
-    try:
-        while True:
-            fertig, _ = await asyncio.wait({aufgabe},
-                                           timeout=deps.config.heartbeat_s)
-            if fertig:
-                break
-            if deps.config.nonstream_keepalive:
-                yield b" "
-        if wache is not None and wache.getroffen:
-            return                       # Client weg: die Wache hat aufgeraeumt
-        ergebnis = aufgabe.result()
-        if isinstance(ergebnis, httpx.TransportError):
-            yield _BODY_NICHT_ERREICHBAR
+    async def beenden(self) -> None:
+        """Cancelt die Lesetask, wartet ihr Ende ab, schliesst die Antwort.
+
+        Deckt auch eine Lesetask ab, die vor ihrem ersten Schritt gecancelt
+        wurde: dann gibt es keine Upstream-Antwort zu schliessen. Der Job
+        wird hier nicht angefasst (das macht ``_beende_abgebrochen``); ein
+        doppelter Aufruf ist harmlos.
+        """
+        aufgabe = self._aufgabe
+        if aufgabe is None:
             return
-        if isinstance(ergebnis, Exception):
-            return                       # Fehler: Log und Job macht die Aufgabe
-        yield ergebnis.content
-    finally:
-        if wache is not None:
-            wache.stop()
+        aufgabe.cancel()
+        await asyncio.wait({aufgabe})
+        if self._antwort is not None:
+            await self._antwort.aclose()
+
+    async def _lauf(self) -> None:
+        """Upstream-Aufruf mit ``stream=true``; SSE bis zum Ende lesen."""
+        try:
+            antwort = await self._deps.client.send(
+                self._deps.client.build_request(
+                    "POST", self._url, headers=self._kopf,
+                    content=self._inhalt, timeout=_timeout(self._deps.config)),
+                stream=True)
+        except Exception as exc:              # Verbindungsfehler vor Phase 2
+            logger.warning("Upstream-Fehler bei rid=%s: %s: %s",
+                           self.job.rid, type(exc).__name__, exc)
+            self.fehler = exc
+            _finish_job(self._deps, self.job, JobStatus.ERROR,
+                        error=f"{type(exc).__name__}: {exc}")
+            return
+        self._antwort = antwort
+        if antwort.status_code >= 400:
+            # Ablehnung vor jedem SSE-Delta: Status und Body unveraendert.
+            await antwort.aread()
+            self.kopf_status = antwort.status_code
+            self.kopf_body = antwort.content
+            self.kopf_headers = _response_headers(antwort)
+            await antwort.aclose()
+            _finish_job(self._deps, self.job, JobStatus.ERROR,
+                        error=f"upstream {self.kopf_status}")
+            return
+        try:
+            async for chunk in antwort.aiter_bytes():
+                self._tracker.absorb(chunk)
+        except Exception as exc:              # Upstream weg/mittendrin kaputt
+            logger.warning("Upstream-Abbruch bei rid=%s: %s: %s",
+                           self.job.rid, type(exc).__name__, exc)
+            self.fehler = exc
+            self._tracker.close(JobStatus.ERROR,
+                                error=f"{type(exc).__name__}: {exc}")
+        else:
+            self.body = self._body_bauen()
+            self._tracker.close_clean()
+        finally:
+            try:
+                await antwort.aclose()
+            except Exception:                 # Schliessen darf die Aufgabe
+                logger.warning("Antwort-Close fehlgeschlagen bei rid=%s",
+                               self.job.rid, exc_info=True)
+
+    def _body_bauen(self) -> bytes:
+        """Reassemblierte ChatCompletion-Antwort (Ruling R4).
+
+        ``content``/``reasoning_content`` sind der volle gesammelte Text,
+        ``finish_reason`` das gemerkte oder ``"stop"``. ``usage`` kommt roh
+        vom Upstream und fehlt ganz, wenn keine usage ankam (nie 0
+        erfinden); das SGLang-``meta_info`` wird bewusst nicht uebernommen.
+        """
+        antwort = {
+            "id": self.job.rid,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": self._model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "".join(self._tracker.content_teile),
+                    "reasoning_content": "".join(self._tracker.reasoning_teile),
+                },
+                "finish_reason": self._tracker.finish_reason or "stop",
+            }],
+        }
+        if self._tracker.usage is not None:
+            antwort["usage"] = self._tracker.usage
+        return json.dumps(antwort, ensure_ascii=False).encode("utf-8")
 
 
 async def _nichtstream(request: Request, deps: Deps, koerper: dict) -> Response:
-    """POST mit JSON-Body und ``stream != true``: Job plus WS-Keepalives.
+    """POST ``chat/completions`` mit ``stream != true``: interner Stream.
 
-    Der Job entsteht **vor** dem Upstream-Aufruf und wird sofort publiziert,
-    damit das Dashboard wartende Anfragen sieht; fehlt die rid, kommt eine
-    neue in den Body (wie im Relay, fuer Registry und /abort_request). Ist
-    die Antwort innerhalb eines Heartbeats da, geht sie byte-identisch und
-    ohne Leerzeichen durch (kein Streaming); sonst liefert der Generator
-    Leerzeichen vor dem kompletten JSON-Body. Nur ein Verbindungsfehler vor
-    dem Antwortstart ergibt 502; spaeter erkannte Fehler stehen nur noch im
-    Log und im Job (der Status 200 ist dann schon beim Client). Mit
-    ``abort_on_disconnect`` (Default) wacht eine Wache ueber die Verbindung:
-    bricht der Client waehrend der Upstream-Wartezeit ab, wird die Aufgabe
-    gecancelt, der Job als ``aborted`` abgeschlossen und der Request best
-    effort bei SGLang abgemeldet (Ruling R3a).
+    Der Job entsteht **vor** dem Upstream-Aufruf und wird sofort als
+    ``waiting`` publiziert; fehlt die rid, kommt eine neue in den Body (wie
+    im Relay, fuer Registry und ``/abort_request``). Der Upstream bekommt
+    eine Body-Kopie mit ``stream=true`` und ``stream_options.include_usage``;
+    die SSE-Antwort wird live verfolgt und zu einem ChatCompletion-JSON
+    reassembliert (Ruling R4, bewusst ohne SGLang-``meta_info``). Innerhalb
+    von ``heartbeat_s`` fertig heisst einzelne Response ohne Leerzeichen;
+    sonst kommen je Heartbeat Leerzeichen vor das JSON
+    (``nonstream_keepalive``). Ein Abbruch-Signal der Cancel-Route beendet
+    den lokalen Lauf wirklich: 499 mit ``aborted``-JSON vor dem
+    Antwortstart, sonst dasselbe JSON hinter den Leerzeichen. Nur ein
+    Verbindungsfehler vor dem Antwortstart ergibt 502. Mit
+    ``abort_on_disconnect`` (Default) wacht eine Wache ueber die Verbindung
+    wie bisher: bricht der Client ab, wird der laufende Task gecancelt, der
+    Job als ``aborted`` abgeschlossen und der Request best effort bei SGLang
+    abgemeldet.
     """
     rid = ensure_rid(koerper)
     model = koerper.get("model")
+    if not isinstance(model, str):
+        model = ""
     job = deps.registry.register(
         rid,
         source=_client_source(request),
-        model=model if isinstance(model, str) else "",
+        model=model,
         full_prompt=_extract_full_prompt(koerper),
         now=time.time(),
     )
     deps.hub.publish("job", job_to_dict(job))
 
+    abbruch = deps.registry.abort_signal(rid)
+    if abbruch is None:                       # nach ``register`` unerreichbar
+        abbruch = asyncio.Event()
     kopf = _upstream_headers(request)
     kopf["content-type"] = "application/json"
-    wache = _neue_wache(request, deps, rid)
-    aufgabe = asyncio.create_task(
-        _hole_nichtstream(
-            deps, job, _upstream_url(request, deps.config), kopf,
-            json.dumps(koerper, ensure_ascii=False).encode("utf-8"),
-            wache=wache),
-        name=f"nichtstream-{rid}")
+    verlauf = _InternerStream(
+        deps, job, url=_upstream_url(request, deps.config), kopf=kopf,
+        inhalt=_stream_body(koerper), model=model)
+    aufgabe = verlauf.start()
 
-    async def bei_disconnect() -> None:
-        """R3a: wartende Aufgabe canceln, Job aborted, Abort an SGLang."""
-        aufgabe.cancel()
+    async def bei_abbruch() -> None:
+        """Lauf beenden, Job ``aborted``, Abort an SGLang (best effort).
+
+        Wird vom Abbruch-Signal und vom Disconnect-Handler aufgerufen;
+        mehrfacher Aufruf ist unschaedlich (first-wins in der Registry,
+        ``abort_request`` ist idempotent).
+        """
+        await verlauf.beenden()
         _beende_abgebrochen(deps, job)
         await _abort_best_effort(deps, rid)
 
+    wache = _neue_wache(request, deps, rid)
     if wache is not None:
-        wache.setze_handler(bei_disconnect)
+        wache.setze_handler(bei_abbruch)
         wache.start()
 
-    fertig, _ = await asyncio.wait({aufgabe},
-                                   timeout=deps.config.heartbeat_s)
-    if not fertig:
-        return StreamingResponse(_nichtstream_langsam(deps, aufgabe, wache),
-                                 media_type="application/json")
-    if wache is not None:
+    def wache_zu() -> bool:
+        """Wache beenden; True, wenn der Client weg ist (Disconnect)."""
+        if wache is None:
+            return False
         wache.stop()
-        if wache.getroffen:
-            # Client weg: die Wache hat die Aufgabe gecancelt und den Job
-            # abgeschlossen; die Antwort erreicht ihn nicht mehr.
-            return _client_weg_antwort()
-    ergebnis = aufgabe.result()
-    if isinstance(ergebnis, httpx.TransportError):
-        return Response(_BODY_NICHT_ERREICHBAR, status_code=502,
+        return wache.getroffen
+
+    def abgebrochen_antwort() -> Response:
+        """499 mit ``aborted``-JSON (Antwort war noch nicht gestartet)."""
+        return Response(_BODY_ABGEBROCHEN, status_code=499,
                         media_type="application/json")
-    if isinstance(ergebnis, Exception):
-        # Kein Netzproblem, sondern ein unerwarteter Fehler: der Job ist
-        # bereits error, der Bug soll aber sichtbar bleiben (500) statt als
-        # irrefuehrendes "sglang nicht erreichbar" zu verschwinden.
-        raise ergebnis
-    return Response(ergebnis.content, status_code=ergebnis.status_code,
-                    headers=_response_headers(ergebnis))
+
+    signal = asyncio.create_task(abbruch.wait(), name=f"abbruch-warten-{rid}")
+    uebergeben = False
+    try:
+        bereit, _ = await asyncio.wait(
+            {aufgabe, signal}, timeout=deps.config.heartbeat_s,
+            return_when=asyncio.FIRST_COMPLETED)
+        if aufgabe in bereit:
+            if wache_zu():
+                return _client_weg_antwort()
+            if signal in bereit:
+                await bei_abbruch()
+                return abgebrochen_antwort()
+            if verlauf.kopf_status is not None:
+                return Response(verlauf.kopf_body,
+                                status_code=verlauf.kopf_status,
+                                headers=verlauf.kopf_headers)
+            if isinstance(verlauf.fehler, httpx.TransportError):
+                return Response(_BODY_NICHT_ERREICHBAR, status_code=502,
+                                media_type="application/json")
+            if verlauf.fehler is not None:
+                # Kein Netzproblem, sondern ein unerwarteter Fehler: der Job
+                # ist bereits error, der Bug soll aber sichtbar bleiben (500)
+                # statt als "sglang nicht erreichbar" zu verschwinden.
+                raise verlauf.fehler
+            return Response(verlauf.body, media_type="application/json")
+        if signal in bereit:
+            await bei_abbruch()
+            if wache_zu():
+                return _client_weg_antwort()
+            return abgebrochen_antwort()
+
+        async def langsam() -> AsyncIterator[bytes]:
+            """Client-Seite: Leerzeichen je Heartbeat, dann das fertige JSON.
+
+            Je Heartbeat ohne Ergebnis geht ein einzelnes Leerzeichen raus
+            (nur wenn ``config.nonstream_keepalive``); den Job schliesst die
+            Lesetask ab, nicht dieser Generator. Ein Transportfehler nach dem
+            Antwortstart kommt als 502-Koerper hinter den Leerzeichen, damit
+            der Gesamtbody parsebares JSON bleibt. Ein Abbruch-Signal liefert
+            das ``aborted``-JSON hinter den Leerzeichen. Hat die ``wache``
+            einen Disconnect erkannt, endet der Generator ohne Body (der Job
+            ist schon abgeschlossen und die Lesetask gecancelt).
+            """
+            try:
+                while True:
+                    bereit, _ = await asyncio.wait(
+                        {aufgabe, signal}, timeout=deps.config.heartbeat_s,
+                        return_when=asyncio.FIRST_COMPLETED)
+                    if signal in bereit:
+                        await bei_abbruch()
+                        yield _BODY_ABGEBROCHEN
+                        return
+                    if aufgabe in bereit:
+                        break
+                    if deps.config.nonstream_keepalive:
+                        yield b" "
+                if wache_zu():
+                    return           # Client weg: die Wache hat aufgeraeumt
+                if verlauf.kopf_status is not None:
+                    yield verlauf.kopf_body
+                    return
+                if isinstance(verlauf.fehler, httpx.TransportError):
+                    yield _BODY_NICHT_ERREICHBAR
+                    return
+                if verlauf.fehler is not None:
+                    return           # Log und Job macht die Lesetask
+                yield verlauf.body
+            finally:
+                wache_zu()
+                signal.cancel()
+
+        uebergeben = True
+        return StreamingResponse(langsam(), media_type="application/json")
+    finally:
+        if not uebergeben:
+            signal.cancel()
+            if wache is not None:
+                # Auch bei einem Abbruch von aussen (Server-Shutdown): die
+                # Wache darf nicht als Zombie weiterpollend uebrig bleiben.
+                wache.stop()
 
 
 async def _passthrough(request: Request, deps: Deps, roh: bytes) -> Response:
@@ -714,17 +877,19 @@ async def handle_v1(request: Request, deps: Deps) -> Response:
     """Bedient jede ``/v1/*``-Anfrage des Gateways.
 
     GET ohne Body und POSTs ohne JSON-Objekt sind ein gepufferter
-    Passthrough ohne Job. JSON-POSTs ohne ``stream=true`` laufen ueber den
-    Nicht-Stream-Pfad (Job, WS-Keepalives, 502 bei Verbindungsfehler).
-    ``stream=true`` laeuft ueber das Relay: erst die Kopfzeile des Upstreams
-    pruefen (Status >= 400 kommt unveraendert zurueck, ohne SSE und ohne
-    Job), dann Job anlegen und streamen. Der Job wird erst nach der
-    Kopfzeile angelegt; so hinterlaesst keine abgelehnte Anfrage eine
-    Zeile in der Registry. Pfade mit Punkt-Segmenten enden sofort mit 404.
-    Mit ``abort_on_disconnect`` (Default) wacht je getracktem Request eine
-    ``_DisconnectWatcher`` ueber die Client-Verbindung und bricht bei einem
-    Disconnect den wartenden Aufruf ab, schliesst den Job als ``aborted``
-    ab und meldet den Request bei SGLang ab.
+    Passthrough ohne Job. Nur JSON-POSTs auf ``chat/completions`` mit
+    ``stream != true`` laufen ueber den internen Stream (Job, Live-Tracking,
+    Keepalives, 502 bei Verbindungsfehler); andere JSON-POSTs bleiben der
+    Byte-Passthrough ohne Job. ``stream=true`` laeuft ueber das Relay: erst
+    die Kopfzeile des Upstreams pruefen (Status >= 400 kommt unveraendert
+    zurueck, ohne SSE und ohne Job), dann Job anlegen und streamen. Der Job
+    wird erst nach der Kopfzeile angelegt; so hinterlaesst keine abgelehnte
+    Anfrage eine Zeile in der Registry. Pfade mit Punkt-Segmenten enden
+    sofort mit 404. Mit ``abort_on_disconnect`` (Default) wacht je
+    getracktem Request eine ``_DisconnectWatcher`` ueber die
+    Client-Verbindung und bricht bei einem Disconnect den wartenden Aufruf
+    ab, schliesst den Job als ``aborted`` ab und meldet den Request bei
+    SGLang ab.
     """
     if _pfad_mit_punktsegment(request.url.path):
         return Response(_BODY_UNGUELTIGER_PFAD, status_code=404,
@@ -734,7 +899,11 @@ async def handle_v1(request: Request, deps: Deps) -> Response:
     if koerper is None:
         return await _passthrough(request, deps, roh)
     if koerper.get("stream") is not True:
-        return await _nichtstream(request, deps, koerper)
+        if request.url.path.endswith(_CHAT_COMPLETIONS):
+            return await _nichtstream(request, deps, koerper)
+        # Ruling R1: nur Chat-Non-Stream wird konvertiert; alle anderen
+        # JSON-POSTs bleiben der getreue Byte-Passthrough ohne Job.
+        return await _passthrough(request, deps, roh)
 
     rid = ensure_rid(koerper)
     kopf = _upstream_headers(request)

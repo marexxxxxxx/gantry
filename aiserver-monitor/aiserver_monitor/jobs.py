@@ -1,10 +1,14 @@
 """Job-Registry (nur RAM) fuer den aiserver-monitor.
 
 Haelt je Request einen Job mit Status, Zeiten, Tokenzaehlern und den letzten
-Zeichen von Antwort/Denken (TextRing). Kein I/O, kein asyncio. Vorschau- und
-Prompttexte werden nie persistiert.
+Zeichen von Antwort/Denken (TextRing). Seit dem internen Non-Stream-Stream
+traegt jeder Job zusaetzlich ein lazily erzeugtes Abbruch-Signal
+(``asyncio.Event``), das die Cancel-Route setzt und der Non-Stream-Pfad
+abwartet; die Methoden selbst bleiben synchron. Kein I/O, kein Netzwerk.
+Vorschau- und Prompttexte werden nie persistiert.
 """
 
+import asyncio
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -67,6 +71,9 @@ class Job:
     completion_tokens: int | None = None
     fallback_completion_tokens: int = 0
     error: str | None = None
+    #: Lazy erzeugtes Abbruch-Signal (nur ueber ``abort_signal`` gesetzt);
+    #: wird nie serialisiert (``job_to_dict`` kennt es nicht).
+    abort_event: asyncio.Event | None = None
 
 
 class JobRegistry:
@@ -119,6 +126,21 @@ class JobRegistry:
 
     def get(self, rid: str) -> Job | None:
         return self._jobs.get(rid)
+
+    def abort_signal(self, rid: str) -> asyncio.Event | None:
+        """Lazy erzeugtes Abbruch-Signal je Job; None ohne Job.
+
+        Die Cancel-Route setzt es, der Non-Stream-Pfad wartet darauf. Jeder
+        Job bekommt genau ein Event; ein gleicher rid ersetzt mit
+        ``register`` auch den Job samt Signal, ein alter Abbruch wirkt also
+        nie auf einen neuen Lauf nach.
+        """
+        job = self._jobs.get(rid)
+        if job is None:
+            return None
+        if job.abort_event is None:
+            job.abort_event = asyncio.Event()
+        return job.abort_event
 
     def _require(self, rid: str) -> Job:
         job = self._jobs.get(rid)

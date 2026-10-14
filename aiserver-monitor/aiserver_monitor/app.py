@@ -230,6 +230,12 @@ def create_app(config: Config, *,
 
     @app.post("/monitor/jobs/{rid}/cancel")
     async def monitor_cancel_job(rid: str) -> dict:
+        # R5: erst das lokale Abbruch-Signal (der Non-Stream-Pfad beendet
+        # damit seinen Lauf wirklich), dann best effort der Abort am
+        # Upstream. Ein unbekannter rid hat kein Signal und bleibt No-op.
+        signal = registry.abort_signal(rid)
+        if signal is not None:
+            signal.set()
         ok = await _abbrechen(rid=rid, abort_all=False)
         if ok:
             job = registry.get(rid)

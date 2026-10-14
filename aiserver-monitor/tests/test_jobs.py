@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 
 from aiserver_monitor.jobs import (
@@ -201,6 +202,45 @@ class TestJobRegistry(unittest.TestCase):
             reg.register(f"aktiv-{n}", source="s", model="m",
                          full_prompt="p", now=float(n))
         self.assertEqual(len(reg.snapshot()), 250)      # nichts geprunnt
+
+
+class TestAbortSignal(unittest.TestCase):
+    """R5: lazily erzeugtes Abbruch-Signal je Job (Non-Stream-Chat)."""
+
+    def test_signal_wird_lazy_erzeugt_und_bleibt_dasselbe(self):
+        reg = JobRegistry(preview_max_chars=5)
+        reg.register("sig-a", source="s", model="m", full_prompt="p", now=0.0)
+        signal = reg.abort_signal("sig-a")
+        self.assertIsInstance(signal, asyncio.Event)
+        self.assertFalse(signal.is_set())
+        self.assertIs(reg.abort_signal("sig-a"), signal)  # nicht jedes Mal neu
+        signal.set()
+        self.assertTrue(reg.abort_signal("sig-a").is_set())
+
+    def test_signal_fuer_unbekannte_rid_ist_none(self):
+        reg = JobRegistry(preview_max_chars=5)
+        self.assertIsNone(reg.abort_signal("gibt-es-nicht"))
+
+    def test_abbruch_nach_done_setzt_nichts_zurueck(self):
+        # R7.7: first-wins bleibt - ein Signal nach dem Abschluss aendert den
+        # Job nicht (kein Overwrite, keine zweite Statusaenderung).
+        reg = JobRegistry(preview_max_chars=5)
+        reg.register("sig-b", source="s", model="m", full_prompt="p", now=10.0)
+        reg.finish("sig-b", JobStatus.DONE, completion_tokens=7, now=11.0)
+        reg.abort_signal("sig-b").set()
+        daten = job_to_dict(reg.get("sig-b"))
+        self.assertEqual(daten["status"], "done")
+        self.assertEqual(daten["completion_tokens"], 7)
+        self.assertEqual(daten["duration_ms"], 1000.0)
+
+    def test_neue_registrierung_bekommt_ein_frisches_signal(self):
+        # Gleiche rid ersetzt den Job (register): das Signal des alten Laufs
+        # haengt nicht gesetzt am neuen Job.
+        reg = JobRegistry(preview_max_chars=5)
+        reg.register("sig-c", source="s", model="m", full_prompt="p", now=0.0)
+        reg.abort_signal("sig-c").set()
+        reg.register("sig-c", source="s", model="m", full_prompt="p", now=1.0)
+        self.assertFalse(reg.abort_signal("sig-c").is_set())
 
 
 if __name__ == "__main__":

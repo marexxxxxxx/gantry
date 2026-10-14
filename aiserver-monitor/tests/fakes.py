@@ -166,21 +166,30 @@ class SkriptStream(httpx.AsyncByteStream):
     """Test-Bytestrom, der die Skript-Schritte mit echten Pausen liefert.
 
     Mit ``fehler`` bricht der Strom nach den Schritten ab (Upstream weg).
+    ``geschlossen`` wird beim Ende des Stroms gesetzt - auch wenn der Leser
+    ihn mittendrin abbricht: damit pruefen Tests, dass ein abgebrochener
+    Lauf den Read-Stream wirklich beendet hat (kein Zombie).
     """
 
     def __init__(self, schritte: Iterable[Schritt],
-                 fehler: BaseException | None = None):
+                 fehler: BaseException | None = None,
+                 geschlossen: asyncio.Event | None = None):
         self._schritte = list(schritte)
         self._fehler = fehler
+        self._geschlossen = geschlossen
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
-        for pause, chunk in self._schritte:
-            if pause > 0:
-                await asyncio.sleep(pause)
-            if chunk:
-                yield chunk
-        if self._fehler is not None:
-            raise self._fehler
+        try:
+            for pause, chunk in self._schritte:
+                if pause > 0:
+                    await asyncio.sleep(pause)
+                if chunk:
+                    yield chunk
+            if self._fehler is not None:
+                raise self._fehler
+        finally:
+            if self._geschlossen is not None:
+                self._geschlossen.set()
 
 
 def skript_transport(schritte: Iterable[Schritt] = (), *,
