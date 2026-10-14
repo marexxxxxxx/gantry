@@ -814,8 +814,12 @@ async def _nichtstream(request: Request, deps: Deps, koerper: dict) -> Response:
             der Gesamtbody parsebares JSON bleibt. Ein Abbruch-Signal liefert
             das ``aborted``-JSON hinter den Leerzeichen. Hat die ``wache``
             einen Disconnect erkannt, endet der Generator ohne Body (der Job
-            ist schon abgeschlossen und die Lesetask gecancelt).
+            ist schon abgeschlossen und die Lesetask gecancelt). Schliesst
+            Starlette den Generator stattdessen selbst (Client weg nach dem
+            Antwortstart), raeumt das ``finally`` best effort ab, falls die
+            Wache den Disconnect nicht mehr gesehen hat.
             """
+            beendet_normal = False
             try:
                 while True:
                     bereit, _ = await asyncio.wait(
@@ -823,9 +827,11 @@ async def _nichtstream(request: Request, deps: Deps, koerper: dict) -> Response:
                         return_when=asyncio.FIRST_COMPLETED)
                     if signal in bereit:
                         await bei_abbruch()
+                        beendet_normal = True
                         yield _BODY_ABGEBROCHEN
                         return
                     if aufgabe in bereit:
+                        beendet_normal = True
                         break
                     if deps.config.nonstream_keepalive:
                         yield b" "
@@ -841,7 +847,16 @@ async def _nichtstream(request: Request, deps: Deps, koerper: dict) -> Response:
                     return           # Log und Job macht die Lesetask
                 yield verlauf.body
             finally:
-                wache_zu()
+                treffer = wache_zu()
+                if (wache is not None and not beendet_normal and not treffer
+                        and job.status in ACTIVE_STATUSES):
+                    # Der Generator wurde von aussen geschlossen (Client
+                    # weg), bevor die Wache den Disconnect gesehen hat:
+                    # best effort aufraeumen. Nie awaiten
+                    # (GeneratorExit-/Cancel-Kontext); bei_abbruch ist
+                    # idempotent und first-wins.
+                    asyncio.create_task(bei_abbruch(),
+                                        name=f"dc-cleanup-{rid}")
                 signal.cancel()
 
         uebergeben = True

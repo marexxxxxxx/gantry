@@ -9,12 +9,14 @@ echter uvicorn auf 127.0.0.1:39127 in einem Hintergrund-Thread.
 
 import json
 import os
+import socket
 import sqlite3
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import httpx
 import uvicorn
@@ -30,6 +32,9 @@ from aiserver_monitor.proxy import Deps
 
 #: Port des SSE-Integrationstests (39xxx ist fuer Tests freigegeben).
 SSE_PORT = 39127
+
+#: Port des Socket-Tests fuer den Nicht-Stream-Disconnect (39xxx).
+DC_PORT = 39217
 
 #: Static-Verzeichnis des Pakets (existiert bis Task 12 nicht).
 STATIC_DIR = Path(__file__).resolve().parent.parent / "aiserver_monitor" / "static"
@@ -802,6 +807,165 @@ class TestSseIntegration(AppTestCase):
                     if len(zeilen) >= 3:
                         break
         return zeilen
+
+
+class _StillerSseTransport(httpx.AsyncBaseTransport):
+    """Skripteter Upstream: stille SSE-Antwort, Aborts werden protokolliert.
+
+    ``/v1/chat/completions`` liefert eine SSE-Antwort, deren erstes Byte
+    ``PAUSE_S`` Sekunden auf sich warten laesst: solange bleibt der
+    Non-Stream-Job im Pool und der Antwortkoerper liefert nur
+    Leerzeichen-Keepalives. ``/abort_request`` antwortet 200 und sammelt die
+    Bodies (Beweis, dass der Abort wirklich am Upstream ankam).
+    """
+
+    PAUSE_S = 30.0
+
+    def __init__(self) -> None:
+        self.aborts: list[dict] = []
+
+    async def handle_async_request(
+            self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/abort_request":
+            self.aborts.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json={"success": True})
+        if request.url.path in ("/health", "/metrics"):
+            return httpx.Response(200, text="")
+        sse = (
+            'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+            'data: {"choices":[{"delta":{"content":"Hallo"}}]}\n\n'
+            'data: [DONE]\n\n'
+        ).encode("utf-8")
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"},
+            stream=fakes.SkriptStream([(self.PAUSE_S, sse)]))
+
+
+class TestNichtstreamDisconnectSocket(AppTestCase):
+    """Client-Close im Non-Stream-Pfad, echter uvicorn und roher Socket.
+
+    Fall A ist der Zombie-Bug: der Close kommt erst, nachdem die Antwort
+    bereits streamt (erster Leerzeichen-Keepalive ist beim Client). Dann
+    schliesst Starlette den Antwort-Generator; ohne Aufraeumen bleibt der
+    Job ``waiting``. Fall B (Kontrolle) schliesst VOR dem Antwortstart und
+    laeuft weiter ueber den unveraenderten Wacher-Pfad.
+    """
+
+    def _server(self, transport) -> tuple[uvicorn.Server, threading.Thread]:
+        """App mit skriptetem Transport als echter uvicorn im Hintergrund.
+
+        ``timeout_graceful_shutdown`` begrenzt das Herunterfahren: sonst
+        wartet uvicorn beim Stoppen auf den stummen 30-s-Upstream-Read.
+        """
+        app = self.app(transport=transport, enable_background=False,
+                       heartbeat_s=0.2)
+        server = uvicorn.Server(uvicorn.Config(
+            app, host="127.0.0.1", port=DC_PORT,
+            log_level="warning", timeout_graceful_shutdown=0.5))
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        ende = time.monotonic() + 5.0
+        while not server.started and time.monotonic() < ende:
+            time.sleep(0.02)
+        self.assertTrue(server.started, "uvicorn startet nicht")
+        return server, thread
+
+    def _stop(self, server: uvicorn.Server,
+              thread: threading.Thread) -> None:
+        server.should_exit = True
+        thread.join(timeout=5.0)
+        self.assertFalse(thread.is_alive(), "uvicorn-Thread laeuft noch")
+
+    def _raw_post(self, rid: str) -> socket.socket:
+        """Roher HTTP-POST (stream=false); Socket bleibt offen."""
+        sock = socket.create_connection(("127.0.0.1", DC_PORT), timeout=3.0)
+        self.addCleanup(sock.close)
+        body = json.dumps({
+            "model": "probe", "rid": rid, "stream": False,
+            "messages": [{"role": "user", "content": "Test"}],
+        }).encode("utf-8")
+        sock.sendall(
+            f"POST /v1/chat/completions HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{DC_PORT}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body)
+        return sock
+
+    def _erste_keepalive_lesen(self, sock: socket.socket) -> None:
+        """Liest, bis der erste Body-Chunk (Keepalive-Leerzeichen) da ist."""
+        sock.settimeout(5.0)
+        puffer = b""
+        while b"\r\n\r\n" not in puffer:
+            puffer += sock.recv(4096)
+        kopf, _, puffer = puffer.partition(b"\r\n\r\n")
+        self.assertTrue(kopf.startswith(b"HTTP/1.1 200"), kopf[:60])
+        # Die Stream-Antwort kommt im Chunked-Format: "<hex>\r\n<bytes>\r\n".
+        while b"\r\n" not in puffer:
+            puffer += sock.recv(4096)
+        zeile, _, puffer = puffer.partition(b"\r\n")
+        groesse = int(zeile.split(b";")[0], 16)
+        while len(puffer) < groesse:
+            puffer += sock.recv(4096)
+        self.assertGreaterEqual(groesse, 1)
+        self.assertEqual(puffer[:groesse], b" " * groesse,
+                         "erster Body-Chunk ist kein Keepalive")
+
+    def _status(self, rid: str) -> str | None:
+        """Job-Status ueber die HTTP-Route (laeuft im uvicorn-Thread)."""
+        antwort = httpx.get(f"http://127.0.0.1:{DC_PORT}/monitor/jobs",
+                            timeout=2.0, trust_env=False)
+        for job in antwort.json()["jobs"]:
+            if job["rid"] == rid:
+                return job["status"]
+        return None
+
+    def _warte_auf(self, bedingung, *, timeout_s: float = 5.0) -> bool:
+        ende = time.monotonic() + timeout_s
+        while time.monotonic() < ende:
+            if bedingung():
+                return True
+            time.sleep(0.05)
+        return bedingung()
+
+    def test_disconnect_nach_antwort_start_raeumt_job_ab(self):
+        # Der Close kommt nach dem ersten Keepalive: der Generator wird von
+        # Starlette geschlossen, der Job muss trotzdem aborted werden und
+        # der Abort am Upstream ankommen.
+        transport = _StillerSseTransport()
+        server, thread = self._server(transport)
+        try:
+            sock = self._raw_post("dc-nach")
+            self._erste_keepalive_lesen(sock)       # Antwort streamt jetzt
+            sock.close()
+
+            aborted = self._warte_auf(
+                lambda: self._status("dc-nach") == "aborted")
+            self.assertTrue(aborted, "Job blieb waiting (Zombie)")
+            abgesagt = self._warte_auf(lambda: any(
+                eintrag.get("rid") == "dc-nach"
+                for eintrag in transport.aborts))
+            self.assertTrue(abgesagt, "kein abort_request am Upstream")
+        finally:
+            self._stop(server, thread)
+
+    def test_disconnect_vor_antwort_start_raeumt_job_ab(self):
+        # Kontrolle: der Close kommt vor dem ersten Keepalive und wird vom
+        # Wacher erkannt. Dessen Poll-Intervall ist hier verkuerzt: bei
+        # 0,2-s-Heartbeat und 1-s-Intervall wuerde sonst der Generator-Close
+        # das Rennen gewinnen (Fall A) und der Pre-Response-Pfad ungetestet
+        # bleiben.
+        transport = _StillerSseTransport()
+        server, thread = self._server(transport)
+        try:
+            with mock.patch("aiserver_monitor.proxy._DISCONNECT_CHECK_S", 0.05):
+                sock = self._raw_post("dc-vor")
+                time.sleep(0.05)
+                sock.close()
+                aborted = self._warte_auf(
+                    lambda: self._status("dc-vor") == "aborted")
+            self.assertTrue(aborted, "Job blieb waiting (Zombie)")
+        finally:
+            self._stop(server, thread)
 
 
 if __name__ == "__main__":
