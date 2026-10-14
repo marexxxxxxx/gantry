@@ -1,7 +1,8 @@
 """FastAPI-App fuer aiserver-monitor: Routen, Static, Lifespan, Client-IP.
 
-``create_app`` verdrahtet Config, Job-Registry, EventHub, History, den
-gemeinsamen httpx-Client und (optional) den Metrik-Sammler zu einer App.
+``create_app`` verdrahtet Config, Job-Registry, EventHub, History, die
+httpx-Clients (gemeinsam fuer den Proxy, je eigene fuer Metriken und
+Steuer/Cancel) und (optional) den Metrik-Sammler zu einer App.
 Routen: Health, Job-Snapshot, SSE-Ereignisse, Cancel/Notaus, Statistik und der
 ``/v1``-Passthrough; zuletzt der Static-Mount (oder die Platzhalterseite).
 
@@ -42,6 +43,9 @@ MAX_FENSTER_MS = 30 * 86400 * 1000
 
 #: Default-Bucket der Statistik in Sekunden (bis die UI etwas anderes schickt).
 DEFAULT_BUCKET_S = 60
+
+#: Timeout des dedizierten Steuer-Clients fuer Cancel (Sekunden).
+_STEUER_TIMEOUT_S = 5.0
 
 #: Platzhalterseite, solange das Static-Verzeichnis (Webapp-Tasks) fehlt.
 _PLATZHALTER_HTML = """<!doctype html>
@@ -131,14 +135,18 @@ class _CfClientMiddleware:
 
 def create_app(config: Config, *,
                transport: httpx.AsyncBaseTransport | None = None,
+               steuer_transport: httpx.AsyncBaseTransport | None = None,
                gpu_reader: Callable[[], Awaitable[GpuSample]] | None = None,
                enable_background: bool = True) -> FastAPI:
     """Baut die Gateway-App aus Config, optionalem Transport und GPU-Reader.
 
-    ``transport`` ersetzt den httpx-Transport (Tests); ``gpu_reader`` den
-    nvidia-smi-Aufruf des Sammlers. ``enable_background=False`` startet keinen
-    Collector (Tests). Die Lifespan initialisiert und raeumt die History auf,
-    markiert haengengebliebene Jobs als error und startet/stoppt den Collector.
+    ``transport`` ersetzt den httpx-Transport der Clients (Tests),
+    ``steuer_transport`` den des dedizierten Steuer-Clients; ohne Angabe
+    faellt der Steuer-Client auf ``transport`` zurueck. ``gpu_reader``
+    ersetzt den nvidia-smi-Aufruf des Sammlers. ``enable_background=False``
+    startet keinen Collector (Tests). Die Lifespan initialisiert und raeumt
+    die History auf, markiert haengengebliebene Jobs als error und
+    startet/stoppt den Collector.
     """
     Path(config.db_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -153,6 +161,13 @@ def create_app(config: Config, *,
     # mehr in den PoolTimeout und das Dashboard meldet SGLang nicht
     # faelschlich als nicht erreichbar.
     collector_client = httpx.AsyncClient(transport=transport)
+    # Steuer-/Cancel-Aufrufe bekommen ebenfalls einen EIGENEN Client mit
+    # eigenem Pool und explizitem Timeout: sind die Proxy-Verbindungen voll
+    # (wartende Relay-Jobs), wuerde der Abbruch sonst im PoolTimeout enden
+    # und das Dashboard faelschlich "Abbruch nicht moeglich" melden.
+    steuer_client = httpx.AsyncClient(
+        transport=transport if steuer_transport is None else steuer_transport,
+        timeout=httpx.Timeout(_STEUER_TIMEOUT_S))
     deps = Deps(
         config=config,
         registry=registry,
@@ -186,6 +201,7 @@ def create_app(config: Config, *,
                     pass
             await client.aclose()
             await collector_client.aclose()
+            await steuer_client.aclose()
             history.close()
 
     app = FastAPI(title="aiserver-monitor", lifespan=lifespan)
@@ -193,11 +209,16 @@ def create_app(config: Config, *,
     app.state.deps = deps
     app.state.collector_task = None
     app.state.collector_client = collector_client
+    app.state.steuer_client = steuer_client
 
     async def _abbrechen(*, rid: str | None, abort_all: bool) -> bool:
-        """``abort_request`` mit Fehler-Mapping: Netzfehler -> False (geloggt)."""
+        """``abort_request`` ueber den Steuer-Client: Netzfehler -> False.
+
+        Der dedizierte Steuer-Client hat einen eigenen Pool, damit ein
+        gesaettigter Proxy-Pool den Abbruch nicht blockiert (PoolTimeout).
+        """
         try:
-            return await abort_request(deps.client, config.upstream_base,
+            return await abort_request(steuer_client, config.upstream_base,
                                        rid=rid, abort_all=abort_all)
         except httpx.HTTPError as exc:
             logger.warning(

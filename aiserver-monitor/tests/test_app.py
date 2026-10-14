@@ -89,9 +89,11 @@ class AppTestCase(unittest.TestCase):
         basis.update(felder)
         return Config(**basis)
 
-    def app(self, *, transport=None, enable_background: bool = False,
+    def app(self, *, transport=None, steuer_transport=None,
+            enable_background: bool = False,
             gpu_reader=None, **felder):
         return create_app(self.config(**felder), transport=transport,
+                          steuer_transport=steuer_transport,
                           gpu_reader=gpu_reader,
                           enable_background=enable_background)
 
@@ -277,6 +279,22 @@ class _AbortFake:
         return [json.loads(request.content) for request in self.requests]
 
 
+class _AusgeschoepfterTransport(httpx.AsyncBaseTransport):
+    """Transport wie ein gesaettigter Pool: wirft sofort ``PoolTimeout``.
+
+    Simuliert den Live-Befund: der Proxy-Client bekommt keinen Slot mehr; der
+    dedizierte Steuer-Client muss davon unabhaengig antworten koennen.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+
+    async def handle_async_request(
+            self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        raise httpx.PoolTimeout("Pool ist ausgeschoepft")
+
+
 class TestCancelRouten(AppTestCase):
     def _registriere(self, c, rid: str, *, aktiv: bool = True):
         job = c.app.state.deps.registry.register(
@@ -408,6 +426,77 @@ class TestCancelRouten(AppTestCase):
             self.assertEqual(antwort.json(), {"ok": False})
             self.assertIs(c.app.state.deps.registry.get("rid-4").status,
                           JobStatus.RUNNING)
+
+
+class TestDedizierterSteuerClient(AppTestCase):
+    """R1/R2/R4/R5: Cancel laeuft ueber einen eigenen Client (eigener Pool)."""
+
+    def test_steuer_client_ist_eigenstaendig_mit_modul_timeout(self):
+        # R1: eigener Client, explizites Timeout aus der Modulkonstanten.
+        from aiserver_monitor import app as app_modul
+        app = self.app(enable_background=False)
+        steuer_client = app.state.steuer_client
+        self.assertIsNot(steuer_client, app.state.deps.client)
+        self.assertEqual(app_modul._STEUER_TIMEOUT_S, 5.0)
+        self.assertEqual(steuer_client.timeout,
+                         httpx.Timeout(app_modul._STEUER_TIMEOUT_S))
+
+    def test_cancel_und_cancel_all_nutzen_den_steuer_client(self):
+        # R5a: getrennte Recorder; /abort_request sieht nur der Steuer-Client.
+        proxy_fake = _AbortFake()
+        steuer_fake = _AbortFake()
+        app = self.app(transport=httpx.MockTransport(proxy_fake),
+                       steuer_transport=httpx.MockTransport(steuer_fake))
+        with TestClient(app) as c:
+            reg = c.app.state.deps.registry
+            reg.register("w1", source="10.0.0.1", model="m",
+                         full_prompt="Hallo", now=1000.0)
+            reg.note_running("w1", now=1001.0)
+            einzel = c.post("/monitor/jobs/w1/cancel")
+            alle = c.post("/monitor/cancel_all")
+        self.assertEqual(einzel.status_code, 200)
+        self.assertEqual(einzel.json(), {"ok": True})
+        self.assertEqual(alle.status_code, 200)
+        self.assertEqual(alle.json(), {"ok": True})
+        self.assertEqual(steuer_fake.koerper,
+                         [{"rid": "w1", "abort_all": False},
+                          {"rid": "", "abort_all": True}])
+        # Der Proxy-Client bleibt unberuehrt (kein /abort_request, gar nichts).
+        self.assertEqual(proxy_fake.requests, [])
+
+    def test_cancel_bleibt_ok_bei_ausgeschoepftem_proxy_pool(self):
+        # R5b: der Proxy-Client laeuft in den PoolTimeout (Live-Bug); die
+        # Cancel-Routen antworten trotzdem ok=true ueber den Steuer-Client.
+        proxy_transport = _AusgeschoepfterTransport()
+        steuer_fake = _AbortFake()
+        app = self.app(transport=proxy_transport,
+                       steuer_transport=httpx.MockTransport(steuer_fake))
+        with TestClient(app) as c:
+            reg = c.app.state.deps.registry
+            reg.register("p1", source="10.0.0.1", model="m",
+                         full_prompt="Hallo", now=1000.0)
+            reg.note_running("p1", now=1001.0)
+            antwort = c.post("/monitor/jobs/p1/cancel")
+            self.assertEqual(antwort.status_code, 200)
+            self.assertEqual(antwort.json(), {"ok": True})
+            self.assertIs(reg.get("p1").status, JobStatus.ABORTED)
+            alle = c.post("/monitor/cancel_all")
+            self.assertEqual(alle.json(), {"ok": True})
+        self.assertEqual(steuer_fake.koerper,
+                         [{"rid": "p1", "abort_all": False},
+                          {"rid": "", "abort_all": True}])
+        # Der gesaettigte Proxy-Client wurde nie kontaktiert.
+        self.assertEqual(proxy_transport.requests, [])
+
+    def test_shutdown_schliesst_auch_den_steuer_client(self):
+        # R4: die Lifespan schliesst den Steuer-Client beim Shutdown mit.
+        app = self.app(enable_background=False)
+        steuer_client = app.state.steuer_client
+        self.assertIsNot(steuer_client, app.state.deps.client)
+        self.assertFalse(steuer_client.is_closed)
+        with TestClient(app):
+            self.assertFalse(steuer_client.is_closed)
+        self.assertTrue(steuer_client.is_closed)
 
 
 class TestNonstreamLiveIntegration(AppTestCase):
