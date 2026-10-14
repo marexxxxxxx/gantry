@@ -1,19 +1,11 @@
 import { useEffect, useRef } from "react";
-import type { Job, JobStatus } from "./api";
+import type { Job } from "./api";
+import { STATUS_TEXT } from "./JobTable";
 
 export interface PreviewModalProps {
   job: Job;
   onSchliessen: () => void;
 }
-
-/** Deutsche Statustexte (wie in der Job-Tabelle). */
-const STATUS_TEXT: Record<JobStatus, string> = {
-  waiting: "wartend",
-  running: "läuft",
-  done: "fertig",
-  aborted: "abgebrochen",
-  error: "fehler",
-};
 
 /** Text oder "-" fuer leere Vorschauen. */
 function textOderStrich(text: string): string {

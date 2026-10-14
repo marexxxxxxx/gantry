@@ -8,8 +8,8 @@ export interface JobTableProps {
   onVorschau: (rid: string) => void;
 }
 
-/** Deutsche Statustexte zum Backend-Status (job_to_dict). */
-const STATUS_TEXT: Record<JobStatus, string> = {
+/** Deutsche Statustexte zum Backend-Status (job_to_dict); exportiert fuer das Vorschau-Modal. */
+export const STATUS_TEXT: Record<JobStatus, string> = {
   waiting: "wartend",
   running: "läuft",
   done: "fertig",
