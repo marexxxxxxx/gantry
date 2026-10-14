@@ -7,8 +7,8 @@ Streaming-Generators beziehungsweise der gepufferte Body.
 Der Upstream ist der Fake-SGLang aus ``fakes.py``; die meisten Faelle laufen
 ueber ``httpx.ASGITransport`` (keine Sockets). Wo echte Zeitabstaende
 geprueft werden (Keepalive, Client-Abbruch), puffert der ASGITransport die
-Antwort und taugt nicht; dort liefert ``skript_transport`` denselben
-Byte-Strom zeitgetreu.
+Antwort und taugt nicht; dort liefern ``skript_transport`` (SSE) und
+``json_transport`` (Nicht-Stream) dieselben Bytes zeitgetreu.
 """
 
 import asyncio
@@ -38,9 +38,15 @@ PING = b": ping\n\n"
 
 
 def _request(methode: str, pfad: str, body: dict | None = None, *,
-             query: str = "", client_ip: str | None = "10.0.0.5") -> Request:
-    """Baut eine Starlette-Anfrage ohne ASGI-Lauf."""
-    roh = b"" if body is None else json.dumps(body).encode("utf-8")
+             roh: bytes | None = None, query: str = "",
+             client_ip: str | None = "10.0.0.5") -> Request:
+    """Baut eine Starlette-Anfrage ohne ASGI-Lauf.
+
+    ``body`` wird zu JSON kodiert; ``roh`` ersetzt das durch exakte Bytes
+    (z. B. fuer einen Nicht-JSON-Body).
+    """
+    if roh is None:
+        roh = b"" if body is None else json.dumps(body).encode("utf-8")
     scope = {
         "type": "http",
         "http_version": "1.1",
@@ -98,6 +104,15 @@ def _chat_skript(tokens: list[str], *,
     return schritte
 
 
+def _rahmen_lesen(queue: asyncio.Queue) -> list[dict]:
+    """Alle bereitliegenden Hub-Frames als Job-Dicts (Queue wird geleert)."""
+    daten = []
+    while not queue.empty():
+        rahmen = queue.get_nowait()
+        daten.append(json.loads(rahmen.split("data: ", 1)[1]))
+    return daten
+
+
 class ProxyTestBasis(unittest.IsolatedAsyncioTestCase):
     """Gemeinsamer Aufbau: Registry, Hub und ein httpx-Client je Test."""
 
@@ -107,14 +122,16 @@ class ProxyTestBasis(unittest.IsolatedAsyncioTestCase):
         self._client: httpx.AsyncClient | None = None
 
     def deps(self, transport, *, history=None, heartbeat_s: float = 15.0,
-             connect_timeout_s: float = 5.0) -> Deps:
+             connect_timeout_s: float = 5.0,
+             nonstream_keepalive: bool = True) -> Deps:
         """Deps mit dem gegebenen Transport; der Client wird am Testende geschlossen."""
         if self._client is None:
             self._client = httpx.AsyncClient(transport=transport)
             self.addAsyncCleanup(self._client.aclose)
         return Deps(
             config=Config(heartbeat_s=heartbeat_s,
-                          connect_timeout_s=connect_timeout_s),
+                          connect_timeout_s=connect_timeout_s,
+                          nonstream_keepalive=nonstream_keepalive),
             registry=self.registry,
             hub=self.hub,
             history=history,
@@ -333,8 +350,27 @@ class TestPassthroughOhneStream(ProxyTestBasis):
         self.assertEqual(fake.pfade, ["/v1/models?x=1"])
         self.assertEqual(self.registry.snapshot(), [])
 
-    async def test_stream_false_ist_gepufferter_passthrough_ohne_job(self):
-        # Task 8 baut hier Jobs und WS-Keepalives; jetzt bleibt es getreu.
+    async def test_post_ohne_json_ist_passthrough_ohne_job(self):
+        # Ruling 9: POSTs ohne JSON-Objekt bleiben der getreue, gepufferte
+        # Passthrough ohne Job (Task 8 aendert nur den Nicht-Stream-Pfad).
+        fest = b'{"ok": true}'
+        deps = self.deps(fakes.json_transport(fest, content_type="text/plain"))
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/completions", roh=b"kein json"), deps)
+
+        self.assertNotIsInstance(antwort, StreamingResponse)
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(await _body(antwort), fest)
+        self.assertEqual(self.registry.snapshot(), [])
+
+
+class TestNichtstreamPfad(ProxyTestBasis):
+    """POST mit JSON-Body und ``stream != true``: Job, WS-Keepalives, Fehler."""
+
+    async def test_stream_false_fastpfad_mit_job(self):
+        # Antwort kommt sofort: getreuer Body, Job done mit usage; die rid
+        # des Clients geht unveraendert zum Upstream.
         fake = fakes.FakeSglang()
         deps = self.deps(httpx.ASGITransport(app=fake.app))
         body = {"model": "fake-modell", "rid": "ns-1", "stream": False,
@@ -349,8 +385,154 @@ class TestPassthroughOhneStream(ProxyTestBasis):
         daten = json.loads(antwort.body)
         self.assertEqual(daten["choices"][0]["message"]["content"],
                          "Fake-Antwort")
-        self.assertEqual(fake.anfragen, [body])         # unveraendert, ohne rid
-        self.assertEqual(self.registry.snapshot(), [])
+        self.assertEqual(fake.anfragen, [body])         # getreu, rid bleibt
+        job = self.registry.get("ns-1")
+        self.assertIs(job.status, JobStatus.DONE)
+        self.assertEqual(job.prompt_tokens, 3)
+        self.assertEqual(job.completion_tokens, 2)
+
+    async def test_nonstream_schnell_byte_identisch(self):
+        # Innerhalb des Heartbeats: exakt dieselben Bytes, kein Leerzeichen,
+        # kein Streaming, usage landet im Job.
+        roh_upstream = (b'{"choices": [{"message": {"content": "Hallo"}}],'
+                        b' "usage": {"prompt_tokens": 5, "completion_tokens": 7}}')
+        deps = self.deps(fakes.json_transport(roh_upstream))
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions",
+                     {"rid": "ns-schnell", "stream": False}),
+            deps)
+
+        self.assertNotIsInstance(antwort, StreamingResponse)
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(antwort.headers["content-type"], "application/json")
+        self.assertEqual(await _body(antwort), roh_upstream)
+        job = self.registry.get("ns-schnell")
+        self.assertIs(job.status, JobStatus.DONE)
+        self.assertEqual(job.prompt_tokens, 5)
+        self.assertEqual(job.completion_tokens, 7)
+
+    async def test_nonstream_langsam_mit_ws_keepalive(self):
+        # Der Fake rechnet 0,25 s; Heartbeat 0,1 s: der Body beginnt mit
+        # Leerzeichen, bleibt aber gueltiges JSON; Anlage und Abschluss des
+        # Jobs sind als Ereignisse publiziert (Ruling 6).
+        fake = fakes.FakeSglang(pause_nichtstream_s=0.25)
+        deps = self.deps(httpx.ASGITransport(app=fake.app), heartbeat_s=0.1)
+        queue = self.hub.subscribe()
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions",
+                     {"rid": "ns-langsam", "stream": False,
+                      "messages": [{"role": "user", "content": "Hi"}]}),
+            deps)
+
+        self.assertIsInstance(antwort, StreamingResponse)
+        self.assertTrue(
+            antwort.headers["content-type"].startswith("application/json"))
+        roh = await _body(antwort)
+
+        self.assertTrue(roh.startswith(b" "))           # WS vor dem JSON
+        daten = json.loads(roh)                         # Whitespace ist erlaubt
+        self.assertEqual(daten["choices"][0]["message"]["content"],
+                         "Fake-Antwort")
+        job = self.registry.get("ns-langsam")
+        self.assertIs(job.status, JobStatus.DONE)
+        self.assertEqual(job.prompt_tokens, 3)
+        self.assertEqual(job.completion_tokens, 2)
+
+        ereignisse = _rahmen_lesen(queue)
+        self.assertEqual(ereignisse[0]["status"], "waiting")
+        self.assertEqual(ereignisse[0]["rid"], "ns-langsam")
+        self.assertEqual(ereignisse[-1]["status"], "done")
+
+    async def test_nonstream_ohne_keepalive_keine_leerzeichen(self):
+        # Config-Schalter aus: auch eine langsame Antwort kommt ohne WS.
+        roh_upstream = b'{"choices": [{"message": {"content": "ohne WS"}}]}'
+        deps = self.deps(fakes.json_transport(roh_upstream, pause=0.15),
+                         heartbeat_s=0.05, nonstream_keepalive=False)
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions",
+                     {"rid": "ns-ohne-ws", "stream": False}),
+            deps)
+        roh = await _body(antwort)
+
+        self.assertEqual(roh, roh_upstream)             # kein Leerzeichen
+        self.assertIs(self.registry.get("ns-ohne-ws").status, JobStatus.DONE)
+
+    async def test_nonstream_upstream_400_durchgereicht(self):
+        # Upstream lehnt ab: Status und Body unveraendert, Job error mit
+        # Statustext (Ruling 5).
+        fake = fakes.FakeSglang()
+        fake.fehler = (400, b'{"error": {"message": "kaputte Anfrage"}}')
+        deps = self.deps(httpx.ASGITransport(app=fake.app))
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions",
+                     {"rid": "ns-bad", "stream": False}),
+            deps)
+
+        self.assertEqual(antwort.status_code, 400)
+        self.assertEqual(antwort.headers["content-type"], "application/json")
+        self.assertEqual(await _body(antwort),
+                         b'{"error": {"message": "kaputte Anfrage"}}')
+        job = self.registry.get("ns-bad")
+        self.assertIs(job.status, JobStatus.ERROR)
+        self.assertEqual(job.error, "upstream 400")
+
+    async def test_upstream_down_502(self):
+        # SGLang aus: 502 mit festem Fehlerkoerper, Job error, publiziert.
+        deps = self.deps(fakes.json_transport(
+            fehler=httpx.ConnectError("Verbindung abgelehnt")))
+        queue = self.hub.subscribe()
+
+        with self.assertLogs("aiserver_monitor.proxy", level="WARNING") as cm:
+            antwort = await handle_v1(
+                _request("POST", "/v1/chat/completions",
+                         {"rid": "down-1", "stream": False,
+                          "messages": [{"role": "user", "content": "Hi"}]}),
+                deps)
+
+        self.assertEqual(antwort.status_code, 502)
+        self.assertEqual(antwort.headers["content-type"], "application/json")
+        self.assertEqual(
+            antwort.body,
+            b'{"error": {"message": "sglang nicht erreichbar", '
+            b'"type": "upstream_unavailable"}}')
+        self.assertTrue(any("down-1" in zeile for zeile in cm.output))
+
+        job = self.registry.get("down-1")               # Job trotz Ausfall
+        self.assertIs(job.status, JobStatus.ERROR)
+        self.assertEqual(job.error, "ConnectError: Verbindung abgelehnt")
+        ereignisse = _rahmen_lesen(queue)
+        self.assertEqual(ereignisse[0]["status"], "waiting")
+        self.assertEqual(ereignisse[-1]["status"], "error")
+        self.assertEqual(ereignisse[-1]["error"], job.error)
+
+    async def test_nonstream_client_abbruch_job_laeuft_zu_ende(self):
+        # Client bricht ab, waehrend der Upstream noch rechnet: die Aufgabe
+        # schliesst den Job trotzdem ab (kein waiting-Zombie, Ruling 8).
+        roh_upstream = b'{"choices": [{"message": {"content": "spaet"}}]}'
+        deps = self.deps(fakes.json_transport(roh_upstream, pause=0.3),
+                         heartbeat_s=0.05)
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions",
+                     {"rid": "ns-abbruch", "stream": False}),
+            deps)
+        self.assertIsInstance(antwort, StreamingResponse)
+        self.assertEqual(await anext(antwort.body_iterator), b" ")
+        self.assertIs(self.registry.get("ns-abbruch").status, JobStatus.WAITING)
+
+        await antwort.body_iterator.aclose()            # Browser weg: Abbruch
+
+        fertig = await _warte_bis(
+            lambda: self.registry.get("ns-abbruch").status is not JobStatus.WAITING)
+        self.assertTrue(fertig, "Job blieb haengen (Zombie)")
+        job = self.registry.get("ns-abbruch")
+        self.assertIs(job.status, JobStatus.DONE)
+        self.assertIsNone(job.prompt_tokens)            # ohne usage: null, nie 0
+        self.assertIsNone(job.completion_tokens)
 
 
 class TestJobTracking(ProxyTestBasis):
@@ -448,6 +630,13 @@ class _ZaehlendeHistory:
         self._inner.record_job(job_dict)
 
 
+class _KaputteHistory:
+    """History, deren Schreiben immer wirft (Task-7-Minor: best-effort)."""
+
+    def record_job(self, job_dict: dict) -> None:
+        raise RuntimeError("DB kaputt")
+
+
 class TestHistoryAnbindung(ProxyTestBasis):
     async def test_history_wird_genau_einmal_beim_finish_geschrieben(self):
         schritte = _chat_skript(
@@ -475,6 +664,23 @@ class TestHistoryAnbindung(ProxyTestBasis):
             self.assertEqual(fenster["overview"]["done"], 1)
             self.assertEqual(fenster["overview"]["tokens_in"], 7)
             self.assertEqual(fenster["overview"]["tokens_out"], 4)
+
+    async def test_history_fehler_verschluckt_abschluss_nicht(self):
+        # Task-7-Minor: das Endereignis geht auch raus, wenn die History
+        # wirft; der Job endet trotzdem sauber (kein un-abgeholter Fehler).
+        queue = self.hub.subscribe()
+        with self.assertLogs("aiserver_monitor.proxy", level="WARNING") as cm:
+            antwort = await handle_v1(
+                _request("POST", "/v1/chat/completions",
+                         {"rid": "hist-kaputt", "stream": False}),
+                self.deps(fakes.json_transport(b'{"choices": []}'),
+                          history=_KaputteHistory()))
+            await _body(antwort)
+
+        self.assertTrue(any("History-Eintrag" in zeile for zeile in cm.output))
+        self.assertIs(self.registry.get("hist-kaputt").status, JobStatus.DONE)
+        ereignisse = _rahmen_lesen(queue)
+        self.assertEqual(ereignisse[-1]["status"], "done")
 
 
 if __name__ == "__main__":

@@ -79,10 +79,14 @@ class FakeSglang:
     POST-Anfragen, ``pfade`` die angefragten Pfade inklusive Query. Damit
     pruefen Tests Weiterleitung, Query und rid-Durchreichung. ``fehler``
     (Status, Body) laesst die POST-Routen fehlschlagen.
+    ``pause_nichtstream_s`` verzoegert die nicht-streamende JSON-Antwort
+    (Keepalive-Test des Nicht-Stream-Pfads).
     """
 
-    def __init__(self, schritte: Iterable[Schritt] = ()):
+    def __init__(self, schritte: Iterable[Schritt] = (), *,
+                 pause_nichtstream_s: float = 0.0):
         self.schritte = list(schritte)
+        self.pause_nichtstream_s = pause_nichtstream_s
         self.anfragen: list[dict] = []
         self.pfade: list[str] = []
         self.fehler: tuple[int, bytes] | None = None
@@ -133,6 +137,8 @@ class FakeSglang:
             if koerper.get("stream"):
                 return StreamingResponse(self._sse(),
                                          media_type="text/event-stream")
+            if self.pause_nichtstream_s > 0:
+                await asyncio.sleep(self.pause_nichtstream_s)
             return JSONResponse(self._antwort(koerper))
 
         @self.app.get("/health")
@@ -192,5 +198,27 @@ def skript_transport(schritte: Iterable[Schritt] = (), *,
         return httpx.Response(
             status, headers={"content-type": content_type},
             stream=SkriptStream(schritte, fehler))
+
+    return httpx.MockTransport(handler)
+
+
+def json_transport(inhalt: bytes = b"", *,
+                   content_type: str = "application/json",
+                   pause: float = 0.0,
+                   fehler: BaseException | None = None) -> httpx.MockTransport:
+    """Transport mit exakt vorgegebenem, gepuffertem JSON-Body.
+
+    Fuer den Nicht-Stream-Pfad: die Antwort kommt komplett und byte-genau
+    (``inhalt``); ``pause`` verzoegert sie (fuer die Keepalive-Schleife
+    sichtbar), ``fehler`` wirft stattdessen (z. B. ``httpx.ConnectError``,
+    wenn SGLang aus ist).
+    """
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if fehler is not None:
+            raise fehler
+        if pause > 0:
+            await asyncio.sleep(pause)
+        return httpx.Response(200, headers={"content-type": content_type},
+                              content=inhalt)
 
     return httpx.MockTransport(handler)

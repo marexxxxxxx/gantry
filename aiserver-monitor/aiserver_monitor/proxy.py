@@ -10,9 +10,11 @@ zum Client, inklusive ``[DONE]``.
 Nebenbei misst das Relay jeden Byte-Chunk (``SSEByteParser`` +
 ``summarize_chunk``): TTFT, Vorschau, Tokenzaehler und gedrosselte
 Live-Ereignisse am Hub; beim Abschluss genau ein ``history.record_job``.
-Voller Prompt und Vorschauen bleiben im RAM. Ohne ``stream=true`` (und fuer
-GET) gibt es einen getreuen, gepufferten Passthrough ohne Job; Keepalives
-und Fehlerbilder fuer diesen Pfad baut Task 8.
+Voller Prompt und Vorschauen bleiben im RAM. POSTs mit JSON-Body und
+``stream != true`` laufen ueber den Nicht-Stream-Pfad: eigener Job, je
+Heartbeat ein einzelnes Leerzeichen (WS-Keepalive, abschaltbar) und am
+Ende der komplette JSON-Body; ist der Upstream weg, kommt 502. GETs und
+POSTs ohne JSON-Objekt bleiben ein getreuer, gepufferter Passthrough.
 """
 
 import asyncio
@@ -40,6 +42,11 @@ PUBLISH_ABSTAND_S = 0.25
 
 #: Keepalive-Kommentar, wie er zwischen den Original-Bytes zum Client geht.
 _PING = format_comment("ping").encode("utf-8")
+
+#: Antwortkoerper, wenn der Upstream nicht erreichbar ist (SGLang aus).
+_BODY_NICHT_ERREICHBAR = (
+    b'{"error": {"message": "sglang nicht erreichbar", '
+    b'"type": "upstream_unavailable"}}')
 
 #: Anfrage-Kopfzeilen, die nie zum Upstream gehen: ``host`` gehoert zur
 #: Ziel-URL, Laenge und Verbindung setzen httpx und uvicorn.
@@ -172,6 +179,51 @@ def _json_koerper(roh: bytes) -> dict | None:
     return koerper if isinstance(koerper, dict) else None
 
 
+def _tokenzahl(wert: object) -> int | None:
+    """Ganzzahlige Tokenzahl oder None; bool und Fremdtypen zaehlen nicht."""
+    if isinstance(wert, bool) or not isinstance(wert, int):
+        return None
+    return wert
+
+
+def _usage_aus_json(inhalt: bytes) -> tuple[int | None, int | None]:
+    """``(prompt_tokens, completion_tokens)`` aus dem JSON-Body.
+
+    Nicht-streamende Antworten tragen die usage direkt; fehlende oder
+    fremdartige Werte bleiben None ("nicht gemessen" heisst None, nie 0).
+    """
+    koerper = _json_koerper(inhalt)
+    usage = koerper.get("usage") if koerper is not None else None
+    if not isinstance(usage, dict):
+        return None, None
+    return (_tokenzahl(usage.get("prompt_tokens")),
+            _tokenzahl(usage.get("completion_tokens")))
+
+
+def _finish_job(deps: Deps, job: Job, status: JobStatus, *,
+                error: str | None = None,
+                prompt_tokens: int | None = None,
+                completion_tokens: int | None = None) -> None:
+    """Job abschliessen: Registry, Ereignis, dann (fehlertolerant) History.
+
+    Das Abschlussereignis geht **vor** dem History-Schreiben raus, und ein
+    History-Fehler wird nur geloggt: ein DB-Problem darf den Abschluss weder
+    verschlucken noch als un-abgeholter Task-Fehler entkommen (Task-7-Minor).
+    Relay und Nicht-Stream-Pfad teilen sich diese Routine.
+    """
+    deps.registry.finish(job.rid, status, prompt_tokens=prompt_tokens,
+                         completion_tokens=completion_tokens, error=error,
+                         now=time.time())
+    daten = job_to_dict(job)
+    deps.hub.publish("job", daten)
+    if deps.history is not None:
+        try:
+            deps.history.record_job(daten)
+        except Exception:
+            logger.warning("History-Eintrag fehlgeschlagen bei rid=%s",
+                           job.rid, exc_info=True)
+
+
 class _JobTracker:
     """Verfolgt einen Streaming-Job: Parser, usage, Vorschau, Drossel.
 
@@ -232,15 +284,10 @@ class _JobTracker:
         self.close(JobStatus.DONE)
 
     def close(self, status: JobStatus, *, error: str | None = None) -> None:
-        """Job abschliessen: Registry, einmal History, dann das Ereignis."""
-        self._deps.registry.finish(
-            self.rid, status, prompt_tokens=self.prompt_tokens,
-            completion_tokens=self.completion_tokens, error=error,
-            now=time.time())
-        daten = job_to_dict(self.job)
-        if self._deps.history is not None:
-            self._deps.history.record_job(daten)
-        self._deps.hub.publish("job", daten)
+        """Job abschliessen: Registry, Ereignis, dann die History."""
+        _finish_job(self._deps, self.job, status, error=error,
+                    prompt_tokens=self.prompt_tokens,
+                    completion_tokens=self.completion_tokens)
 
     def _publish_due(self) -> None:
         """Live-Ereignis senden, aber hoechstens alle PUBLISH_ABSTAND_S."""
@@ -314,11 +361,118 @@ class _Relay:
             self._client_ab = True
 
 
+async def _hole_nichtstream(deps: Deps, job: Job, url: str,
+                            kopf: dict[str, str], inhalt: bytes
+                            ) -> httpx.Response | Exception:
+    """Upstream-POST ohne Stream; schliesst den Job immer selbst ab.
+
+    Die Aufgabe laeuft auch nach einem Client-Abbruch zu Ende und
+    hinterlaesst keinen Zombie (wie ``_Relay``). Ein Fehler wird als Wert
+    zurueckgegeben statt geworfen: findet ihn der Client-Generator nicht mehr
+    (Client weg), entsteht kein un-abgeholter Task-Fehler. Der Job ist fertig,
+    wenn die Aufgabe endet: ``done`` mit usage aus dem JSON-Body, sonst
+    ``error`` mit Statustext bzw. Meldung. Ohne Chunks gibt es kein erstes
+    Token: der Job springt von ``waiting`` auf ``done``/``error`` (TTFT
+    bleibt None, "nicht gemessen").
+    """
+    try:
+        antwort = await deps.client.request(
+            "POST", url, headers=kopf, content=inhalt,
+            timeout=_timeout(deps.config))
+    except Exception as exc:
+        logger.warning("Upstream-Fehler bei rid=%s: %s: %s",
+                       job.rid, type(exc).__name__, exc)
+        _finish_job(deps, job, JobStatus.ERROR,
+                    error=f"{type(exc).__name__}: {exc}")
+        return exc
+    if antwort.status_code >= 400:
+        _finish_job(deps, job, JobStatus.ERROR,
+                    error=f"upstream {antwort.status_code}")
+    else:
+        prompt_tokens, completion_tokens = _usage_aus_json(antwort.content)
+        _finish_job(deps, job, JobStatus.DONE,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens)
+    return antwort
+
+
+async def _nichtstream_langsam(deps: Deps,
+                               aufgabe: asyncio.Task) -> AsyncIterator[bytes]:
+    """Client-Seite des Nicht-Stream-Pfads: WS-Keepalives, dann der Body.
+
+    Je Heartbeat ohne Upstream-Antwort geht ein einzelnes Leerzeichen raus
+    (nur wenn ``config.nonstream_keepalive``); der komplette JSON-Body folgt,
+    sobald die Aufgabe fertig ist. Den Job schliesst die Aufgabe ab, nicht
+    dieser Generator: ein Client-Abbruch laesst sie unberuehrt weiterlaufen.
+    """
+    while True:
+        fertig, _ = await asyncio.wait({aufgabe},
+                                       timeout=deps.config.heartbeat_s)
+        if fertig:
+            break
+        if deps.config.nonstream_keepalive:
+            yield b" "
+    ergebnis = aufgabe.result()
+    if isinstance(ergebnis, Exception):
+        return                       # Fehler: Log und Job macht die Aufgabe
+    yield ergebnis.content
+
+
+async def _nichtstream(request: Request, deps: Deps, koerper: dict) -> Response:
+    """POST mit JSON-Body und ``stream != true``: Job plus WS-Keepalives.
+
+    Der Job entsteht **vor** dem Upstream-Aufruf und wird sofort publiziert,
+    damit das Dashboard wartende Anfragen sieht; fehlt die rid, kommt eine
+    neue in den Body (wie im Relay, fuer Registry und /abort_request). Ist
+    die Antwort innerhalb eines Heartbeats da, geht sie byte-identisch und
+    ohne Leerzeichen durch (kein Streaming); sonst liefert der Generator
+    Leerzeichen vor dem kompletten JSON-Body. Nur ein Verbindungsfehler vor
+    dem Antwortstart ergibt 502; spaeter erkannte Fehler stehen nur noch im
+    Log und im Job (der Status 200 ist dann schon beim Client).
+    """
+    rid = ensure_rid(koerper)
+    model = koerper.get("model")
+    job = deps.registry.register(
+        rid,
+        source=_client_source(request),
+        model=model if isinstance(model, str) else "",
+        full_prompt=_extract_full_prompt(koerper),
+        now=time.time(),
+    )
+    deps.hub.publish("job", job_to_dict(job))
+
+    kopf = _upstream_headers(request)
+    kopf["content-type"] = "application/json"
+    aufgabe = asyncio.create_task(
+        _hole_nichtstream(
+            deps, job, _upstream_url(request, deps.config), kopf,
+            json.dumps(koerper, ensure_ascii=False).encode("utf-8")),
+        name=f"nichtstream-{rid}")
+
+    fertig, _ = await asyncio.wait({aufgabe},
+                                   timeout=deps.config.heartbeat_s)
+    if not fertig:
+        return StreamingResponse(_nichtstream_langsam(deps, aufgabe),
+                                 media_type="application/json")
+    ergebnis = aufgabe.result()
+    if isinstance(ergebnis, httpx.TransportError):
+        return Response(_BODY_NICHT_ERREICHBAR, status_code=502,
+                        media_type="application/json")
+    if isinstance(ergebnis, Exception):
+        # Kein Netzproblem, sondern ein unerwarteter Fehler: der Job ist
+        # bereits error, der Bug soll aber sichtbar bleiben (500) statt als
+        # irrefuehrendes "sglang nicht erreichbar" zu verschwinden.
+        raise ergebnis
+    return Response(ergebnis.content, status_code=ergebnis.status_code,
+                    headers=_response_headers(ergebnis))
+
+
 async def _passthrough(request: Request, deps: Deps, roh: bytes) -> Response:
-    """Getreuer, gepufferter Passthrough (GET ohne Body, ohne ``stream=true``).
+    """Getreuer, gepufferter Passthrough fuer GET und Nicht-JSON-POSTs.
 
     Status und Body kommen unveraendert zurueck, ohne Job und ohne
-    Keepalives; Job-Tracking und Fehlerbilder fuer diesen Pfad baut Task 8.
+    Keepalives; die getrackten Pfade (SSE-Relay, Nicht-Stream mit Jobs)
+    liegen daneben.
     """
     antwort = await deps.client.request(
         request.method,
@@ -334,17 +488,21 @@ async def _passthrough(request: Request, deps: Deps, roh: bytes) -> Response:
 async def handle_v1(request: Request, deps: Deps) -> Response:
     """Bedient jede ``/v1/*``-Anfrage des Gateways.
 
-    GET ohne Body und POSTs ohne ``stream=true`` sind ein gepufferter
-    Passthrough. ``stream=true`` laeuft ueber das Relay: erst die Kopfzeile
-    des Upstreams pruefen (Status >= 400 kommt unveraendert zurueck, ohne
-    SSE und ohne Job), dann Job anlegen und streamen. Der Job wird erst nach
-    der Kopfzeile angelegt; so hinterlaesst keine abgelehnte Anfrage eine
+    GET ohne Body und POSTs ohne JSON-Objekt sind ein gepufferter
+    Passthrough ohne Job. JSON-POSTs ohne ``stream=true`` laufen ueber den
+    Nicht-Stream-Pfad (Job, WS-Keepalives, 502 bei Verbindungsfehler).
+    ``stream=true`` laeuft ueber das Relay: erst die Kopfzeile des Upstreams
+    pruefen (Status >= 400 kommt unveraendert zurueck, ohne SSE und ohne
+    Job), dann Job anlegen und streamen. Der Job wird erst nach der
+    Kopfzeile angelegt; so hinterlaesst keine abgelehnte Anfrage eine
     Zeile in der Registry.
     """
     roh = await request.body()
     koerper = _json_koerper(roh) if request.method == "POST" else None
-    if koerper is None or koerper.get("stream") is not True:
+    if koerper is None:
         return await _passthrough(request, deps, roh)
+    if koerper.get("stream") is not True:
+        return await _nichtstream(request, deps, koerper)
 
     rid = ensure_rid(koerper)
     kopf = _upstream_headers(request)
