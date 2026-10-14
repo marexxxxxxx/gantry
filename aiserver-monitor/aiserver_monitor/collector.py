@@ -29,6 +29,19 @@ logger = logging.getLogger(__name__)
 #: Sammelschleife nicht blockieren. Bewusst kein Config-Feld.
 _HTTP_TIMEOUT_S = 5.0
 
+#: Zeitlimit des nvidia-smi-Aufrufs: ein haengendes Kommando darf den
+#: Messdurchlauf nicht blockieren; danach wird es beendet (best effort).
+_GPU_TIMEOUT_S = 5.0
+
+#: Wartezeit nach dem Kill, damit der Prozess eingesammelt wird. Laeuft sie
+#: ab (z. B. haelt ein Wrapper-Skript einen Enkelprozess), kehrt der
+#: Messdurchlauf trotzdem zurueck; der Child-Watcher raeumt spaeter auf.
+_GPU_KILL_WARTEZEIT_S = 1.0
+
+#: Abstand der periodischen Retention in ``run()``: haeufiger als stuendlich
+#: bringt nichts (Stichtage sind Tage) und wuerde nur Last erzeugen.
+_CLEANUP_ABSTAND_S = 3600.0
+
 #: Argumente der nvidia-smi-Abfrage: Auslastung, VRAM belegt und gesamt.
 _GPU_ARGUMENTE = (
     "--query-gpu=utilization.gpu,memory.used,memory.total",
@@ -49,7 +62,21 @@ async def _nvidia_smi_lesen(config: Config) -> GpuSample:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await prozess.communicate()
+        stdout, _ = await asyncio.wait_for(prozess.communicate(),
+                                           timeout=_GPU_TIMEOUT_S)
+    except TimeoutError:
+        logger.warning("nvidia-smi-Timeout nach %.1f s", _GPU_TIMEOUT_S)
+        try:
+            prozess.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(prozess.wait(),
+                                   timeout=_GPU_KILL_WARTEZEIT_S)
+        except TimeoutError:
+            logger.warning("nvidia-smi-Prozess %s nicht eingesammelt",
+                           prozess.pid)
+        return GpuSample(None, None, None)
     except Exception as exc:
         logger.warning("nvidia-smi-Aufruf fehlgeschlagen: %s: %s",
                        type(exc).__name__, exc)
@@ -129,13 +156,25 @@ class Collector:
     async def run(self) -> None:
         """Endlosschleife: sofort messen, dann je ``poll_interval_s``.
 
-        Ein Fehler in einem Durchlauf wird geloggt und beendet die Schleife
-        nicht; ``asyncio.CancelledError`` (App-Shutdown) laeuft bewusst nach
-        oben durch.
+        Zusaetzlich laeuft die Retention: hoechstens alle
+        ``_CLEANUP_ABSTAND_S`` raeumt ``history.cleanup`` (nur mit History)
+        alte Jobs und Samples weg; die geloeschten Zeilen stehen im Log
+        (INFO). Ein Fehler in einem Durchlauf (Messen oder Aufraeumen) wird
+        geloggt und beendet die Schleife nicht; ``asyncio.CancelledError``
+        (App-Shutdown) laeuft bewusst nach oben durch.
         """
+        letzter_cleanup = time.monotonic()
         while True:
             try:
                 await self.sample_once()
+                jetzt = time.monotonic()
+                if (self._deps.history is not None
+                        and jetzt - letzter_cleanup >= _CLEANUP_ABSTAND_S):
+                    jobs_weg, samples_weg = self._deps.history.cleanup(
+                        time.time())
+                    letzter_cleanup = jetzt
+                    logger.info("Retention: %s Jobs und %s Samples geloescht",
+                                jobs_weg, samples_weg)
             except Exception:
                 logger.warning("Messdurchlauf fehlgeschlagen", exc_info=True)
             await asyncio.sleep(self._deps.config.poll_interval_s)

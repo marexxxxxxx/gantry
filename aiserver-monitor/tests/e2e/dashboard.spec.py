@@ -172,7 +172,7 @@ def szenario_1_live(page: Page) -> None:
         raise AssertionError(
             f"e2e-langsam startete nicht wartend, sondern {erster_status!r}")
     expect(job_zeile(page, "e2e-langsam").get_by_test_id("job-status")
-           ).to_contain_text("läuft", timeout=DEADLINE_MS)
+           ).to_contain_text("l\u00e4uft", timeout=DEADLINE_MS)
 
     # Queue-Kennzahlen aus dem letzten Sample (Fake: 3 laufend, 1 wartend).
     laufend, wartend = queue_werte(page)
@@ -240,7 +240,7 @@ def szenario_3_warteschlange(page: Page) -> None:
     # Danach sind beide Zeilen gelaufen oder fertig (kein Haenger).
     for rid in ("e2e-queue-1", "e2e-queue-2"):
         expect(job_zeile(page, rid).get_by_test_id("job-status")
-               ).to_contain_text(re.compile("läuft|fertig"), timeout=DEADLINE_MS)
+               ).to_contain_text(re.compile("l\u00e4uft|fertig"), timeout=DEADLINE_MS)
 
 
 def szenario_4_notaus(page: Page) -> None:
@@ -313,7 +313,7 @@ def szenario_6_reconnect(page: Page) -> None:
     zeile = job_zeile(page, "e2e-nach-reconnect-langsam")
     expect(zeile).to_be_visible(timeout=DEADLINE_MS)
     expect(zeile.get_by_test_id("job-status")).to_contain_text(
-        "läuft", timeout=DEADLINE_MS)
+        "l\u00e4uft", timeout=DEADLINE_MS)
 
     # Aufraeumen: der neue Job laesst sich auch nach dem Reconnect abbrechen.
     zeile.get_by_test_id("job-cancel").click()

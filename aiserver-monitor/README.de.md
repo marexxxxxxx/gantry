@@ -61,6 +61,22 @@ Der Einstiegspunkt liest `AISERVER_MONITOR_CONFIG` (Pfad zu einer
 TOML-Datei, optional), schreibt ein rotierendes Log nach `log_path` (5 MB
 pro Datei, 3 Backups) und beantwortet `/healthz` als Lebenszeichen.
 
+## Dashboard-Build (Webapp)
+
+Das Dashboard ist eine Vite/React-App in `webapp/`; der Build wird nicht
+eingecheckt. Ohne ihn liefert das Gateway eine kleine Platzhalterseite aus.
+Einmal bauen (und nach jeder Webapp-Änderung erneut):
+
+```bash
+cd webapp
+npm install
+npm run build
+```
+
+Voraussetzung ist Node 22+. Der Build landet in `aiserver_monitor/static/`,
+das gitignored ist und nicht eingecheckt werden darf. `tests/e2e/run_e2e.sh`
+führt den Build vor den Browser-Szenarien automatisch aus.
+
 ## systemd (User-Unit)
 
 `systemd/aiserver-monitor.service` ist eine User-Unit:

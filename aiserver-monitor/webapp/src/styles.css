@@ -366,6 +366,18 @@ body {
   white-space: normal;
 }
 
+/* Fehlertext je Job: gekuerzt, voll im title-Attribut. */
+.job-fehler {
+  display: block;
+  margin-top: 0.25rem;
+  max-width: 14rem;
+  overflow: hidden;
+  color: var(--farbe-rot);
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .leer-zelle {
   padding: 1rem 0.5rem;
   color: var(--farbe-text-gedimmt);
@@ -402,6 +414,16 @@ body {
 
 .meldung-fehler {
   color: var(--farbe-rot);
+}
+
+/* --- Offline-Banner (SGLang nicht erreichbar) --- */
+
+.offline-hinweis {
+  padding: 0.5rem 1rem;
+  background: rgba(248, 81, 73, 0.12);
+  border-bottom: 1px solid var(--farbe-rot);
+  color: var(--farbe-rot);
+  font-size: 0.85rem;
 }
 
 /* --- Vorschau-Modal --- */
@@ -453,6 +475,14 @@ body {
 .modal-rid {
   color: var(--farbe-text-gedimmt);
   font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+/* Fehlerzeile des Jobs im Modal. */
+.modal-fehler {
+  margin: 0;
+  color: var(--farbe-rot);
+  font-size: 0.85rem;
   overflow-wrap: anywhere;
 }
 

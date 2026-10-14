@@ -1,6 +1,12 @@
 import unittest
 
-from aiserver_monitor.jobs import JobRegistry, JobStatus, TextRing, job_to_dict
+from aiserver_monitor.jobs import (
+    MAX_BEENDETE_JOBS,
+    JobRegistry,
+    JobStatus,
+    TextRing,
+    job_to_dict,
+)
 
 
 class TestTextRing(unittest.TestCase):
@@ -162,6 +168,39 @@ class TestJobRegistry(unittest.TestCase):
         d = job_to_dict(reg.get("i9"))
         self.assertEqual((d["status"], d["error"]), ("error", "upstream weg"))
         self.assertEqual(d["duration_ms"], 1000.0)
+
+    def test_register_prunt_alte_beendete_jobs(self):
+        # Mehr als MAX_BEENDETE_JOBS abgeschlossene Jobs: nur die neuesten
+        # bleiben; der alte aktive Job wird nie entfernt.
+        self.assertEqual(MAX_BEENDETE_JOBS, 200)
+        reg = JobRegistry(preview_max_chars=5)
+        reg.register("alt-aktiv", source="s", model="m", full_prompt="p",
+                     now=0.0)                           # aeltester Eintrag
+        for n in range(1, 206):
+            reg.register(f"job-{n}", source="s", model="m", full_prompt="p",
+                         now=float(n))
+            reg.finish(f"job-{n}", JobStatus.DONE, now=float(n) + 0.5)
+        # Noch ein Job: die Prune laeuft in register() und zieht das Limit
+        # strikt ein (nach dem letzten finish lag der Zaehler bei 201).
+        reg.register("aktiv-2", source="s", model="m", full_prompt="p",
+                     now=1000.0)
+
+        beendete = [d for d in reg.snapshot()
+                    if d["status"] not in ("waiting", "running")]
+        self.assertEqual(len(beendete), MAX_BEENDETE_JOBS)
+        self.assertIsNone(reg.get("job-1"))             # aelteste sind weg
+        self.assertIsNone(reg.get("job-5"))
+        self.assertIsNotNone(reg.get("job-6"))
+        self.assertIsNotNone(reg.get("job-205"))
+        self.assertIsNotNone(reg.get("alt-aktiv"))      # aktiv bleibt
+        self.assertIs(reg.get("alt-aktiv").status, JobStatus.WAITING)
+
+    def test_aktive_jobs_zaehlen_nicht_gegen_das_limit(self):
+        reg = JobRegistry(preview_max_chars=5)
+        for n in range(250):                            # viele aktive Jobs
+            reg.register(f"aktiv-{n}", source="s", model="m",
+                         full_prompt="p", now=float(n))
+        self.assertEqual(len(reg.snapshot()), 250)      # nichts geprunnt
 
 
 if __name__ == "__main__":

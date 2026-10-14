@@ -32,6 +32,20 @@ class Config:
     gpu_cmd: str = "nvidia-smi"
     connect_timeout_s: float = 10.0
 
+    def __post_init__(self) -> None:
+        """Weist nicht-positive Intervalle ab (sie waeren Busy-Loops).
+
+        ``heartbeat_s`` taktet die Keepalive- und Nicht-Stream-Schleife,
+        ``poll_interval_s`` die Sammelschleife; 0 oder negativ wuerde beide
+        ohne Pause drehen. Deshalb ValueError statt stiller Uebernahme.
+        """
+        if self.heartbeat_s <= 0:
+            raise ValueError(
+                f"heartbeat_s muss positiv sein: {self.heartbeat_s}")
+        if self.poll_interval_s <= 0:
+            raise ValueError(
+                f"poll_interval_s muss positiv sein: {self.poll_interval_s}")
+
 
 def _coerce(feld: str, typ: Any, wert: Any) -> Any:
     """Wandelt einen Rohwert (env-String oder TOML-Wert) in den Feldtyp um."""

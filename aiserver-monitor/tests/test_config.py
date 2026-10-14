@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 
-from aiserver_monitor.config import load_config
+from aiserver_monitor.config import Config, load_config
 
 
 class TestLoadConfig(unittest.TestCase):
@@ -54,6 +54,24 @@ class TestLoadConfig(unittest.TestCase):
             path = os.path.join(tmp, "gibt-es-nicht.toml")
             with self.assertRaises(FileNotFoundError):
                 load_config(path=path, env={})
+
+    def test_nicht_positive_intervalle_werden_abgewiesen(self):
+        # 0 oder negativ wuerde die Keepalive- und Sammelschleife zum
+        # Busy-Loop machen; load_config (und damit jede Quelle) wirft.
+        for feld in ("heartbeat_s", "poll_interval_s"):
+            for wert in ("0", "-1", "-0.5"):
+                with self.subTest(feld=feld, wert=wert):
+                    with self.assertRaisesRegex(ValueError, feld):
+                        load_config(env={
+                            f"AISERVER_MONITOR_{feld.upper()}": wert})
+
+    def test_post_init_wirft_direkt(self):
+        # Auch ohne load_config: eine direkt gebaute Config ist nie ein
+        # Busy-Loop.
+        with self.assertRaisesRegex(ValueError, "heartbeat_s"):
+            Config(heartbeat_s=0.0)
+        with self.assertRaisesRegex(ValueError, "poll_interval_s"):
+            Config(poll_interval_s=-1.0)
 
 
 if __name__ == "__main__":

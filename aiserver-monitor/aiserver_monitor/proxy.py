@@ -13,8 +13,13 @@ Live-Ereignisse am Hub; beim Abschluss genau ein ``history.record_job``.
 Voller Prompt und Vorschauen bleiben im RAM. POSTs mit JSON-Body und
 ``stream != true`` laufen ueber den Nicht-Stream-Pfad: eigener Job, je
 Heartbeat ein einzelnes Leerzeichen (WS-Keepalive, abschaltbar) und am
-Ende der komplette JSON-Body; ist der Upstream weg, kommt 502. GETs und
-POSTs ohne JSON-Objekt bleiben ein getreuer, gepufferter Passthrough.
+Ende der komplette JSON-Body; ist der Upstream weg, kommt 502. Faellt der
+Upstream erst nach dem Antwortstart aus, folgt der 502-Koerper als JSON
+hinter den Leerzeichen ("spaeter" Transportfehler). GETs und POSTs ohne
+JSON-Objekt bleiben ein getreuer, gepufferter Passthrough. Anfragen mit
+Punkt-Segmenten im Pfad (``.``/``..``) werden vor jedem Upstream-Kontakt
+mit 404 abgewiesen: httpx wuerde sie normalisieren und damit SGLang-Admin-
+Routen am Job-Tracking vorbei erreichbar machen.
 """
 
 import asyncio
@@ -47,6 +52,11 @@ _PING = format_comment("ping").encode("utf-8")
 _BODY_NICHT_ERREICHBAR = (
     b'{"error": {"message": "sglang nicht erreichbar", '
     b'"type": "upstream_unavailable"}}')
+
+#: Antwortkoerper auf Pfade mit Punkt-Segmenten (Traversal-Versuch).
+_BODY_UNGUELTIGER_PFAD = (
+    b'{"error": {"message": "ungueltiger Pfad", '
+    b'"type": "invalid_path"}}')
 
 #: Anfrage-Kopfzeilen, die nie zum Upstream gehen: ``host`` gehoert zur
 #: Ziel-URL, Laenge und Verbindung setzen httpx und uvicorn.
@@ -138,6 +148,17 @@ def _client_source(request: Request) -> str:
     if client is not None and client.host:
         return client.host
     return "unbekannt"
+
+
+def _pfad_mit_punktsegment(pfad: str) -> bool:
+    """True, wenn ein Pfadsegment genau ``.`` oder ``..`` ist.
+
+    httpx normalisiert solche Segmente beim Bau der Upstream-URL:
+    ``/v1/../get_server_info`` wuerde beim Upstream als
+    ``/get_server_info`` ankommen und damit SGLang-Admin-Routen ungeschuetzt
+    erreichbar machen. Solche Anfragen enden vor jedem Upstream-Kontakt.
+    """
+    return any(segment in (".", "..") for segment in pfad.split("/"))
 
 
 def _upstream_url(request: Request, config: Config) -> str:
@@ -404,6 +425,9 @@ async def _nichtstream_langsam(deps: Deps,
     (nur wenn ``config.nonstream_keepalive``); der komplette JSON-Body folgt,
     sobald die Aufgabe fertig ist. Den Job schliesst die Aufgabe ab, nicht
     dieser Generator: ein Client-Abbruch laesst sie unberuehrt weiterlaufen.
+    Scheitert die Aufgabe erst nach dem Antwortstart (spaeter
+    Transportfehler), folgt der 502-Koerper hinter den Leerzeichen: so
+    bleibt der Gesamtbody parsebares JSON statt "Leerzeichen und nichts".
     """
     while True:
         fertig, _ = await asyncio.wait({aufgabe},
@@ -413,6 +437,9 @@ async def _nichtstream_langsam(deps: Deps,
         if deps.config.nonstream_keepalive:
             yield b" "
     ergebnis = aufgabe.result()
+    if isinstance(ergebnis, httpx.TransportError):
+        yield _BODY_NICHT_ERREICHBAR
+        return
     if isinstance(ergebnis, Exception):
         return                       # Fehler: Log und Job macht die Aufgabe
     yield ergebnis.content
@@ -495,8 +522,11 @@ async def handle_v1(request: Request, deps: Deps) -> Response:
     pruefen (Status >= 400 kommt unveraendert zurueck, ohne SSE und ohne
     Job), dann Job anlegen und streamen. Der Job wird erst nach der
     Kopfzeile angelegt; so hinterlaesst keine abgelehnte Anfrage eine
-    Zeile in der Registry.
+    Zeile in der Registry. Pfade mit Punkt-Segmenten enden sofort mit 404.
     """
+    if _pfad_mit_punktsegment(request.url.path):
+        return Response(_BODY_UNGUELTIGER_PFAD, status_code=404,
+                        media_type="application/json")
     roh = await request.body()
     koerper = _json_koerper(roh) if request.method == "POST" else None
     if koerper is None:
@@ -531,6 +561,7 @@ async def handle_v1(request: Request, deps: Deps) -> Response:
         full_prompt=_extract_full_prompt(koerper),
         now=time.time(),
     )
+    deps.hub.publish("job", job_to_dict(job))
     relay = _Relay(antwort, _JobTracker(deps, job),
                    heartbeat_s=deps.config.heartbeat_s)
     relay.start()

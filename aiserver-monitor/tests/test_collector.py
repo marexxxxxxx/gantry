@@ -10,11 +10,13 @@ Ersatzbefehl (kleines Shell-Skript), ebenfalls kein nvidia-smi.
 
 import asyncio
 import json
+import sqlite3
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import httpx
 
@@ -22,6 +24,7 @@ import fakes
 from aiserver_monitor.collector import Collector
 from aiserver_monitor.config import Config
 from aiserver_monitor.events import EventHub
+from aiserver_monitor.history import History
 from aiserver_monitor.jobs import JobRegistry
 from aiserver_monitor.metrics_parse import GpuSample
 from aiserver_monitor.proxy import Deps
@@ -279,6 +282,38 @@ class TestStandardGpuReader(CollectorTestBasis):
         for key in ("gpu_util", "vram_used_mb", "vram_total_mb"):
             self.assertNotIn(key, sample)
 
+    async def test_haengendes_kommando_ergibt_timeout_und_none_werte(self):
+        """Ein haengendes gpu_cmd wird nach _GPU_TIMEOUT_S beendet.
+
+        Das Wrapper-Skript macht per ``exec`` direkt ``sleep`` (wie
+        ``nvidia-smi`` selbst, kein Enkelprozess); das Limit wird klein
+        gepatcht. Der Messdurchlauf wartet die 5 s nicht ab, die GPU-Werte
+        bleiben None und der Upstream-Teil ist heil.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            skript = Path(tmp) / "haengt"
+            skript.write_text("#!/bin/sh\nexec sleep 5\n")
+            skript.chmod(0o755)
+            config = Config(upstream_base="http://upstream.test/",
+                            gpu_cmd=str(skript))
+            collector = Collector(self.deps(
+                httpx.ASGITransport(app=fakes.FakeSglang().app),
+                config=config))
+
+            with mock.patch("aiserver_monitor.collector._GPU_TIMEOUT_S", 0.2):
+                start = time.monotonic()
+                with self.assertLogs("aiserver_monitor.collector",
+                                     level="WARNING") as logs:
+                    sample = await collector.sample_once()
+                dauer = time.monotonic() - start
+
+        self.assertLess(dauer, 3.0)                     # nicht die 5 s
+        self.assertTrue(any("Timeout" in zeile for zeile in logs.output))
+        self.assertIs(sample["available"], True)
+        self.assertEqual(sample["running"], 3)
+        for key in ("gpu_util", "vram_used_mb", "vram_total_mb"):
+            self.assertNotIn(key, sample)
+
 
 class TestRunLoop(CollectorTestBasis):
     async def test_erster_durchlauf_sofort_und_cancel_kommt_heraus(self):
@@ -338,6 +373,62 @@ class TestRunLoop(CollectorTestBasis):
         self.assertEqual(self.history.samples[0]["gpu_util"], 5)
         self.assertEqual([payload for _, payload in _frames(self.queue)],
                          self.history.samples)
+
+    async def test_periodischer_cleanup_loescht_alte_zeilen(self):
+        """run() raeumt die Retention im Betrieb auf, nicht nur beim Start.
+
+        Echte temp-SQLite mit altem Job und altem Sample; das Intervall wird
+        klein gepatcht. Danach: alte Zeilen weg, Schleife laeuft und laesst
+        sich abbrechen.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            pfad = Path(tmp) / "monitor.db"
+            hist = History(pfad, retention_jobs_days=1,
+                           retention_series_days=1)
+            hist.init()
+            self.addCleanup(hist.close)
+            alt = time.time() - 10 * 86400
+            hist.record_job({
+                "rid": "alt", "source": "s", "model": "m", "prompt_start": "p",
+                "status": "done", "created_at_ms": int(alt * 1000)})
+            hist.record_sample({"ts": alt, "available": True})
+
+            def alte_zeilen_weg() -> bool:
+                conn = sqlite3.connect(pfad)
+                try:
+                    jobs = conn.execute(
+                        "SELECT COUNT(*) FROM jobs WHERE rid = 'alt'"
+                    ).fetchone()[0]
+                    samples = conn.execute(
+                        "SELECT COUNT(*) FROM samples WHERE ts = ?",
+                        (alt,)).fetchone()[0]
+                finally:
+                    conn.close()
+                return jobs == 0 and samples == 0
+
+            deps = self.deps(
+                httpx.ASGITransport(app=fakes.FakeSglang().app),
+                config=Config(upstream_base="http://upstream.test/",
+                              poll_interval_s=0.01))
+            deps.history = hist
+            collector = Collector(deps, gpu_reader=_FakeGpuReader())
+
+            with mock.patch(
+                    "aiserver_monitor.collector._CLEANUP_ABSTAND_S", 0.05):
+                aufgabe = asyncio.create_task(collector.run())
+                try:
+                    erreicht = await _warte_bis(alte_zeilen_weg, timeout_s=2.0)
+                    self.assertTrue(
+                        erreicht, "Cleanup loeschte die alten Zeilen nicht")
+                    self.assertFalse(aufgabe.done())
+                finally:
+                    aufgabe.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await aufgabe
+
+            self.assertTrue(aufgabe.cancelled())
+            # Die neuen Samples des laufenden Betriebs bleiben in der DB.
+            self.assertIsNotNone(hist.last_sample())
 
 
 if __name__ == "__main__":

@@ -77,6 +77,14 @@ class TestParseNvidiaSmi(unittest.TestCase):
         self.assertEqual(sample, GpuSample(12, None, 16384))
         self.assertIsNone(sample.vram_used_mb)
 
+    def test_unendliches_feld_wird_none(self):
+        # "inf" ist mit float lesbar, aber int(float("inf")) wirft
+        # OverflowError; das Feld bleibt None statt die Zeile zu sprengen.
+        self.assertEqual(parse_nvidia_smi("inf, 12, 34\n"),
+                         GpuSample(None, 12, 34))
+        self.assertEqual(parse_nvidia_smi("-inf, 12, 34\n"),
+                         GpuSample(None, 12, 34))
+
     def test_leere_oder_falsche_ausgabe(self):
         self.assertEqual(parse_nvidia_smi(""), GpuSample(None, None, None))
         self.assertEqual(parse_nvidia_smi("1, 2\n"), GpuSample(None, None, None))

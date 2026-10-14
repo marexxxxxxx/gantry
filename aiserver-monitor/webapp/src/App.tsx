@@ -50,6 +50,26 @@ function istAktiv(job: Job): boolean {
   return job.status === "waiting" || job.status === "running";
 }
 
+/**
+ * Banner, solange der letzte Messwert SGLang als nicht erreichbar meldet
+ * (``available === false``). Ohne Sample (noch nie gemessen) bleibt es aus.
+ * Eigene Komponente, damit sie sich isoliert rendern laesst.
+ */
+export function OfflineHinweis({ sample }: { sample: Sample | null }) {
+  if (sample === null || sample.available) {
+    return null;
+  }
+  return (
+    <div
+      className="offline-hinweis"
+      role="status"
+      data-testid="offline-hinweis"
+    >
+      SGLang ist nicht erreichbar — die Messwerte fehlen.
+    </div>
+  );
+}
+
 /** Aktive zuerst, innerhalb der Gruppen created_at_ms absteigend (neueste oben). */
 function sortiereJobs(jobs: Job[]): Job[] {
   return [...jobs].sort((a, b) => {
@@ -240,6 +260,7 @@ export default function App() {
           </span>
         )}
       </header>
+      <OfflineHinweis sample={letztesSample} />
       <main className="inhalt">
         {tab === "live" ? (
           <LiveView

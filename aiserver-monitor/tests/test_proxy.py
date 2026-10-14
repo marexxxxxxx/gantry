@@ -161,6 +161,26 @@ class TestEnsureRid(unittest.TestCase):
 
 
 class TestStreamRelay(ProxyTestBasis):
+    async def test_job_wird_sofort_als_waiting_publiziert(self):
+        # Register-Publizierung wie im Nicht-Stream-Pfad: wartende Stream-Jobs
+        # stehen sofort im Hub, nicht erst mit dem ersten Token.
+        schritte = [(0.3, fakes.chat_chunk({"content": "spaet"})),
+                    (0.0, fakes.chat_chunk({}, finish_reason="stop")),
+                    (0.0, fakes.DONE)]
+        deps = self.deps(fakes.skript_transport(schritte), heartbeat_s=0.05)
+        queue = self.hub.subscribe()
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions",
+                     {"rid": "warten-1", "stream": True}),
+            deps)
+        ereignisse = _rahmen_lesen(queue)
+        self.assertEqual(ereignisse[0]["status"], "waiting")
+        self.assertEqual(ereignisse[0]["rid"], "warten-1")
+
+        await _body(antwort)
+        self.assertIs(self.registry.get("warten-1").status, JobStatus.DONE)
+
     async def test_stream_relay_bytes_identisch(self):
         schritte = _chat_skript(
             ["Hallo", " Welt"],
@@ -336,6 +356,36 @@ class TestStreamRelay(ProxyTestBasis):
         self.assertEqual(job_to_dict(job)["completion_tokens"], 1)
 
 
+class TestPfadschutz(ProxyTestBasis):
+    """Punkt-Segmente im Pfad enden mit 404, bevor der Upstream kontaktiert wird.
+
+    httpx normalisiert ``..`` beim Bau der Upstream-URL; ohne die Sperre
+    waere ``/v1/../get_server_info`` beim Upstream ``/get_server_info`` und
+    damit eine ungeschuetzte SGLang-Admin-Route.
+    """
+
+    async def test_punktsegmente_ergeben_404_ohne_upstream_kontakt(self):
+        pfade: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            pfade.append(str(request.url))
+            return httpx.Response(200, json={})
+
+        deps = self.deps(httpx.MockTransport(handler))
+        faelle = (
+            ("POST", "/v1/../get_server_info", {"stream": True}),
+            ("GET", "/v1/../get_server_info", None),
+            ("POST", "/v1/a/../b", {"stream": False}),
+        )
+        for methode, pfad, body in faelle:
+            with self.subTest(methode=methode, pfad=pfad):
+                antwort = await handle_v1(_request(methode, pfad, body), deps)
+                self.assertEqual(antwort.status_code, 404)
+
+        self.assertEqual(pfade, [])                     # kein Upstream-Kontakt
+        self.assertEqual(self.registry.snapshot(), [])
+
+
 class TestPassthroughOhneStream(ProxyTestBasis):
     async def test_get_ist_passthrough_ohne_job(self):
         fake = fakes.FakeSglang()
@@ -509,6 +559,33 @@ class TestNichtstreamPfad(ProxyTestBasis):
         self.assertEqual(ereignisse[-1]["status"], "error")
         self.assertEqual(ereignisse[-1]["error"], job.error)
 
+    async def test_nonstream_spaeter_transportfehler_liefert_fehlerkoerper(self):
+        # Transportfehler erst nach dem Heartbeat (Status 200 ist schon
+        # draussen): nach den Keepalive-Leerzeichen kommt der 502-Koerper,
+        # der Gesamtbody bleibt parsebares JSON; der Job endet als error.
+        deps = self.deps(
+            fakes.json_transport(
+                pause=0.25, fehler=httpx.ReadError("spaet weg"),
+                fehler_nach_pause=True),
+            heartbeat_s=0.05)
+
+        with self.assertLogs("aiserver_monitor.proxy", level="WARNING") as cm:
+            antwort = await handle_v1(
+                _request("POST", "/v1/chat/completions",
+                         {"rid": "ns-spaet", "stream": False}),
+                deps)
+            self.assertIsInstance(antwort, StreamingResponse)
+            roh = await _body(antwort)
+
+        self.assertTrue(roh.startswith(b" "))           # WS vor dem JSON
+        self.assertEqual(json.loads(roh), json.loads(
+            b'{"error": {"message": "sglang nicht erreichbar", '
+            b'"type": "upstream_unavailable"}}'))
+        self.assertTrue(any("ns-spaet" in zeile for zeile in cm.output))
+        job = self.registry.get("ns-spaet")
+        self.assertIs(job.status, JobStatus.ERROR)
+        self.assertIn("ReadError", job.error)
+
     async def test_nonstream_client_abbruch_job_laeuft_zu_ende(self):
         # Client bricht ab, waehrend der Upstream noch rechnet: die Aufgabe
         # schliesst den Job trotzdem ab (kein waiting-Zombie, Ruling 8).
@@ -591,8 +668,10 @@ class TestJobTracking(ProxyTestBasis):
         self.assertEqual(job.prompt_start, "Ein Prompt")
 
     async def test_ereignisse_gedrosselt_und_abschluss_immer(self):
-        # Schneller Schwall: die Drossel laesst nur wenige Ereignisse durch,
-        # der Abschluss kommt aber immer (auch wenn er in die Drossel faellt).
+        # Schneller Schwall: die Drossel laesst nur wenige Live-Ereignisse
+        # durch, der Abschluss kommt aber immer (auch wenn er in die Drossel
+        # faellt). Das erste Frame ist das Anlage-Ereignis "waiting"
+        # (Register-Publizierung wie im Nicht-Stream-Pfad).
         schritte = [(0.0, fakes.chat_chunk({"content": f"t{n}"}))
                     for n in range(40)]
         schritte += [(0.0, fakes.chat_chunk({}, finish_reason="stop")),
@@ -609,11 +688,11 @@ class TestJobTracking(ProxyTestBasis):
         rahmen = []
         while not queue.empty():
             rahmen.append(queue.get_nowait())
-        self.assertGreaterEqual(len(rahmen), 1)
-        self.assertLessEqual(len(rahmen), 4)            # ~4/s, kein Schwall
+        self.assertGreaterEqual(len(rahmen), 2)
+        self.assertLessEqual(len(rahmen), 5)            # waiting + ~4/s
         daten = [json.loads(rahmen_eintrag.split("data: ", 1)[1])
                  for rahmen_eintrag in rahmen]
-        self.assertEqual(daten[0]["status"], "running")
+        self.assertEqual(daten[0]["status"], "waiting")
         self.assertEqual(daten[-1]["status"], "done")
         self.assertEqual(daten[-1]["rid"], "hub-1")
 

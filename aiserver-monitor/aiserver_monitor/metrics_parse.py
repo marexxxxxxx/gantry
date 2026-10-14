@@ -62,10 +62,14 @@ class GpuSample:
 
 
 def _feld_zu_int(feld: str) -> int | None:
-    """Ein CSV-Feld als int; unlesbare Felder (z. B. ``[N/A]``) werden None."""
+    """Ein CSV-Feld als int; unlesbare Felder (z. B. ``[N/A]``) werden None.
+
+    ``OverflowError`` deckt Werte wie ``inf`` ab: ``float`` liest sie, aber
+    ``int`` kann sie nicht darstellen; sie zaehlen als "nicht gemessen".
+    """
     try:
         return int(float(feld))
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
 
 

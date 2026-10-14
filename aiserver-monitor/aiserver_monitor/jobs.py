@@ -12,6 +12,11 @@ from enum import StrEnum
 # (entspricht dem Config-Default prompt_start_chars).
 PROMPT_START_CHARS = 100
 
+#: So viele abgeschlossene Jobs haelt die Registry im RAM; beim Anlegen
+#: neuer Jobs fliegen die aeltesten raus. Aktive Jobs (waiting/running)
+#: werden nie geprunnt.
+MAX_BEENDETE_JOBS = 200
+
 
 class JobStatus(StrEnum):
     WAITING = "waiting"
@@ -77,7 +82,12 @@ class JobRegistry:
 
     def register(self, rid: str, *, source: str, model: str, full_prompt: str,
                  now: float) -> Job:
-        """Legt einen Job im Status waiting an; gleiche rid ersetzt den Alten."""
+        """Legt einen Job im Status waiting an; gleiche rid ersetzt den Alten.
+
+        Nach dem Einfuegen laeuft die Prune: mehr als ``MAX_BEENDETE_JOBS``
+        abgeschlossene Jobs kosten sonst immer mehr RAM (volles Prompt plus
+        Vorschau-Ringe). Aktive Jobs bleiben unangetastet.
+        """
         job = Job(
             rid=rid,
             source=source,
@@ -89,7 +99,23 @@ class JobRegistry:
             reasoning_ring=TextRing(self.preview_max_chars),
         )
         self._jobs[rid] = job
+        self._prune_finished()
         return job
+
+    def _prune_finished(self) -> None:
+        """Haelt nur die neuesten ``MAX_BEENDETE_JOBS`` abgeschlossenen Jobs.
+
+        Sortiert nach ``created_at``; bei gleichem Zeitstempel entscheidet
+        die rid, damit die Auswahl deterministisch bleibt. Aktive Jobs
+        zaehlen nicht mit und werden nie entfernt.
+        """
+        beendete = [job for job in self._jobs.values()
+                    if job.status not in ACTIVE_STATUSES]
+        if len(beendete) <= MAX_BEENDETE_JOBS:
+            return
+        beendete.sort(key=lambda job: (job.created_at, job.rid))
+        for job in beendete[:len(beendete) - MAX_BEENDETE_JOBS]:
+            del self._jobs[job.rid]
 
     def get(self, rid: str) -> Job | None:
         return self._jobs.get(rid)

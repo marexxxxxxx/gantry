@@ -68,6 +68,12 @@ export default function PreviewModal({ job, onSchliessen }: PreviewModalProps) {
           </button>
         </header>
 
+        {job.error !== null && job.error !== "" && (
+          <p className="modal-fehler" data-testid="modal-fehler">
+            {job.error}
+          </p>
+        )}
+
         <section className="modal-abschnitt">
           <h3 className="modal-ueberschrift">Prompt</h3>
           <pre className="modal-prompt" data-testid="modal-prompt">

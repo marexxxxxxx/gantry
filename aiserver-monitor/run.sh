@@ -254,7 +254,7 @@ stop() {
         done
     fi
     if is_running; then
-        echo "[aiserver-monitor] nach ${STOP_GRACE}s noch aktiv: $(monitor_pids)- sende KILL" >&2
+        echo "[aiserver-monitor] nach ${STOP_GRACE}s noch aktiv: $(monitor_pids) - sende KILL" >&2
         signal_monitors KILL || true
         sleep 1
     fi

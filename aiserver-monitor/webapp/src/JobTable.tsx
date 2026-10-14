@@ -61,6 +61,16 @@ function promptAnfang(job: Job): string {
   return job.prompt_start === "" ? "-" : job.prompt_start;
 }
 
+/** Fehlertext gekuerzt auf 60 Zeichen; der volle Text steht im title. */
+function fehlerKurz(text: string): string {
+  return text.length > 60 ? `${text.slice(0, 59)}…` : text;
+}
+
+/** true, wenn der Job einen anzeigbaren Fehlertext traegt. */
+function hatFehler(job: Job): job is Job & { error: string } {
+  return job.error !== null && job.error !== "";
+}
+
 /** Tokens ein/aus; ohne beide Messwerte bleibt nur "-". */
 function tokensText(job: Job): string {
   if (job.prompt_tokens === null && job.completion_tokens === null) {
@@ -107,6 +117,15 @@ function JobZeile({ job, jetztMs, onVorschau }: ZeileProps) {
           <span className={`punkt punkt-${job.status}`} aria-hidden="true" />
           {STATUS_TEXT[job.status]}
         </span>
+        {hatFehler(job) && (
+          <span
+            className="job-fehler"
+            data-testid="job-fehler"
+            title={job.error}
+          >
+            {fehlerKurz(job.error)}
+          </span>
+        )}
       </td>
       <td className="spalte-quelle">{job.source === "" ? "-" : job.source}</td>
       <td>

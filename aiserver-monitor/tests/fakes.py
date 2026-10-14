@@ -205,19 +205,23 @@ def skript_transport(schritte: Iterable[Schritt] = (), *,
 def json_transport(inhalt: bytes = b"", *,
                    content_type: str = "application/json",
                    pause: float = 0.0,
-                   fehler: BaseException | None = None) -> httpx.MockTransport:
+                   fehler: BaseException | None = None,
+                   fehler_nach_pause: bool = False) -> httpx.MockTransport:
     """Transport mit exakt vorgegebenem, gepuffertem JSON-Body.
 
     Fuer den Nicht-Stream-Pfad: die Antwort kommt komplett und byte-genau
     (``inhalt``); ``pause`` verzoegert sie (fuer die Keepalive-Schleife
     sichtbar), ``fehler`` wirft stattdessen (z. B. ``httpx.ConnectError``,
-    wenn SGLang aus ist).
+    wenn SGLang aus ist). Mit ``fehler_nach_pause=True`` kommt zuerst die
+    Pause, dann der Fehler: der "spaete" Transportfehler nach Antwortstart.
     """
     async def handler(request: httpx.Request) -> httpx.Response:
-        if fehler is not None:
+        if fehler is not None and not fehler_nach_pause:
             raise fehler
         if pause > 0:
             await asyncio.sleep(pause)
+        if fehler is not None:
+            raise fehler
         return httpx.Response(200, headers={"content-type": content_type},
                               content=inhalt)
 
