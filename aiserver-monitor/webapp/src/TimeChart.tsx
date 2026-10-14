@@ -22,6 +22,9 @@ const HOEHE = 220;
 const ACHSE_FARBE = "#9aa3af";
 const GITTER_FARBE = "#262d38";
 
+/** Linienfarben fuer bis zu zwei Serien (Dark Theme). */
+const SERIEN_FARBEN = ["#4fc1ff", "#e5c07b"];
+
 /**
  * Bringt die Punktreihen auf eine gemeinsame x-Achse (``uPlot.AlignedData``).
  * Zeitpunkte ohne Messwert einer Reihe werden zu ``null`` (Luecke im Chart).
@@ -59,7 +62,12 @@ export default function TimeChart({ title, unit, series }: TimeChartProps) {
       scales: { x: { time: true } },
       series: [
         { label: "Zeit" },
-        ...series.map((reihe) => ({ label: `${reihe.label} (${unit})` })),
+        ...series.map((reihe, index) => ({
+          label: `${reihe.label} (${unit})`,
+          stroke: SERIEN_FARBEN[index % SERIEN_FARBEN.length],
+          width: 2,
+          points: { show: true, size: 5 },
+        })),
       ],
       axes: [
         { stroke: ACHSE_FARBE, grid: { stroke: GITTER_FARBE } },

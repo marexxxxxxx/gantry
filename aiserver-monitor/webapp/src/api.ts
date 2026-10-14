@@ -70,7 +70,9 @@ export interface StatsOverview {
   error: number;
   tokens_in: number | null;
   tokens_out: number | null;
+  // Quantile in SEKUNDEN (Server liefert Epoch-Sekunden-Differenzen).
   ttft: { p50: number | null; p95: number | null };
+  // Quantile in SEKUNDEN (Anzeige rechnet auf ms bzw. min um).
   duration: { p50: number | null; p95: number | null };
 }
 

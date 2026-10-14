@@ -36,14 +36,16 @@ function zahlOderStrich(wert: number | null): string {
   return wert === null ? "-" : String(wert);
 }
 
-/** Millisekunden als ganze Zahl mit Einheit, "-" wenn nicht gemessen. */
+/** Serverwert in Sekunden als ganze Millisekunden, "-" wenn nicht gemessen. */
 function millisekunden(wert: number | null): string {
-  return wert === null ? "-" : `${Math.round(wert)} ms`;
+  return wert === null ? "-" : `${Math.round(wert * 1000)} ms`;
 }
 
-/** Millisekunden als Sekunden mit einer Nachkommastelle und deutschem Komma. */
+/** Serverwert in Sekunden mit einer Nachkommastelle; ab 60 s in Minuten (deutsches Komma). */
 function sekunden(wert: number | null): string {
-  return wert === null ? "-" : `${(wert / 1000).toFixed(1).replace(".", ",")} s`;
+  if (wert === null) return "-";
+  if (wert >= 60) return `${(wert / 60).toFixed(1).replace(".", ",")} min`;
+  return `${wert.toFixed(1).replace(".", ",")} s`;
 }
 
 /** Fehlertext fuer die Meldung; nie ein unbehandelter Wurf. */

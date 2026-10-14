@@ -70,15 +70,23 @@ export function OfflineHinweis({ sample }: { sample: Sample | null }) {
   );
 }
 
-/** Aktive zuerst, innerhalb der Gruppen created_at_ms absteigend (neueste oben). */
+/** Laufende zuerst, dann Wartende (aelteste oben), dann Fertige (neueste oben). */
 function sortiereJobs(jobs: Job[]): Job[] {
+  const rang = (job: Job): number => {
+    if (job.status === "running") return 0;
+    if (job.status === "waiting") return 1;
+    return 2;
+  };
   return [...jobs].sort((a, b) => {
-    const rangA = istAktiv(a) ? 0 : 1;
-    const rangB = istAktiv(b) ? 0 : 1;
+    const rangA = rang(a);
+    const rangB = rang(b);
     if (rangA !== rangB) {
       return rangA - rangB;
     }
-    return b.created_at_ms - a.created_at_ms;
+    if (rangA === 2) {
+      return b.created_at_ms - a.created_at_ms;
+    }
+    return a.created_at_ms - b.created_at_ms;
   });
 }
 

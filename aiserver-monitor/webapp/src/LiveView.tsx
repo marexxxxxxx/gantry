@@ -138,7 +138,7 @@ function Sparkline({ samples }: { samples: Sample[] }) {
 
 /**
  * Live-Ansicht: Queue-Leiste mit Sparkline, Filter Aktiv/Alle und Job-Tabelle.
- * Die Jobs kommen bereits sortiert aus App (aktive zuerst).
+ * Die Jobs kommen bereits sortiert aus App (laufende zuerst, dann wartende).
  */
 export default function LiveView({
   jobs,
