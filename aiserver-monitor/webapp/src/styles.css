@@ -526,3 +526,110 @@ body {
     padding: 0.5rem;
   }
 }
+
+/* --- Statistik-Ansicht (Zeitfenster, Kennwerte, Diagramme) --- */
+
+.stat-ansicht {
+  display: flex;
+  flex-direction: column;
+  gap: var(--abstand);
+}
+
+.stat-fenster-leiste {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.stat-chip {
+  appearance: none;
+  border: 1px solid var(--farbe-rand);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--farbe-text-gedimmt);
+  padding: 0.25rem 0.9rem;
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.stat-chip:hover {
+  color: var(--farbe-text);
+}
+
+.stat-chip[aria-pressed="true"] {
+  background: var(--farbe-rand);
+  color: var(--farbe-text);
+}
+
+.stat-ladehinweis {
+  color: var(--farbe-text-gedimmt);
+  font-size: 0.8rem;
+}
+
+.stat-fehler {
+  margin: 0;
+  color: var(--farbe-rot);
+  font-size: 0.85rem;
+}
+
+.stat-leer {
+  margin: 0;
+  color: var(--farbe-text-gedimmt);
+}
+
+.kennwert-raster {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--abstand);
+}
+
+.kennwert-karte {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.6rem 0.75rem;
+  background: var(--farbe-flaeche);
+  border: 1px solid var(--farbe-rand);
+  border-radius: var(--radius);
+}
+
+.kennwert-karte-label {
+  color: var(--farbe-text-gedimmt);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.kennwert-karte-wert {
+  font-size: 1.25rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.kennwert-karte-zusatz {
+  color: var(--farbe-text-gedimmt);
+  font-size: 0.78rem;
+}
+
+.stat-diagramme {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.stat-diagramm {
+  width: 100%;
+  padding: 0.5rem 0.6rem 0.6rem;
+  background: var(--farbe-flaeche);
+  border: 1px solid var(--farbe-rand);
+  border-radius: var(--radius);
+}
+
+/* Handy: die Kennwerte stehen einspaltig untereinander. */
+@media (max-width: 640px) {
+  .kennwert-raster {
+    grid-template-columns: 1fr;
+  }
+}

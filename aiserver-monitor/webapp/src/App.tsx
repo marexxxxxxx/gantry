@@ -3,6 +3,7 @@ import { cancelAll, connectEvents } from "./api";
 import type { Job, Sample, VerbindungsStatus } from "./api";
 import LiveView from "./LiveView";
 import PreviewModal from "./PreviewModal";
+import StatsView from "./StatsView";
 
 /** Serverspalte der Kopfleiste als deutsche Beschriftung. */
 const STATUS_TEXT: Record<VerbindungsStatus, string> = {
@@ -249,9 +250,7 @@ export default function App() {
             onVorschau={vorschauOeffnen}
           />
         ) : (
-          <p className="platzhalter">
-            Die Statistik-Ansicht ist noch nicht eingebaut.
-          </p>
+          <StatsView />
         )}
       </main>
       {modalJob !== null && (
