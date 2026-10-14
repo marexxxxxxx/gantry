@@ -1,0 +1,154 @@
+/* Dark Theme als CSS-Variablen (keine Frameworks, kein Tailwind). */
+:root {
+  --farbe-hintergrund: #0f1115;
+  --farbe-flaeche: #161a21;
+  --farbe-rand: #262d38;
+  --farbe-text: #e6e8eb;
+  --farbe-text-gedimmt: #9aa3af;
+  --farbe-akzent: #4da3ff;
+  --farbe-gruen: #3fb950;
+  --farbe-gelb: #d29922;
+  --farbe-rot: #f85149;
+  --radius: 6px;
+  --abstand: 0.75rem;
+  --schrift: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--farbe-hintergrund);
+  color: var(--farbe-text);
+  font-family: var(--schrift);
+  font-size: 14px;
+}
+
+#root {
+  height: 100%;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+.kopfleiste {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--abstand);
+  padding: 0.6rem 1rem;
+  background: var(--farbe-flaeche);
+  border-bottom: 1px solid var(--farbe-rand);
+}
+
+.marke {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.kennwert {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.35rem;
+}
+
+.kennwert-label {
+  color: var(--farbe-text-gedimmt);
+  font-size: 0.8rem;
+}
+
+.kennwert-wert {
+  font-variant-numeric: tabular-nums;
+}
+
+.server-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.punkt {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  background: var(--farbe-gelb);
+}
+
+.punkt-verbunden {
+  background: var(--farbe-gruen);
+}
+
+.punkt-verbinde {
+  background: var(--farbe-gelb);
+}
+
+.punkt-getrennt {
+  background: var(--farbe-rot);
+}
+
+.fuelle {
+  flex: 1 1 auto;
+}
+
+.tabs {
+  display: inline-flex;
+  border: 1px solid var(--farbe-rand);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.tab {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--farbe-text-gedimmt);
+  padding: 0.35rem 0.8rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+.tab-aktiv {
+  background: var(--farbe-rand);
+  color: var(--farbe-text);
+}
+
+.notaus {
+  appearance: none;
+  border: 1px solid var(--farbe-rot);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--farbe-rot);
+  padding: 0.35rem 0.9rem;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.notaus:hover {
+  background: var(--farbe-rot);
+  color: #ffffff;
+}
+
+.inhalt {
+  flex: 1 1 auto;
+  padding: 1rem;
+}
+
+.platzhalter {
+  color: var(--farbe-text-gedimmt);
+}
+
+.zeit-diagramm {
+  width: 100%;
+  margin-top: 0.5rem;
+}
