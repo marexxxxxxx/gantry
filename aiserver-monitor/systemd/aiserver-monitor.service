@@ -1,0 +1,11 @@
+[Unit]
+Description=aiserver-monitor gateway (OpenAI passthrough + dashboard)
+
+[Service]
+WorkingDirectory=/home/user/small_qwen/aiserver-monitor
+ExecStart=/home/user/small_qwen/.venv/bin/python -m aiserver_monitor
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
