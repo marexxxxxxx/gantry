@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { cancelAll, connectEvents } from "./api";
 import type { Job, Sample, VerbindungsStatus } from "./api";
+import LiveView from "./LiveView";
+import PreviewModal from "./PreviewModal";
 
 /** Serverspalte der Kopfleiste als deutsche Beschriftung. */
 const STATUS_TEXT: Record<VerbindungsStatus, string> = {
@@ -8,6 +10,12 @@ const STATUS_TEXT: Record<VerbindungsStatus, string> = {
   verbunden: "verbunden",
   getrennt: "getrennt",
 };
+
+/** Ohne Bestaetigung faellt der Notaus-Schalter nach dieser Zeit zurueck. */
+const NOTAUS_FENSTER_MS = 5000;
+
+/** So viele Stats-Samples haelt der Ringpuffer fuer die Sparkline vor. */
+const RINGLAENGE = 30;
 
 type Tab = "live" | "stats";
 
@@ -36,42 +44,134 @@ function gpuAnzeige(sample: Sample | null): string {
   return teile.length > 0 ? teile.join(" - ") : "-";
 }
 
-/** Geruest: Kopfleiste (Status, Modell, GPU, Tabs, Notaus) und leerer Inhalt. */
+/** waiting/running gelten als aktiv (wie ACTIVE_STATUSES im Backend). */
+function istAktiv(job: Job): boolean {
+  return job.status === "waiting" || job.status === "running";
+}
+
+/** Aktive zuerst, innerhalb der Gruppen created_at_ms absteigend (neueste oben). */
+function sortiereJobs(jobs: Job[]): Job[] {
+  return [...jobs].sort((a, b) => {
+    const rangA = istAktiv(a) ? 0 : 1;
+    const rangB = istAktiv(b) ? 0 : 1;
+    if (rangA !== rangB) {
+      return rangA - rangB;
+    }
+    return b.created_at_ms - a.created_at_ms;
+  });
+}
+
+/** Upsert per rid: vorhandenen Eintrag voll ersetzen, sonst anhaengen. */
+function setzeJob(jobs: Job[], neu: Job): Job[] {
+  if (!jobs.some((job) => job.rid === neu.rid)) {
+    return [...jobs, neu];
+  }
+  return jobs.map((job) => (job.rid === neu.rid ? neu : job));
+}
+
+/** Fehlertext fuer kurze Meldungen; nie ein unbehandelter Wurf. */
+function fehlerText(fehler: unknown): string {
+  return fehler instanceof Error ? fehler.message : "unbekannter Fehler";
+}
+
+/**
+ * Zentraler Zustand (nur React-Hooks): Jobs, letztes Stats-Sample,
+ * Ringpuffer der letzten 30 Stats-Samples (Sparkline) und Verbindungsstatus.
+ * "snapshot" ersetzt die Job-Liste vollstaendig, "job" upsertet per rid.
+ */
 export default function App() {
   const [status, setStatus] = useState<VerbindungsStatus>("verbinde");
-  const [modell, setModell] = useState<string | null>(null);
-  const [sample, setSample] = useState<Sample | null>(null);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [letztesSample, setLetztesSample] = useState<Sample | null>(null);
+  const [samples, setSamples] = useState<Sample[]>([]);
   const [tab, setTab] = useState<Tab>("live");
+  const [modalRid, setModalRid] = useState<string | null>(null);
+  const [notausScharf, setNotausScharf] = useState(false);
+  const [notausMeldung, setNotausMeldung] = useState<string | null>(null);
+  const [jetztMs, setJetztMs] = useState(() => Date.now());
 
   useEffect(() => {
     const verbindung = connectEvents((ereignis, daten) => {
       if (ereignis === "snapshot") {
         const inhalt = daten as { jobs: Job[]; stats: Sample | null };
-        // "zuletzt gesehen": der zuletzt angelegte Job aus dem Snapshot.
-        const neuester = inhalt.jobs.reduce<Job | null>(
-          (bisher, job) =>
-            bisher === null || job.created_at_ms > bisher.created_at_ms
-              ? job
-              : bisher,
-          null,
-        );
-        if (neuester !== null) {
-          setModell(neuester.model);
+        setJobs(inhalt.jobs);
+        const stats = inhalt.stats;
+        if (stats !== null) {
+          // Snapshot-Sample anhaengen: die Sparkline zeigt die zuletzt
+          // empfangenen Samples, auch ueber einen Reconnect hinweg.
+          setLetztesSample(stats);
+          setSamples((alt) => [...alt, stats].slice(-RINGLAENGE));
         }
-        setSample(inhalt.stats);
       } else if (ereignis === "job") {
-        setModell((daten as Job).model);
+        const job = daten as Job;
+        setJobs((alt) => setzeJob(alt, job));
       } else if (ereignis === "stats") {
-        setSample(daten as Sample);
+        const stats = daten as Sample;
+        setLetztesSample(stats);
+        setSamples((alt) => [...alt, stats].slice(-RINGLAENGE));
       }
     }, setStatus);
     return () => verbindung.close();
   }, []);
 
-  const notaus = () => {
-    // Bestaetigung (confirm-cancel-all) und Rueckmeldung folgen mit Task 13;
-    // hier nur der Aufruf, Fehler verwirft die Geruest-Oberflaeche still.
-    void cancelAll().catch(() => undefined);
+  // Notaus: ohne Bestaetigung faellt der scharfe Schalter nach 5 s zurueck.
+  useEffect(() => {
+    if (!notausScharf) {
+      return;
+    }
+    const timer = window.setTimeout(() => setNotausScharf(false), NOTAUS_FENSTER_MS);
+    return () => window.clearTimeout(timer);
+  }, [notausScharf]);
+
+  const sortiert = useMemo(() => sortiereJobs(jobs), [jobs]);
+
+  // Modell des zuletzt angelegten Jobs, sonst "-".
+  const modell = useMemo(() => {
+    let neuester: Job | null = null;
+    for (const job of jobs) {
+      if (neuester === null || job.created_at_ms > neuester.created_at_ms) {
+        neuester = job;
+      }
+    }
+    return neuester === null ? null : neuester.model;
+  }, [jobs]);
+
+  // Modal folgt dem Job per rid; fehlt er (z. B. nach neuem Snapshot), bleibt es zu.
+  const modalJob = jobs.find((job) => job.rid === modalRid) ?? null;
+
+  // Stabile Callbacks: das Modal muss seinen Escape-Listener nicht je Render neu binden.
+  const vorschauOeffnen = useCallback((rid: string) => setModalRid(rid), []);
+  const vorschauSchliessen = useCallback(() => setModalRid(null), []);
+
+  // Laufzeit tickt, solange mindestens ein aktiver Job oder das Modal offen ist.
+  const tickerAktiv = modalJob !== null || jobs.some(istAktiv);
+  useEffect(() => {
+    if (!tickerAktiv) {
+      return;
+    }
+    setJetztMs(Date.now());
+    const timer = window.setInterval(() => setJetztMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [tickerAktiv]);
+
+  const notausArmen = () => {
+    setNotausMeldung(null);
+    setNotausScharf(true);
+  };
+
+  const notausAusfuehren = () => {
+    // Auto-Reset nach Ausfuehrung: zurueck in den Normalzustand.
+    setNotausScharf(false);
+    setNotausMeldung(null);
+    cancelAll()
+      .then((antwort) => {
+        if (!antwort.ok) {
+          setNotausMeldung("Notaus: der Server meldet ok=false");
+        }
+      })
+      .catch((fehler: unknown) => {
+        setNotausMeldung(`Notaus fehlgeschlagen: ${fehlerText(fehler)}`);
+      });
   };
 
   return (
@@ -90,7 +190,7 @@ export default function App() {
           <span className="kennwert-wert">{modell ?? "-"}</span>
         </span>
         <span className="kennwert">
-          <span className="kennwert-wert">{gpuAnzeige(sample)}</span>
+          <span className="kennwert-wert">{gpuAnzeige(letztesSample)}</span>
         </span>
         <span className="fuelle" />
         <nav className="tabs" aria-label="Ansichten">
@@ -113,20 +213,50 @@ export default function App() {
             Statistik
           </button>
         </nav>
-        <button
-          type="button"
-          className="notaus"
-          data-testid="cancel-all"
-          onClick={notaus}
-        >
-          Notaus
-        </button>
+        <span className="notaus-bereich">
+          <button
+            type="button"
+            className={notausScharf ? "notaus notaus-scharf" : "notaus"}
+            data-testid="cancel-all"
+            onClick={notausArmen}
+          >
+            Notaus
+          </button>
+          {notausScharf && (
+            <button
+              type="button"
+              className="notaus notaus-bestaetigen"
+              data-testid="confirm-cancel-all"
+              onClick={notausAusfuehren}
+            >
+              Alles stoppen
+            </button>
+          )}
+        </span>
+        {notausMeldung !== null && (
+          <span className="meldung meldung-fehler" role="alert">
+            {notausMeldung}
+          </span>
+        )}
       </header>
       <main className="inhalt">
-        <p className="platzhalter">
-          Der Inhalt folgt: Live-Ansicht und Statistik sind noch nicht eingebaut.
-        </p>
+        {tab === "live" ? (
+          <LiveView
+            jobs={sortiert}
+            sample={letztesSample}
+            samples={samples}
+            jetztMs={jetztMs}
+            onVorschau={vorschauOeffnen}
+          />
+        ) : (
+          <p className="platzhalter">
+            Die Statistik-Ansicht ist noch nicht eingebaut.
+          </p>
+        )}
       </main>
+      {modalJob !== null && (
+        <PreviewModal job={modalJob} onSchliessen={vorschauSchliessen} />
+      )}
     </div>
   );
 }

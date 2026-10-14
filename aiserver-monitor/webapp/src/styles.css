@@ -152,3 +152,377 @@ body {
   width: 100%;
   margin-top: 0.5rem;
 }
+
+/* --- Live-Ansicht (Queue-Leiste, Filter, Job-Tabelle) --- */
+
+.queue-leiste {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.2rem;
+  padding: 0.55rem 0.25rem;
+  border-bottom: 1px solid var(--farbe-rand);
+  color: var(--farbe-text-gedimmt);
+  font-size: 0.85rem;
+}
+
+.queue-kennwert {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.queue-wert {
+  color: var(--farbe-text);
+  font-size: 0.95rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.sparkline {
+  display: block;
+  margin-left: auto;
+}
+
+.spark-linie {
+  fill: none;
+  stroke-width: 1.6;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.spark-linie-running {
+  stroke: var(--farbe-gruen);
+}
+
+.spark-linie-waiting {
+  stroke: var(--farbe-gelb);
+}
+
+.spark-punkt-running {
+  fill: var(--farbe-gruen);
+}
+
+.spark-punkt-waiting {
+  fill: var(--farbe-gelb);
+}
+
+.filter-leiste {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.6rem 0.25rem 0.4rem;
+}
+
+.filter-schalter {
+  appearance: none;
+  border: 1px solid var(--farbe-rand);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--farbe-text-gedimmt);
+  padding: 0.25rem 0.9rem;
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.filter-schalter:hover {
+  color: var(--farbe-text);
+}
+
+.filter-schalter[aria-pressed="true"] {
+  background: var(--farbe-rand);
+  color: var(--farbe-text);
+}
+
+/* Handy: die Tabelle bleibt im scrollbaren Rahmen bedienbar. */
+.tabelle-rahmen {
+  overflow-x: auto;
+}
+
+.job-tabelle {
+  width: 100%;
+  min-width: 44rem;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.job-tabelle th {
+  padding: 0.45rem 0.5rem;
+  border-bottom: 1px solid var(--farbe-rand);
+  color: var(--farbe-text-gedimmt);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.job-tabelle td {
+  padding: 0.5rem;
+  border-bottom: 1px solid var(--farbe-rand);
+  vertical-align: middle;
+}
+
+.job-zeile {
+  cursor: pointer;
+}
+
+.job-zeile:hover {
+  background: rgba(77, 163, 255, 0.08);
+}
+
+.job-zeile-running {
+  background: rgba(77, 163, 255, 0.05);
+  box-shadow: inset 3px 0 0 var(--farbe-akzent);
+}
+
+.job-zeile-done,
+.job-zeile-aborted {
+  opacity: 0.72;
+}
+
+.job-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  white-space: nowrap;
+}
+
+.punkt-waiting {
+  background: var(--farbe-gelb);
+}
+
+.punkt-running {
+  background: var(--farbe-gruen);
+}
+
+.punkt-done,
+.punkt-aborted {
+  background: var(--farbe-text-gedimmt);
+}
+
+.punkt-error {
+  background: var(--farbe-rot);
+}
+
+.prompt-anfang {
+  display: inline-block;
+  max-width: 24rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+  white-space: nowrap;
+}
+
+.spalte-zahl {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.spalte-aktionen {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.aktion {
+  appearance: none;
+  border: 1px solid var(--farbe-rand);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--farbe-text-gedimmt);
+  padding: 0.15rem 0.55rem;
+  font: inherit;
+  font-size: 0.85rem;
+  line-height: 1.3;
+  cursor: pointer;
+}
+
+.aktion + .aktion {
+  margin-left: 0.35rem;
+}
+
+.aktion:hover {
+  border-color: var(--farbe-akzent);
+  color: var(--farbe-text);
+}
+
+.aktion-abbruch {
+  color: var(--farbe-rot);
+}
+
+.aktion-abbruch:hover {
+  border-color: var(--farbe-rot);
+  color: var(--farbe-rot);
+}
+
+.zeilen-hinweis {
+  display: block;
+  margin-top: 0.3rem;
+  margin-left: auto;
+  max-width: 12rem;
+  color: var(--farbe-rot);
+  font-size: 0.72rem;
+  text-align: right;
+  white-space: normal;
+}
+
+.leer-zelle {
+  padding: 1rem 0.5rem;
+  color: var(--farbe-text-gedimmt);
+  text-align: center;
+}
+
+/* --- Notaus (Bestaetigungszustand) und Meldungen --- */
+
+.notaus-bereich {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.notaus-scharf {
+  background: var(--farbe-rot);
+  color: #ffffff;
+}
+
+.notaus-bestaetigen {
+  border-color: var(--farbe-gelb);
+  color: var(--farbe-gelb);
+}
+
+.notaus-bestaetigen:hover {
+  background: var(--farbe-gelb);
+  border-color: var(--farbe-gelb);
+  color: #0f1115;
+}
+
+.meldung {
+  font-size: 0.8rem;
+}
+
+.meldung-fehler {
+  color: var(--farbe-rot);
+}
+
+/* --- Vorschau-Modal --- */
+
+.modal-hintergrund {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: rgba(0, 0, 0, 0.62);
+}
+
+.modal {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  width: min(48rem, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 1rem 1.1rem 1.2rem;
+  background: var(--farbe-flaeche);
+  border: 1px solid var(--farbe-rand);
+  border-radius: var(--radius);
+}
+
+.modal-kopf {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.modal-titel {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.modal-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--farbe-text-gedimmt);
+  font-size: 0.85rem;
+}
+
+.modal-rid {
+  color: var(--farbe-text-gedimmt);
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.modal-schliessen {
+  margin-left: auto;
+  appearance: none;
+  border: 1px solid var(--farbe-rand);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--farbe-text);
+  padding: 0.15rem 0.5rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+.modal-schliessen:hover {
+  border-color: var(--farbe-rot);
+  color: var(--farbe-rot);
+}
+
+.modal-ueberschrift {
+  margin: 0 0 0.35rem;
+  color: var(--farbe-text-gedimmt);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.modal-prompt,
+.modal-antwort,
+.modal-denken-text {
+  margin: 0;
+  padding: 0.6rem;
+  background: var(--farbe-hintergrund);
+  border: 1px solid var(--farbe-rand);
+  border-radius: var(--radius);
+  font-family: var(--schrift);
+  font-size: 0.85rem;
+  line-height: 1.45;
+  overflow-wrap: break-word;
+  white-space: pre-wrap;
+}
+
+.modal-prompt {
+  max-height: 30vh;
+  overflow-y: auto;
+}
+
+.modal-antwort {
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.modal-denken-text {
+  margin-top: 0.5rem;
+  max-height: 25vh;
+  overflow-y: auto;
+}
+
+.modal-denken-schalter {
+  padding: 0.2rem 0;
+  color: var(--farbe-text-gedimmt);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+/* Handy: das Modal nutzt fast die volle Breite. */
+@media (max-width: 640px) {
+  .modal-hintergrund {
+    padding: 0.5rem;
+  }
+}
