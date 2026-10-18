@@ -34,8 +34,12 @@ def main() -> None:
 
     # Genau ein Worker: SQLite-History, Job-Registry und der SSE-Hub liegen im
     # Prozess; ein zweiter Worker haette einen zweiten, unabhaengigen Zustand.
+    # timeout_graceful_shutdown begrenzt das Warten auf offene Streams
+    # (SSE/Streaming-Clients) beim Stoppen, sonst greift systemd nach
+    # TimeoutStopSec zum SIGKILL.
     uvicorn.run(create_app(config), host=config.listen_host,
-                port=config.listen_port, log_config=None)
+                port=config.listen_port, log_config=None,
+                timeout_graceful_shutdown=10)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,22 @@
+[Unit]
+Description=Escha SGLang server (Qwen3.8-27B, port 30001)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/user/small_qwen
+Environment=PORT=30001
+Environment=LOG=/tmp/escha_server.log
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash /home/user/small_qwen/runtime/sglang/start-penalty.sh start-systemd 2.0
+StandardOutput=append:/tmp/escha_server.log
+StandardError=inherit
+Restart=always
+RestartSec=15
+TimeoutStopSec=30
+# SGLang beendet sich nach dem Drainen selbst per SIGKILL (kill_process_tree).
+SuccessExitStatus=SIGKILL
+
+[Install]
+WantedBy=default.target

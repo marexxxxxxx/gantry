@@ -1,11 +1,19 @@
 [Unit]
 Description=aiserver-monitor gateway (OpenAI passthrough + dashboard)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 WorkingDirectory=/home/user/small_qwen/aiserver-monitor
+Environment=AISERVER_MONITOR_LISTEN_PORT=30000
+Environment=AISERVER_MONITOR_UPSTREAM_BASE=http://127.0.0.1:30001
 ExecStart=/home/user/small_qwen/.venv/bin/python -m aiserver_monitor
 Restart=always
 RestartSec=3
+# Offene Client-Verbindungen (SSE/Streams) koennen den uvicorn-Shutdown
+# aufhalten; nach 15 s greift SIGKILL. SIGKILL gilt dabei als sauber.
+TimeoutStopSec=15
+SuccessExitStatus=SIGKILL
 
 [Install]
 WantedBy=default.target

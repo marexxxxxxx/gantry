@@ -3,6 +3,7 @@
 #
 # Usage:
 #   bash start-penalty.sh [LAMBDA]
+#   bash start-penalty.sh start-systemd [LAMBDA]
 #
 #   LAMBDA  penalty strength, default 2.0 (paper sweep 0.5-4.0; higher = harder cut).
 #
@@ -14,7 +15,17 @@
 # The server starts IN THE BACKGROUND, logs to /tmp/escha_server.log and this script
 # waits until it answers on http://127.0.0.1:$PORT. Stop it again with:
 #   bash runtime/sglang/stop-server.sh
+#
+# start-systemd keeps serve.sh IN THE FOREGROUND and exec's it, so systemd can
+# supervise the real server process (used by escha-server.service). Logs are
+# redirected by the unit.
 set -euo pipefail
+
+MODE=background
+if [ "${1:-}" = "start-systemd" ]; then
+  MODE=systemd
+  shift
+fi
 
 LAMBDA=${1:-2.0}
 case "$LAMBDA" in ''|*[!0-9.]*|[!0-9.]*) echo "[start] ERROR: LAMBDA must be a number (got '$LAMBDA')" >&2; exit 1 ;; esac
@@ -29,7 +40,8 @@ export VENV=${VENV:-$REPO/.venv}   # serve.sh aborts silently without a python t
 # (MEM=0.72 CTXLEN=65536): on 16 GB they shrink the recurrent pool until
 # get_batch_sizes_to_capture() asserts capture_bs=[0] and startup dies.
 export MEM=${MEM:-0.90}
-export CTXLEN=${CTXLEN:-16384}
+export CTXLEN=${CTXLEN:-86016}   # 84k Kontext (Nutzerwunsch 2026-10-14); KV-Pool ~90k Token deckt das
+
 export CUDA_GRAPH_BS=${CUDA_GRAPH_BS:-"1 2 4 8"}
 export OTP=1 PENALTY_LAMBDA="$LAMBDA"
 export LOG=${LOG:-/tmp/escha_server.log}
@@ -43,6 +55,11 @@ if PIDS=$(pgrep -f "[s]glang.launch_server"); then
   echo "$PIDS" >&2
   echo "[start]        stop it first: bash $HERE/stop-server.sh" >&2
   exit 1
+fi
+
+if [ "$MODE" = "systemd" ]; then
+  echo "[start] systemd mode: serve.sh stays in the foreground on http://$HOST:$PORT (lambda=$LAMBDA)"
+  exec bash "$HERE/serve.sh"
 fi
 
 echo "[start] launching: model=$MODEL  lambda=$LAMBDA  http://$HOST:$PORT  (log: $LOG)"
