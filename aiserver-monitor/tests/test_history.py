@@ -84,7 +84,7 @@ class TestSchema(HistoryTestCase):
         self.assertEqual(self.db_zeilen("PRAGMA journal_mode")[0][0], "wal")
         namen = [zeile[0] for zeile in self.db_zeilen(
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
-        self.assertEqual(namen, ["jobs", "samples"])
+        self.assertEqual(namen, ["jobs", "samples", "settings"])
 
     def test_init_legt_fehlende_verzeichnisse_an(self):
         # Default-Pfad "data/monitor.db": das Verzeichnis existiert frisch nicht.
@@ -93,6 +93,27 @@ class TestSchema(HistoryTestCase):
         history.init()
         self.addCleanup(history.close)
         self.assertTrue(os.path.exists(pfad))
+
+
+class TestSettings(HistoryTestCase):
+    """Allgemeine Einstellungen (Key/Value) ueberleben Close/Init."""
+
+    def test_unbekannter_schluessel_ist_none(self):
+        self.assertIsNone(self.history.get_setting("fehlt"))
+
+    def test_setting_wird_gespeichert_und_ueberschrieben(self):
+        self.history.set_setting("priority", "eins")
+        self.assertEqual(self.history.get_setting("priority"), "eins")
+        self.history.set_setting("priority", "zwei")
+        self.assertEqual(self.history.get_setting("priority"), "zwei")
+
+    def test_setting_ueberlebt_close_und_neues_init(self):
+        self.history.set_setting("priority", "gespeichert")
+        self.history.close()
+        neu = History(self.path)
+        neu.init()
+        self.addCleanup(neu.close)
+        self.assertEqual(neu.get_setting("priority"), "gespeichert")
 
 
 class TestRecordJob(HistoryTestCase):

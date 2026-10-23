@@ -29,6 +29,12 @@ from aiserver_monitor.config import Config
 from aiserver_monitor.events import EventHub
 from aiserver_monitor.history import History
 from aiserver_monitor.jobs import JobRegistry, JobStatus, job_to_dict
+from aiserver_monitor.priority import (
+    DEFAULT_MARKER,
+    MAX_PRIORITY,
+    NORMAL_PRIORITY,
+    PriorityManager,
+)
 from aiserver_monitor.proxy import Deps, ensure_rid, handle_v1
 
 #: rid-Muster des Gateways: uuid4().hex
@@ -146,7 +152,8 @@ class ProxyTestBasis(unittest.IsolatedAsyncioTestCase):
     def deps(self, transport, *, history=None, heartbeat_s: float = 15.0,
              connect_timeout_s: float = 5.0,
              nonstream_keepalive: bool = True,
-             abort_on_disconnect: bool = True) -> Deps:
+             abort_on_disconnect: bool = True,
+             priority: PriorityManager | None = None) -> Deps:
         """Deps mit dem gegebenen Transport; der Client wird am Testende geschlossen."""
         if self._client is None:
             self._client = httpx.AsyncClient(transport=transport)
@@ -160,6 +167,7 @@ class ProxyTestBasis(unittest.IsolatedAsyncioTestCase):
             hub=self.hub,
             history=history,
             client=self._client,
+            priority=priority if priority is not None else PriorityManager(),
         )
 
 
@@ -182,6 +190,131 @@ class TestEnsureRid(unittest.TestCase):
                 rid = ensure_rid(body)
                 self.assertRegex(rid, RID_MUSTER)
                 self.assertEqual(body["rid"], rid)
+
+
+class TestPrioritaet(ProxyTestBasis):
+    """Max-Marker werden nur auf Chat-Bodies angewendet (priority 100/0)."""
+
+    def deaktiviert(self) -> PriorityManager:
+        manager = PriorityManager()
+        manager.update(enabled=False, markers=[DEFAULT_MARKER])
+        return manager
+
+    async def test_stream_max_systemprompt_bekommt_prioritaet(self):
+        fake = fakes.FakeSglang(_chat_skript(["Hallo"]))
+        deps = self.deps(httpx.ASGITransport(app=fake.app))
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "fake-modell",
+                "rid": "max-stream",
+                "stream": True,
+                "messages": [
+                    {"role": "system", "content": DEFAULT_MARKER},
+                    {"role": "user", "content": "Hi"},
+                ],
+            }),
+            deps)
+        await _body(antwort)
+
+        self.assertEqual(fake.anfragen[0]["priority"], MAX_PRIORITY)
+
+    async def test_stream_ohne_marker_bekommt_normale_prioritaet(self):
+        fake = fakes.FakeSglang(_chat_skript(["Hallo"]))
+        deps = self.deps(httpx.ASGITransport(app=fake.app))
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "fake-modell",
+                "rid": "normal-stream",
+                "stream": True,
+                "messages": [{"role": "user", "content": "Hi"}],
+            }),
+            deps)
+        await _body(antwort)
+
+        self.assertEqual(fake.anfragen[0]["priority"], NORMAL_PRIORITY)
+
+    async def test_marker_nur_im_user_text_zaehlt_nicht(self):
+        fake = fakes.FakeSglang(_chat_skript(["Hallo"]))
+        deps = self.deps(httpx.ASGITransport(app=fake.app))
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "fake-modell",
+                "rid": "user-marker",
+                "stream": True,
+                "messages": [{"role": "user", "content": DEFAULT_MARKER}],
+            }),
+            deps)
+        await _body(antwort)
+
+        self.assertEqual(fake.anfragen[0]["priority"], NORMAL_PRIORITY)
+
+    async def test_deaktiviert_entfernt_prioritaet_aus_chat_body(self):
+        fake = fakes.FakeSglang(_chat_skript(["Hallo"]))
+        deps = self.deps(httpx.ASGITransport(app=fake.app),
+                         priority=self.deaktiviert())
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "fake-modell",
+                "rid": "aus-stream",
+                "stream": True,
+                "priority": 999,
+                "messages": [
+                    {"role": "system", "content": DEFAULT_MARKER},
+                    {"role": "user", "content": "Hi"},
+                ],
+            }),
+            deps)
+        await _body(antwort)
+
+        self.assertNotIn("priority", fake.anfragen[0])
+
+    async def test_nonstream_max_bekommt_prioritaet(self):
+        fake = fakes.FakeSglang(_chat_skript(["Hallo"]))
+        deps = self.deps(httpx.ASGITransport(app=fake.app))
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "fake-modell",
+                "rid": "max-nonstream",
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": DEFAULT_MARKER},
+                    {"role": "user", "content": "Hi"},
+                ],
+            }),
+            deps)
+        await _body(antwort)
+
+        anfrage = fake.anfragen[0]
+        self.assertIs(anfrage["stream"], True)
+        self.assertEqual(anfrage["priority"], MAX_PRIORITY)
+
+    async def test_embeddings_werden_nicht_markiert(self):
+        fest = b'{"data": [{"embedding": [0.1], "index": 0}]}'
+        gesehen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            gesehen.append(request)
+            return httpx.Response(200, content=fest, headers={
+                "content-type": "application/json"})
+
+        deps = self.deps(httpx.MockTransport(handler))
+        body = {
+            "model": "fake-modell",
+            "input": "Hallo",
+            "priority": 999,
+            "messages": [{"role": "system", "content": DEFAULT_MARKER}],
+        }
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/embeddings", body), deps)
+
+        self.assertEqual(await _body(antwort), fest)
+        self.assertEqual(json.loads(gesehen[0].content), body)
 
 
 class TestStreamRelay(ProxyTestBasis):
@@ -347,7 +480,8 @@ class TestStreamRelay(ProxyTestBasis):
             deps)
         await _body(antwort)
 
-        self.assertEqual(fake.anfragen, [{"rid": "abc", "stream": True}])
+        self.assertEqual(fake.anfragen,
+                         [{"rid": "abc", "stream": True, "priority": 0}])
         self.assertIsNotNone(self.registry.get("abc"))
 
     async def test_neue_rid_wenn_keine_mitkommt(self):

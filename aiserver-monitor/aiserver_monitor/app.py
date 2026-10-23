@@ -34,6 +34,7 @@ from .events import EventHub, format_sse, sse_stream
 from .history import History
 from .jobs import ACTIVE_STATUSES, JobRegistry, JobStatus, job_to_dict
 from .metrics_parse import GpuSample
+from .priority import PriorityManager
 from .proxy import Deps, handle_v1
 
 logger = logging.getLogger(__name__)
@@ -168,12 +169,14 @@ def create_app(config: Config, *,
     steuer_client = httpx.AsyncClient(
         transport=transport if steuer_transport is None else steuer_transport,
         timeout=httpx.Timeout(_STEUER_TIMEOUT_S))
+    priority = PriorityManager(history)
     deps = Deps(
         config=config,
         registry=registry,
         hub=hub,
         history=history,
         client=client,
+        priority=priority,
     )
     collector = Collector(deps, gpu_reader=gpu_reader, client=collector_client)
 
@@ -277,6 +280,33 @@ def create_app(config: Config, *,
                 registry.finish(job.rid, JobStatus.ABORTED, now=jetzt)
                 hub.publish("job", job_to_dict(job))
         return {"ok": ok}
+
+    @app.get("/monitor/priority")
+    async def monitor_priority() -> dict:
+        return priority.as_dict()
+
+    @app.put("/monitor/priority")
+    async def monitor_priority_update(request: Request) -> Response:
+        try:
+            daten = await request.json()
+        except ValueError:
+            daten = None
+        if not isinstance(daten, dict):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "JSON-Objekt erwartet"})
+        enabled = daten.get("enabled")
+        if not isinstance(enabled, bool):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "enabled muss true oder false sein"})
+        try:
+            priority.update(enabled=enabled, markers=daten.get("markers"))
+        except (TypeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"error": str(exc)})
+        return priority.as_dict()
 
     @app.get("/monitor/stats")
     async def monitor_stats(

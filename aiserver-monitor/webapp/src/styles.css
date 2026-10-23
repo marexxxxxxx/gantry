@@ -426,6 +426,132 @@ body {
   font-size: 0.85rem;
 }
 
+/* --- Prioritaet (Max-Marker) --- */
+
+.prioritaet {
+  max-width: 52rem;
+}
+
+.prioritaet h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.15rem;
+}
+
+.prioritaet h3 {
+  margin: 1.4rem 0 0.3rem;
+  font-size: 0.95rem;
+}
+
+.prioritaet-hinweis {
+  margin: 0 0 0.9rem;
+  color: var(--farbe-text-gedimmt);
+  line-height: 1.5;
+}
+
+.prioritaet-hinweis code {
+  color: var(--farbe-text);
+}
+
+.prioritaet-schalter {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  padding: 0.75rem;
+  background: var(--farbe-flaeche);
+  border: 1px solid var(--farbe-rand);
+  border-radius: var(--radius);
+}
+
+.prioritaet-schalter input {
+  width: 1.1rem;
+  height: 1.1rem;
+  accent-color: var(--farbe-akzent);
+}
+
+.prioritaet-schalter-text {
+  font-weight: 600;
+}
+
+.prioritaet-schalter-hinweis {
+  flex-basis: 100%;
+  color: var(--farbe-text-gedimmt);
+  font-size: 0.8rem;
+}
+
+.marker-liste {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.marker-zeile,
+.marker-neu {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.marker-zeile input,
+.marker-neu input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0.4rem 0.55rem;
+  background: var(--farbe-flaeche);
+  border: 1px solid var(--farbe-rand);
+  border-radius: var(--radius);
+  color: var(--farbe-text);
+  font: inherit;
+}
+
+.marker-zeile input:focus,
+.marker-neu input:focus {
+  outline: 1px solid var(--farbe-akzent);
+  border-color: var(--farbe-akzent);
+}
+
+.prioritaet-aktion,
+.prioritaet-speichern {
+  appearance: none;
+  border: 1px solid var(--farbe-rand);
+  border-radius: var(--radius);
+  background: var(--farbe-flaeche);
+  color: var(--farbe-text);
+  padding: 0.4rem 0.8rem;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.prioritaet-aktion:hover,
+.prioritaet-speichern:hover {
+  border-color: var(--farbe-akzent);
+}
+
+.prioritaet-speichern {
+  border-color: var(--farbe-akzent);
+  color: var(--farbe-akzent);
+  font-weight: 600;
+}
+
+.prioritaet-speichern:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.marker-neu {
+  margin-top: 0.5rem;
+}
+
+.prioritaet-aktionen {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 1.2rem;
+}
+
 /* --- Vorschau-Modal --- */
 
 .modal-hintergrund {

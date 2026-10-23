@@ -28,6 +28,7 @@ from aiserver_monitor.config import Config
 from aiserver_monitor.history import History
 from aiserver_monitor.jobs import JobStatus
 from aiserver_monitor.metrics_parse import GpuSample
+from aiserver_monitor.priority import DEFAULT_MARKER
 from aiserver_monitor.proxy import Deps
 
 #: Port des SSE-Integrationstests (39xxx ist fuer Tests freigegeben).
@@ -262,6 +263,55 @@ class TestBasisRouten(AppTestCase):
             # Bis Task 12 gibt es kein Static-Verzeichnis: Platzhalterseite.
             self.assertIn("aiserver-monitor", antwort.text)
             self.assertIn("Dashboard", antwort.text)
+
+
+class TestPrioritaetsRouten(AppTestCase):
+    """GET/PUT /monitor/priority: Dashboard liest und schreibt die Marker."""
+
+    def test_get_liefert_defaults(self):
+        with TestClient(self.app()) as c:
+            antwort = c.get("/monitor/priority")
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(antwort.json(),
+                         {"enabled": True, "markers": [DEFAULT_MARKER]})
+
+    def test_put_speichert_und_überlebt_neustart(self):
+        with TestClient(self.app()) as c:
+            antwort = c.put("/monitor/priority", json={
+                "enabled": False,
+                "markers": ["  Neuer Marker  ", "Noch einer"],
+            })
+            self.assertEqual(antwort.status_code, 200)
+            self.assertEqual(antwort.json(), {
+                "enabled": False,
+                "markers": ["Neuer Marker", "Noch einer"],
+            })
+
+        with TestClient(self.app()) as c:
+            antwort = c.get("/monitor/priority")
+        self.assertEqual(antwort.json(), {
+            "enabled": False,
+            "markers": ["Neuer Marker", "Noch einer"],
+        })
+
+    def test_put_lehnt_ungueltige_marker_ab(self):
+        with TestClient(self.app()) as c:
+            antwort = c.put("/monitor/priority", json={
+                "enabled": True,
+                "markers": [42],
+            })
+            gespeichert = c.get("/monitor/priority")
+        self.assertEqual(antwort.status_code, 400)
+        self.assertEqual(gespeichert.json(),
+                         {"enabled": True, "markers": [DEFAULT_MARKER]})
+
+    def test_put_lehnt_nicht_bool_ab(self):
+        with TestClient(self.app()) as c:
+            antwort = c.put("/monitor/priority", json={
+                "enabled": "ja",
+                "markers": [DEFAULT_MARKER],
+            })
+        self.assertEqual(antwort.status_code, 400)
 
 
 class _AbortFake:

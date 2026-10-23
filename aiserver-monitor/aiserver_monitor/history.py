@@ -32,6 +32,10 @@ CREATE TABLE IF NOT EXISTS samples(
   running INTEGER, waiting INTEGER, throughput REAL, token_usage REAL,
   gpu_util INTEGER, vram_used_mb INTEGER, vram_total_mb INTEGER)"""
 
+_SCHEMA_SETTINGS = """\
+CREATE TABLE IF NOT EXISTS settings(
+  key TEXT PRIMARY KEY, value TEXT NOT NULL)"""
+
 
 def percentile(values: list[float], p: int) -> float | None:
     """Nearest-Rank-Perzentil ohne Interpolation; leere Liste ergibt None.
@@ -71,8 +75,23 @@ class History:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(_SCHEMA_JOBS)
         conn.execute(_SCHEMA_SAMPLES)
+        conn.execute(_SCHEMA_SETTINGS)
         conn.commit()
         self._conn = conn
+
+    def get_setting(self, key: str) -> str | None:
+        """Wert einer allgemeinen Einstellung oder None, wenn sie fehlt."""
+        zeile = self._conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return None if zeile is None else zeile[0]
+
+    def set_setting(self, key: str, value: str) -> None:
+        """Schreibt/ersetzt eine allgemeine Einstellung (Upsert auf ``key``)."""
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO settings(key, value) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value))
 
     def record_job(self, job_dict: dict) -> None:
         """Schreibt/ersetzt eine Job-Zeile (INSERT OR REPLACE auf ``rid``).

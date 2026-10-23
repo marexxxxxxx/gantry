@@ -351,6 +351,11 @@ POOL_ARGS=()
 [[ "$MAXREQ"   != "0" ]] && POOL_ARGS+=(--max-running-requests "$MAXREQ")
 [[ "$MAXMAMBA" != "0" ]] && POOL_ARGS+=(--max-mamba-cache-size "$MAXMAMBA")
 [[ -n "$MAMBA_RATIO" ]] && POOL_ARGS+=(--mamba-full-memory-ratio "$MAMBA_RATIO")
+# Native Prioritaet: Das Gateway markiert Max-Requests mit priority=100, alle
+# anderen mit 0. Preemption ist aus, damit Max nur wartende Requests ueberholt
+# und keinen laufenden Job unterbricht.
+PRIORITY_ARGS=(--enable-priority-scheduling --default-priority-value 0
+               --disable-priority-preemption)
 RADIX_ARGS=()
 ATTN_ARGS=(); [[ -n "$ATTN_BACKEND" ]] && ATTN_ARGS+=(--attention-backend "$ATTN_BACKEND")
 AUTH_ARGS=(); [[ -n "$API_KEY" ]] && AUTH_ARGS+=(--api-key "$API_KEY")
@@ -441,6 +446,7 @@ exec "$PYBIN" -m sglang.launch_server \
   "${REASON_ARGS[@]}" \
   "${TEMPLATE_ARGS[@]}" \
   "${POOL_ARGS[@]}" \
+  "${PRIORITY_ARGS[@]}" \
   "${KV_ARGS[@]}" \
   "${HICACHE_ARGS[@]}" \
   "${RADIX_ARGS[@]}" \

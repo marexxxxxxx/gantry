@@ -5,7 +5,7 @@ E2E_BASE_URL (Default http://127.0.0.1:39000) und den Fake-SGLang aus
 fake_sglang.py als Upstream (127.0.0.1:39001). Chromium kommt ueber EXE
 (Pfad aus dem Playwright-Cache, von run_e2e.sh exportiert).
 
-Sechs Szenarien laufen nacheinander in einem Browserfenster:
+Sieben Szenarien laufen nacheinander in einem Browserfenster:
 
   1. Live-Ansicht: Verbindung, langsamer Job (wartend -> laeuft), Queue-
      Kennzahlen, Vorschau-Modal (Denken eingeklappt, Antwort waechst).
@@ -17,6 +17,9 @@ Sechs Szenarien laufen nacheinander in einem Browserfenster:
      Zeitfenster-Chip 7 Tage wird gedrueckt.
   6. Reconnect: Gateway stoppen/starten, conn-status und Job-Tabelle kommen
      zurueck (neuer Job wird wieder live verfolgt).
+  7. Prioritaet: Default-Marker und Schalter, Ausschalten, Marker ergaenzen,
+     speichern und nach einem Tabwechsel erneut aus der DB laden; danach
+     wieder auf den Ausgangszustand zuruecksetzen.
 
 Jedes Szenario druckt eine deutsche PASS/FAIL-Zeile; der Exit-Code ist
 ungleich 0, sobald eines fehlschlaegt. Es gibt keine festen Warteschlafen:
@@ -321,6 +324,43 @@ def szenario_6_reconnect(page: Page) -> None:
         "abgebrochen", timeout=DEADLINE_MS)
 
 
+def szenario_7_prioritaet(page: Page) -> None:
+    """Prioritaets-Tab: Defaults, Speichern, Persistenz und Zuruecksetzen."""
+    page.get_by_test_id("tab-priority").click()
+
+    schalter = page.get_by_test_id("priority-enabled")
+    standard_marker = page.get_by_test_id("priority-marker-0")
+    expect(schalter).to_be_checked(timeout=DEADLINE_MS)
+    expect(standard_marker).to_have_value(
+        "You are Max, built for Marec", timeout=DEADLINE_MS)
+
+    # Ausschalten und einen zusaetzlichen Marker anlegen.
+    schalter.uncheck()
+    page.get_by_test_id("priority-new-marker").fill("E2E Marker")
+    page.get_by_test_id("priority-add-marker").click()
+    expect(page.get_by_test_id("priority-marker-1")).to_have_value("E2E Marker")
+    page.get_by_test_id("priority-save").click()
+    expect(page.get_by_test_id("priority-meldung")).to_have_text(
+        "Gespeichert.", timeout=DEADLINE_MS)
+
+    # Tabwechsel erzwingt einen Neustart der Ansicht: die Werte muessen aus
+    # der DB nachgeladen werden, nicht nur im React-State stehen.
+    page.get_by_test_id("tab-live").click()
+    page.get_by_test_id("tab-priority").click()
+    expect(page.get_by_test_id("priority-enabled")).not_to_be_checked(
+        timeout=DEADLINE_MS)
+    expect(page.get_by_test_id("priority-marker-1")).to_have_value("E2E Marker")
+
+    # Ausgangszustand wiederherstellen (die Temp-DB wird ohnehin verworfen).
+    page.get_by_test_id("priority-enabled").check()
+    page.get_by_test_id("priority-remove-1").click()
+    page.get_by_test_id("priority-save").click()
+    expect(page.get_by_test_id("priority-meldung")).to_have_text(
+        "Gespeichert.", timeout=DEADLINE_MS)
+    expect(page.get_by_test_id("priority-enabled")).to_be_checked()
+    expect(page.get_by_test_id("priority-marker-1")).to_have_count(0)
+
+
 #: Reihenfolge der Szenarien (Name fuer die PASS/FAIL-Zeile, Funktion).
 SZENARIEN: list[tuple[str, Callable[[Page], None]]] = [
     ("Szenario 1 Live-Ansicht und Vorschau-Modal", szenario_1_live),
@@ -329,6 +369,7 @@ SZENARIEN: list[tuple[str, Callable[[Page], None]]] = [
     ("Szenario 4 Notaus", szenario_4_notaus),
     ("Szenario 5 Statistik", szenario_5_statistik),
     ("Szenario 6 Reconnect", szenario_6_reconnect),
+    ("Szenario 7 Prioritaet", szenario_7_prioritaet),
 ]
 
 

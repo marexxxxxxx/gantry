@@ -54,6 +54,7 @@ from .config import Config
 from .events import EventHub, format_comment
 from .history import History
 from .jobs import ACTIVE_STATUSES, Job, JobRegistry, JobStatus, job_to_dict
+from .priority import PriorityManager
 from .sse_parse import SSEByteParser, summarize_chunk
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,7 @@ class Deps:
     hub: EventHub
     history: History | None
     client: httpx.AsyncClient
+    priority: PriorityManager | None = None
 
 
 def ensure_rid(body: dict) -> str:
@@ -913,6 +915,11 @@ async def handle_v1(request: Request, deps: Deps) -> Response:
     koerper = _json_koerper(roh) if request.method == "POST" else None
     if koerper is None:
         return await _passthrough(request, deps, roh)
+    if (deps.priority is not None
+            and request.url.path.endswith(_CHAT_COMPLETIONS)):
+        # Max-Marker nur auf Chat-Bodies anwenden; andere JSON-POSTs
+        # (z. B. Embeddings) bleiben unveraendert.
+        deps.priority.mark(koerper)
     if koerper.get("stream") is not True:
         if request.url.path.endswith(_CHAT_COMPLETIONS):
             return await _nichtstream(request, deps, koerper)

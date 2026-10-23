@@ -82,6 +82,12 @@ export interface StatsWindow {
   buckets: StatsBucket[];
 }
 
+/** Persistente Prioritaets-Einstellungen (GET/PUT /monitor/priority). */
+export interface PrioritySettings {
+  enabled: boolean;
+  markers: string[];
+}
+
 /** Status der Dashboard-Verbindung (SSE). */
 export type VerbindungsStatus = "verbinde" | "verbunden" | "getrennt";
 
@@ -201,4 +207,20 @@ export async function cancelJob(rid: string): Promise<{ ok: boolean }> {
 /** ``POST /monitor/cancel_all`` -> ``{ok}`` (Notaus). */
 export async function cancelAll(): Promise<{ ok: boolean }> {
   return jsonAntwort<{ ok: boolean }>("/monitor/cancel_all", { method: "POST" });
+}
+
+/** ``GET /monitor/priority`` -> aktuelle Prioritaets-Einstellungen. */
+export async function fetchPrioritySettings(): Promise<PrioritySettings> {
+  return jsonAntwort<PrioritySettings>("/monitor/priority");
+}
+
+/** ``PUT /monitor/priority`` -> gespeicherte Einstellungen. */
+export async function updatePrioritySettings(
+  settings: PrioritySettings,
+): Promise<PrioritySettings> {
+  return jsonAntwort<PrioritySettings>("/monitor/priority", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(settings),
+  });
 }

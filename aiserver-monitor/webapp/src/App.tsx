@@ -3,6 +3,7 @@ import { cancelAll, connectEvents } from "./api";
 import type { Job, Sample, VerbindungsStatus } from "./api";
 import LiveView from "./LiveView";
 import PreviewModal from "./PreviewModal";
+import PriorityView from "./PriorityView";
 import StatsView from "./StatsView";
 
 /** Serverspalte der Kopfleiste als deutsche Beschriftung. */
@@ -18,7 +19,7 @@ const NOTAUS_FENSTER_MS = 5000;
 /** So viele Stats-Samples haelt der Ringpuffer fuer die Sparkline vor. */
 const RINGLAENGE = 30;
 
-type Tab = "live" | "stats";
+type Tab = "live" | "stats" | "priority";
 
 /** Echter Wert (nicht null/undefined), damit die UI "-" fuer Ungemessenes zeigt. */
 function vorhanden(wert: number | null | undefined): wert is number {
@@ -241,6 +242,15 @@ export default function App() {
           >
             Statistik
           </button>
+          <button
+            type="button"
+            className={tab === "priority" ? "tab tab-aktiv" : "tab"}
+            aria-pressed={tab === "priority"}
+            data-testid="tab-priority"
+            onClick={() => setTab("priority")}
+          >
+            Priorität
+          </button>
         </nav>
         <span className="notaus-bereich">
           <button
@@ -278,8 +288,10 @@ export default function App() {
             jetztMs={jetztMs}
             onVorschau={vorschauOeffnen}
           />
-        ) : (
+        ) : tab === "stats" ? (
           <StatsView />
+        ) : (
+          <PriorityView />
         )}
       </main>
       {modalJob !== null && (
