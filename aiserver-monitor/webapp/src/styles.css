@@ -432,6 +432,12 @@ body {
   max-width: 52rem;
 }
 
+.prioritaet-hindsight {
+  margin-top: 2.5rem;
+  padding-top: 1.8rem;
+  border-top: 1px solid var(--farbe-rand);
+}
+
 .prioritaet h2 {
   margin: 0 0 0.5rem;
   font-size: 1.15rem;

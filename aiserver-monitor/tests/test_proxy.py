@@ -27,6 +27,10 @@ from starlette.responses import StreamingResponse
 import fakes
 from aiserver_monitor.config import Config
 from aiserver_monitor.events import EventHub
+from aiserver_monitor.hindsight import (
+    DEFAULT_HINDSIGHT_MARKERS,
+    HindsightBlocker,
+)
 from aiserver_monitor.history import History
 from aiserver_monitor.jobs import JobRegistry, JobStatus, job_to_dict
 from aiserver_monitor.priority import (
@@ -153,7 +157,8 @@ class ProxyTestBasis(unittest.IsolatedAsyncioTestCase):
              connect_timeout_s: float = 5.0,
              nonstream_keepalive: bool = True,
              abort_on_disconnect: bool = True,
-             priority: PriorityManager | None = None) -> Deps:
+             priority: PriorityManager | None = None,
+             hindsight: HindsightBlocker | None = None) -> Deps:
         """Deps mit dem gegebenen Transport; der Client wird am Testende geschlossen."""
         if self._client is None:
             self._client = httpx.AsyncClient(transport=transport)
@@ -168,6 +173,7 @@ class ProxyTestBasis(unittest.IsolatedAsyncioTestCase):
             history=history,
             client=self._client,
             priority=priority if priority is not None else PriorityManager(),
+            hindsight=hindsight,
         )
 
 
@@ -315,6 +321,184 @@ class TestPrioritaet(ProxyTestBasis):
 
         self.assertEqual(await _body(antwort), fest)
         self.assertEqual(json.loads(gesehen[0].content), body)
+
+
+class TestHindsightBlock(ProxyTestBasis):
+    """GET/PUT /monitor/hindsight: Hindsight-Requests gezielt abweisen."""
+
+    def blockiert(self) -> HindsightBlocker:
+        blocker = HindsightBlocker()
+        blocker.update(enabled=True,
+                       markers=list(DEFAULT_HINDSIGHT_MARKERS))
+        return blocker
+
+    async def test_stream_hindsight_wird_ohne_upstream_abgewiesen(self):
+        fake = fakes.FakeSglang(_chat_skript(["Hallo"]))
+        deps = self.deps(httpx.ASGITransport(app=fake.app),
+                         hindsight=self.blockiert())
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "fake-modell",
+                "rid": "hindsight-stream",
+                "stream": True,
+                "messages": [
+                    {"role": "system", "content": (
+                        "Extract SIGNIFICANT facts from text. Be SELECTIVE")},
+                    {"role": "user", "content": "Text"},
+                ],
+            }),
+            deps)
+        roh = await _body(antwort)
+
+        self.assertEqual(antwort.status_code, 503)
+        self.assertEqual(antwort.headers.get("retry-after"), "60")
+        self.assertEqual(json.loads(roh)["error"]["type"],
+                         "hindsight_blocked")
+        self.assertEqual(fake.anfragen, [])          # kein SGLang-Kontakt
+        self.assertEqual(self.registry.snapshot(), [])  # kein Job
+
+    async def test_nonstream_hindsight_wird_ohne_upstream_abgewiesen(self):
+        fake = fakes.FakeSglang(_chat_skript(["Hallo"]))
+        deps = self.deps(httpx.ASGITransport(app=fake.app),
+                         hindsight=self.blockiert())
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "fake-modell",
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": (
+                        "You are a memory consolidation system. Synthesize")},
+                ],
+            }),
+            deps)
+
+        self.assertEqual(antwort.status_code, 503)
+        self.assertEqual(fake.anfragen, [])
+        self.assertEqual(self.registry.snapshot(), [])
+
+    async def test_aus_laeuft_hindsight_normal_und_wird_markiert(self):
+        fake = fakes.FakeSglang(_chat_skript(["Hallo"]))
+        deps = self.deps(httpx.ASGITransport(app=fake.app),
+                         hindsight=HindsightBlocker())
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "fake-modell",
+                "rid": "hindsight-aus",
+                "stream": True,
+                "messages": [
+                    {"role": "system", "content": (
+                        "Extract SIGNIFICANT facts from text")},
+                    {"role": "user", "content": "Text"},
+                ],
+            }),
+            deps)
+        await _body(antwort)
+
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(len(fake.anfragen), 1)
+        self.assertTrue(self.registry.get("hindsight-aus").hindsight)
+
+    async def test_an_laesst_normale_requests_durch(self):
+        fake = fakes.FakeSglang(_chat_skript(["Hallo"]))
+        deps = self.deps(httpx.ASGITransport(app=fake.app),
+                         hindsight=self.blockiert())
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "fake-modell",
+                "rid": "normal-trotz-blocker",
+                "stream": True,
+                "messages": [
+                    {"role": "system", "content": DEFAULT_MARKER},
+                    {"role": "user", "content": "Hi"},
+                ],
+            }),
+            deps)
+        await _body(antwort)
+
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(len(fake.anfragen), 1)
+        self.assertFalse(self.registry.get("normal-trotz-blocker").hindsight)
+
+    async def test_marker_nur_im_user_text_blockiert_nicht(self):
+        fake = fakes.FakeSglang(_chat_skript(["Hallo"]))
+        deps = self.deps(httpx.ASGITransport(app=fake.app),
+                         hindsight=self.blockiert())
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "fake-modell",
+                "rid": "user-hindsight",
+                "stream": True,
+                "messages": [{
+                    "role": "user",
+                    "content": "Extract SIGNIFICANT facts from text",
+                }],
+            }),
+            deps)
+        await _body(antwort)
+
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(len(fake.anfragen), 1)
+
+    async def test_embeddings_bleiben_trotz_blocker_unveraendert(self):
+        fest = b'{"data": [{"embedding": [0.1], "index": 0}]}'
+        gesehen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            gesehen.append(request)
+            return httpx.Response(200, content=fest, headers={
+                "content-type": "application/json"})
+
+        deps = self.deps(httpx.MockTransport(handler),
+                         hindsight=self.blockiert())
+        body = {
+            "model": "fake-modell",
+            "input": "Hallo",
+            "messages": [{"role": "system", "content": (
+                "Extract SIGNIFICANT facts from text")}],
+        }
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/embeddings", body), deps)
+
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(await _body(antwort), fest)
+        self.assertEqual(json.loads(gesehen[0].content), body)
+
+    async def test_blocker_waehrend_kopfzeile_bricht_stream_noch_ab(self):
+        # Zwischen Block-Check und Upstream-Kopfzeile kann das Dashboard den
+        # Blocker einschalten. Dann darf der Request nicht als Job starten.
+        blocker = HindsightBlocker()
+        pfade: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            pfade.append(request.url.path)
+            if request.url.path == "/abort_request":
+                return httpx.Response(200, json={"status": "ok"})
+            blocker.update(enabled=True,
+                           markers=list(DEFAULT_HINDSIGHT_MARKERS))
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"},
+                content=b"")
+
+        deps = self.deps(httpx.MockTransport(handler), hindsight=blocker)
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "fake-modell",
+                "rid": "race-hindsight",
+                "stream": True,
+                "messages": [{"role": "system", "content": (
+                    "Extract SIGNIFICANT facts from text")}],
+            }),
+            deps)
+
+        self.assertEqual(antwort.status_code, 503)
+        self.assertIn("/abort_request", pfade)
+        self.assertIsNone(self.registry.get("race-hindsight"))
 
 
 class TestStreamRelay(ProxyTestBasis):

@@ -71,6 +71,10 @@ class Job:
     completion_tokens: int | None = None
     fallback_completion_tokens: int = 0
     error: str | None = None
+    #: True, wenn der Request anhand seiner System-Prompt-Marker als
+    #: Hindsight erkannt wurde. Nur fuer den gezielten Abbruch im Gateway;
+    #: wird bewusst nicht serialisiert.
+    hindsight: bool = False
     #: Lazy erzeugtes Abbruch-Signal (nur ueber ``abort_signal`` gesetzt);
     #: wird nie serialisiert (``job_to_dict`` kennt es nicht).
     abort_event: asyncio.Event | None = None
@@ -88,12 +92,15 @@ class JobRegistry:
         self._jobs: dict[str, Job] = {}
 
     def register(self, rid: str, *, source: str, model: str, full_prompt: str,
-                 now: float) -> Job:
+                 now: float, hindsight: bool = False) -> Job:
         """Legt einen Job im Status waiting an; gleiche rid ersetzt den Alten.
 
-        Nach dem Einfuegen laeuft die Prune: mehr als ``MAX_BEENDETE_JOBS``
-        abgeschlossene Jobs kosten sonst immer mehr RAM (volles Prompt plus
-        Vorschau-Ringe). Aktive Jobs bleiben unangetastet.
+        ``hindsight`` markiert Requests, die das Gateway anhand ihrer
+        System-Prompt-Marker als Hindsight erkannt hat; nur solche Jobs
+        bricht die Hindsight-Route gezielt ab. Nach dem Einfuegen laeuft die
+        Prune: mehr als ``MAX_BEENDETE_JOBS`` abgeschlossene Jobs kosten sonst
+        immer mehr RAM (volles Prompt plus Vorschau-Ringe). Aktive Jobs
+        bleiben unangetastet.
         """
         job = Job(
             rid=rid,
@@ -104,6 +111,7 @@ class JobRegistry:
             created_at=now,
             content_ring=TextRing(self.preview_max_chars),
             reasoning_ring=TextRing(self.preview_max_chars),
+            hindsight=hindsight,
         )
         self._jobs[rid] = job
         self._prune_finished()

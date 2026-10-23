@@ -66,6 +66,14 @@ class TestJobRegistry(unittest.TestCase):
         self.assertEqual(d["tok_per_s"], 1.0)                  # 7 Tokens in 7 s Dekodierzeit
         self.assertIsNone(d["error"])
 
+    def test_hindsight_flag_ist_default_false_und_setzbar(self):
+        reg = JobRegistry(preview_max_chars=5)
+        reg.register("h1", source="s", model="m", full_prompt="p", now=0.0)
+        reg.register("h2", source="s", model="m", full_prompt="p", now=1.0,
+                     hindsight=True)
+        self.assertFalse(reg.get("h1").hindsight)
+        self.assertTrue(reg.get("h2").hindsight)
+
     def test_fallback_zaehlung_und_none(self):
         # ohne usage: completion_tokens == Anzahl nicht-leerer content/reasoning-Deltas
         # vor finish: prompt_tokens ist None, nicht 0

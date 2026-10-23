@@ -31,6 +31,7 @@ from .cancel import abort_request
 from .collector import Collector
 from .config import Config
 from .events import EventHub, format_sse, sse_stream
+from .hindsight import HindsightBlocker
 from .history import History
 from .jobs import ACTIVE_STATUSES, JobRegistry, JobStatus, job_to_dict
 from .metrics_parse import GpuSample
@@ -170,6 +171,7 @@ def create_app(config: Config, *,
         transport=transport if steuer_transport is None else steuer_transport,
         timeout=httpx.Timeout(_STEUER_TIMEOUT_S))
     priority = PriorityManager(history)
+    hindsight = HindsightBlocker(history)
     deps = Deps(
         config=config,
         registry=registry,
@@ -177,6 +179,7 @@ def create_app(config: Config, *,
         history=history,
         client=client,
         priority=priority,
+        hindsight=hindsight,
     )
     collector = Collector(deps, gpu_reader=gpu_reader, client=collector_client)
 
@@ -228,6 +231,34 @@ def create_app(config: Config, *,
                 "Abbruch am Upstream fehlgeschlagen (rid=%r, abort_all=%s):"
                 " %s: %s", rid, abort_all, type(exc).__name__, exc)
             return False
+
+    async def _hindsight_abbrechen() -> int:
+        """Bricht alle aktiven Hindsight-Jobs gezielt ab; Anzahl der Erfolge.
+
+        Anders als ``/monitor/cancel_all`` bleibt jeder normale Job
+        unangetastet. Je rid wird erst das lokale Signal gesetzt (der
+        Non-Stream-Pfad beendet damit seinen Lauf) und dann best effort am
+        Upstream abgemeldet. Schlaegt der Upstream-Abbruch fehl, bleibt der
+        Job aktiv; der Blocker verhindert dennoch neue Hindsight-Requests.
+        """
+        ziele = []
+        for eintrag in registry.snapshot():
+            if eintrag["status"] not in ACTIVE_STATUSES:
+                continue
+            job = registry.get(eintrag["rid"])
+            if job is not None and job.hindsight:
+                ziele.append(job)
+        abgebrochen = 0
+        for job in ziele:
+            signal = registry.abort_signal(job.rid)
+            if signal is not None:
+                signal.set()
+            ok = await _abbrechen(rid=job.rid, abort_all=False)
+            if ok and job.status in ACTIVE_STATUSES:
+                registry.finish(job.rid, JobStatus.ABORTED, now=time.time())
+                hub.publish("job", job_to_dict(job))
+                abgebrochen += 1
+        return abgebrochen
 
     @app.get("/healthz")
     async def healthz() -> dict:
@@ -307,6 +338,36 @@ def create_app(config: Config, *,
                 status_code=400,
                 content={"error": str(exc)})
         return priority.as_dict()
+
+    @app.get("/monitor/hindsight")
+    async def monitor_hindsight() -> dict:
+        return hindsight.as_dict()
+
+    @app.put("/monitor/hindsight")
+    async def monitor_hindsight_update(request: Request) -> Response:
+        try:
+            daten = await request.json()
+        except ValueError:
+            daten = None
+        if not isinstance(daten, dict):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "JSON-Objekt erwartet"})
+        enabled = daten.get("enabled")
+        if not isinstance(enabled, bool):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "enabled muss true oder false sein"})
+        try:
+            hindsight.update(enabled=enabled, markers=daten.get("markers"))
+        except (TypeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"error": str(exc)})
+        abgebrochen = await _hindsight_abbrechen() if enabled else 0
+        antwort = hindsight.as_dict()
+        antwort["aborted"] = abgebrochen
+        return JSONResponse(content=antwort)
 
     @app.get("/monitor/stats")
     async def monitor_stats(

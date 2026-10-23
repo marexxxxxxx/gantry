@@ -88,6 +88,17 @@ export interface PrioritySettings {
   markers: string[];
 }
 
+/** Persistente Hindsight-Einstellungen (GET/PUT /monitor/hindsight). */
+export interface HindsightSettings {
+  enabled: boolean;
+  markers: string[];
+}
+
+/** PUT-Antwort: gespeicherte Einstellungen plus abgebrochene Jobs. */
+export interface HindsightUpdate extends HindsightSettings {
+  aborted: number;
+}
+
 /** Status der Dashboard-Verbindung (SSE). */
 export type VerbindungsStatus = "verbinde" | "verbunden" | "getrennt";
 
@@ -219,6 +230,22 @@ export async function updatePrioritySettings(
   settings: PrioritySettings,
 ): Promise<PrioritySettings> {
   return jsonAntwort<PrioritySettings>("/monitor/priority", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(settings),
+  });
+}
+
+/** ``GET /monitor/hindsight`` -> aktuelle Hindsight-Einstellungen. */
+export async function fetchHindsightSettings(): Promise<HindsightSettings> {
+  return jsonAntwort<HindsightSettings>("/monitor/hindsight");
+}
+
+/** ``PUT /monitor/hindsight`` -> Einstellungen und abgebrochene Jobs. */
+export async function updateHindsightSettings(
+  settings: HindsightSettings,
+): Promise<HindsightUpdate> {
+  return jsonAntwort<HindsightUpdate>("/monitor/hindsight", {
     method: "PUT",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(settings),

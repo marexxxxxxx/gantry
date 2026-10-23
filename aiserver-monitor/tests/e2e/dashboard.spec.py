@@ -5,7 +5,7 @@ E2E_BASE_URL (Default http://127.0.0.1:39000) und den Fake-SGLang aus
 fake_sglang.py als Upstream (127.0.0.1:39001). Chromium kommt ueber EXE
 (Pfad aus dem Playwright-Cache, von run_e2e.sh exportiert).
 
-Sieben Szenarien laufen nacheinander in einem Browserfenster:
+Acht Szenarien laufen nacheinander in einem Browserfenster:
 
   1. Live-Ansicht: Verbindung, langsamer Job (wartend -> laeuft), Queue-
      Kennzahlen, Vorschau-Modal (Denken eingeklappt, Antwort waechst).
@@ -20,6 +20,9 @@ Sieben Szenarien laufen nacheinander in einem Browserfenster:
   7. Prioritaet: Default-Marker und Schalter, Ausschalten, Marker ergaenzen,
      speichern und nach einem Tabwechsel erneut aus der DB laden; danach
      wieder auf den Ausgangszustand zuruecksetzen.
+  8. Hindsight blockieren: Schalter sofort wirksam, Marker ergaenzen und
+     speichern, Persistenz nach Tabwechsel; danach wieder aus und Marker
+     entfernen.
 
 Jedes Szenario druckt eine deutsche PASS/FAIL-Zeile; der Exit-Code ist
 ungleich 0, sobald eines fehlschlaegt. Es gibt keine festen Warteschlafen:
@@ -361,6 +364,48 @@ def szenario_7_prioritaet(page: Page) -> None:
     expect(page.get_by_test_id("priority-marker-1")).to_have_count(0)
 
 
+def szenario_8_hindsight(page: Page) -> None:
+    """Hindsight-Blocker: sofort schalten, Marker speichern und zuruecksetzen."""
+    page.get_by_test_id("tab-priority").click()
+
+    schalter = page.get_by_test_id("hindsight-enabled")
+    expect(schalter).not_to_be_checked(timeout=DEADLINE_MS)
+    expect(page.get_by_test_id("hindsight-marker-0")).to_have_value(
+        "Extract SIGNIFICANT facts from text", timeout=DEADLINE_MS)
+
+    # Einschalten wirkt sofort (PUT im change-Handler, kein Speichern-Klick).
+    schalter.check()
+    expect(page.get_by_test_id("hindsight-meldung")).to_contain_text(
+        "Hindsight blockiert", timeout=DEADLINE_MS)
+
+    page.get_by_test_id("hindsight-new-marker").fill("E2E Hindsight")
+    page.get_by_test_id("hindsight-add-marker").click()
+    expect(page.get_by_test_id("hindsight-marker-2")).to_have_value(
+        "E2E Hindsight")
+    page.get_by_test_id("hindsight-save").click()
+    expect(page.get_by_test_id("hindsight-meldung")).to_have_text(
+        "Hindsight-Marker gespeichert.", timeout=DEADLINE_MS)
+
+    # Tabwechsel erzwingt das Nachladen aus der DB.
+    page.get_by_test_id("tab-live").click()
+    page.get_by_test_id("tab-priority").click()
+    expect(page.get_by_test_id("hindsight-enabled")).to_be_checked(
+        timeout=DEADLINE_MS)
+    expect(page.get_by_test_id("hindsight-marker-2")).to_have_value(
+        "E2E Hindsight")
+
+    # Ausgangszustand wiederherstellen.
+    page.get_by_test_id("hindsight-enabled").uncheck()
+    expect(page.get_by_test_id("hindsight-meldung")).to_have_text(
+        "Hindsight wieder erlaubt.", timeout=DEADLINE_MS)
+    page.get_by_test_id("hindsight-remove-2").click()
+    page.get_by_test_id("hindsight-save").click()
+    expect(page.get_by_test_id("hindsight-meldung")).to_have_text(
+        "Hindsight-Marker gespeichert.", timeout=DEADLINE_MS)
+    expect(page.get_by_test_id("hindsight-enabled")).not_to_be_checked()
+    expect(page.get_by_test_id("hindsight-marker-2")).to_have_count(0)
+
+
 #: Reihenfolge der Szenarien (Name fuer die PASS/FAIL-Zeile, Funktion).
 SZENARIEN: list[tuple[str, Callable[[Page], None]]] = [
     ("Szenario 1 Live-Ansicht und Vorschau-Modal", szenario_1_live),
@@ -370,6 +415,7 @@ SZENARIEN: list[tuple[str, Callable[[Page], None]]] = [
     ("Szenario 5 Statistik", szenario_5_statistik),
     ("Szenario 6 Reconnect", szenario_6_reconnect),
     ("Szenario 7 Prioritaet", szenario_7_prioritaet),
+    ("Szenario 8 Hindsight blockieren", szenario_8_hindsight),
 ]
 
 

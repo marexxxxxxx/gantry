@@ -52,6 +52,7 @@ from starlette.responses import Response, StreamingResponse
 from .cancel import abort_request
 from .config import Config
 from .events import EventHub, format_comment
+from .hindsight import HindsightBlocker
 from .history import History
 from .jobs import ACTIVE_STATUSES, Job, JobRegistry, JobStatus, job_to_dict
 from .priority import PriorityManager
@@ -79,6 +80,11 @@ _BODY_NICHT_ERREICHBAR = (
 #: Antwortkoerper eines lokal abgebrochenen Jobs (Cancel-Route).
 _BODY_ABGEBROCHEN = (
     b'{"error": {"message": "Job wurde abgebrochen", "type": "aborted"}}')
+
+#: Antwortkoerper, solange Hindsight im Dashboard blockiert ist.
+_BODY_HINDSIGHT_BLOCKIERT = (
+    b'{"error": {"message": "Hindsight ist voruebergehend blockiert", '
+    b'"type": "hindsight_blocked"}}')
 
 #: Antwortkoerper auf Pfade mit Punkt-Segmenten (Traversal-Versuch).
 _BODY_UNGUELTIGER_PFAD = (
@@ -114,6 +120,7 @@ class Deps:
     history: History | None
     client: httpx.AsyncClient
     priority: PriorityManager | None = None
+    hindsight: HindsightBlocker | None = None
 
 
 def ensure_rid(body: dict) -> str:
@@ -305,6 +312,13 @@ def _client_weg_antwort() -> Response:
     nginx); so bleibt der Rueckweg der Aufraeumpfade einheitlich.
     """
     return Response(status_code=499)
+
+
+def _hindsight_antwort() -> Response:
+    """503 fuer einen blockierten Hindsight-Request (kein Job, kein Upstream)."""
+    return Response(_BODY_HINDSIGHT_BLOCKIERT, status_code=503,
+                    headers={"Retry-After": "60"},
+                    media_type="application/json")
 
 
 class _DisconnectWatcher:
@@ -704,7 +718,8 @@ class _InternerStream:
         return json.dumps(antwort, ensure_ascii=False).encode("utf-8")
 
 
-async def _nichtstream(request: Request, deps: Deps, koerper: dict) -> Response:
+async def _nichtstream(request: Request, deps: Deps, koerper: dict, *,
+                       hindsight: bool = False) -> Response:
     """POST ``chat/completions`` mit ``stream != true``: interner Stream.
 
     Der Job entsteht **vor** dem Upstream-Aufruf und wird sofort als
@@ -734,6 +749,7 @@ async def _nichtstream(request: Request, deps: Deps, koerper: dict) -> Response:
         model=model,
         full_prompt=_extract_full_prompt(koerper),
         now=time.time(),
+        hindsight=hindsight,
     )
     deps.hub.publish("job", job_to_dict(job))
 
@@ -915,14 +931,21 @@ async def handle_v1(request: Request, deps: Deps) -> Response:
     koerper = _json_koerper(roh) if request.method == "POST" else None
     if koerper is None:
         return await _passthrough(request, deps, roh)
-    if (deps.priority is not None
-            and request.url.path.endswith(_CHAT_COMPLETIONS)):
-        # Max-Marker nur auf Chat-Bodies anwenden; andere JSON-POSTs
+    ist_hindsight = False
+    if request.url.path.endswith(_CHAT_COMPLETIONS):
+        # Marker nur auf Chat-Bodies anwenden; andere JSON-POSTs
         # (z. B. Embeddings) bleiben unveraendert.
-        deps.priority.mark(koerper)
+        if deps.priority is not None:
+            deps.priority.mark(koerper)
+        if deps.hindsight is not None:
+            ist_hindsight = deps.hindsight.matches(koerper)
+            if deps.hindsight.blocked(koerper):
+                # Blockiert: sofort 503, ohne SGLang-Kontakt und ohne Job.
+                return _hindsight_antwort()
     if koerper.get("stream") is not True:
         if request.url.path.endswith(_CHAT_COMPLETIONS):
-            return await _nichtstream(request, deps, koerper)
+            return await _nichtstream(request, deps, koerper,
+                                      hindsight=ist_hindsight)
         # Ruling R1: nur Chat-Non-Stream wird konvertiert; alle anderen
         # JSON-POSTs bleiben der getreue Byte-Passthrough ohne Job.
         return await _passthrough(request, deps, roh)
@@ -967,6 +990,15 @@ async def handle_v1(request: Request, deps: Deps) -> Response:
             return Response(inhalt, status_code=antwort.status_code,
                             headers=kopfzeilen)
 
+        if (ist_hindsight and deps.hindsight is not None
+                and deps.hindsight.settings().enabled):
+            # Der Blocker wurde waehrend des Kopfzeilen-Aufrufs aktiviert:
+            # Request bei SGLang abmelden, bevor ein Job entsteht.
+            await antwort.aread()
+            await antwort.aclose()
+            await _abort_best_effort(deps, rid)
+            return _hindsight_antwort()
+
         model = koerper.get("model")
         job = deps.registry.register(
             rid,
@@ -974,6 +1006,7 @@ async def handle_v1(request: Request, deps: Deps) -> Response:
             model=model if isinstance(model, str) else "",
             full_prompt=_extract_full_prompt(koerper),
             now=time.time(),
+            hindsight=ist_hindsight,
         )
         deps.hub.publish("job", job_to_dict(job))
         relay = _Relay(antwort, _JobTracker(deps, job),

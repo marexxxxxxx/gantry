@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 import fakes
 from aiserver_monitor.app import _CfClientMiddleware, client_source, create_app
 from aiserver_monitor.config import Config
+from aiserver_monitor.hindsight import DEFAULT_HINDSIGHT_MARKERS
 from aiserver_monitor.history import History
 from aiserver_monitor.jobs import JobStatus
 from aiserver_monitor.metrics_parse import GpuSample
@@ -52,6 +53,17 @@ def _job_dict(rid: str, status: str, created_at_ms: int, **felder) -> dict:
     }
     basis.update(felder)
     return basis
+
+
+def _chat_skript(tokens: list[str]) -> list[fakes.Schritt]:
+    """Kleines SGLang-SSE-Skript fuer App-Integrationstests."""
+    schritte = [(0.0, fakes.chat_chunk(
+        {"role": "assistant", "content": ""}))]
+    schritte += [(0.0, fakes.chat_chunk({"content": token}))
+                 for token in tokens]
+    schritte.append((0.0, fakes.chat_chunk({}, finish_reason="stop")))
+    schritte.append((0.0, fakes.DONE))
+    return schritte
 
 
 def _sample_dict(ts: float, **felder) -> dict:
@@ -312,6 +324,148 @@ class TestPrioritaetsRouten(AppTestCase):
                 "markers": [DEFAULT_MARKER],
             })
         self.assertEqual(antwort.status_code, 400)
+
+
+class TestHindsightRouten(AppTestCase):
+    """GET/PUT /monitor/hindsight: blockieren und gezielt Jobs abbrechen."""
+
+    def test_get_liefert_defaults(self):
+        with TestClient(self.app()) as c:
+            antwort = c.get("/monitor/hindsight")
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(antwort.json(), {
+            "enabled": False,
+            "markers": list(DEFAULT_HINDSIGHT_MARKERS),
+        })
+
+    def test_put_speichert_und_überlebt_neustart(self):
+        with TestClient(self.app()) as c:
+            antwort = c.put("/monitor/hindsight", json={
+                "enabled": True,
+                "markers": ["  Neuer Marker  ", "Noch einer"],
+            })
+            self.assertEqual(antwort.status_code, 200)
+            self.assertEqual(antwort.json(), {
+                "enabled": True,
+                "markers": ["Neuer Marker", "Noch einer"],
+                "aborted": 0,
+            })
+
+        with TestClient(self.app()) as c:
+            antwort = c.get("/monitor/hindsight")
+        self.assertEqual(antwort.json(), {
+            "enabled": True,
+            "markers": ["Neuer Marker", "Noch einer"],
+        })
+
+    def test_put_lehnt_ungueltige_marker_ab(self):
+        with TestClient(self.app()) as c:
+            antwort = c.put("/monitor/hindsight", json={
+                "enabled": True,
+                "markers": [42],
+            })
+            gespeichert = c.get("/monitor/hindsight")
+        self.assertEqual(antwort.status_code, 400)
+        self.assertEqual(gespeichert.json(), {
+            "enabled": False,
+            "markers": list(DEFAULT_HINDSIGHT_MARKERS),
+        })
+
+    def test_put_lehnt_nicht_bool_ab(self):
+        with TestClient(self.app()) as c:
+            antwort = c.put("/monitor/hindsight", json={
+                "enabled": "ja",
+                "markers": list(DEFAULT_HINDSIGHT_MARKERS),
+            })
+        self.assertEqual(antwort.status_code, 400)
+
+    def test_einschalten_bricht_nur_aktive_hindsight_jobs_ab(self):
+        fake = _AbortFake()
+        app = self.app(steuer_transport=httpx.MockTransport(fake))
+        with TestClient(app) as c:
+            reg = c.app.state.deps.registry
+            reg.register("h-waiting", source="s", model="m",
+                         full_prompt="p", now=1000.0, hindsight=True)
+            reg.register("h-running", source="s", model="m",
+                         full_prompt="p", now=1001.0, hindsight=True)
+            reg.note_running("h-running", now=1002.0)
+            reg.register("normal", source="s", model="m",
+                         full_prompt="p", now=1003.0)
+            reg.note_running("normal", now=1004.0)
+            reg.register("h-done", source="s", model="m",
+                         full_prompt="p", now=1005.0, hindsight=True)
+            reg.finish("h-done", JobStatus.DONE, now=1006.0)
+            queue = c.app.state.deps.hub.subscribe()
+
+            antwort = c.put("/monitor/hindsight", json={
+                "enabled": True,
+                "markers": list(DEFAULT_HINDSIGHT_MARKERS),
+            })
+
+            self.assertEqual(antwort.status_code, 200)
+            self.assertEqual(antwort.json()["aborted"], 2)
+            self.assertEqual(
+                sorted(eintrag["rid"] for eintrag in fake.koerper),
+                ["h-running", "h-waiting"])
+            self.assertTrue(all(
+                eintrag["abort_all"] is False for eintrag in fake.koerper))
+            self.assertIs(reg.get("h-waiting").status, JobStatus.ABORTED)
+            self.assertIs(reg.get("h-running").status, JobStatus.ABORTED)
+            self.assertIs(reg.get("normal").status, JobStatus.RUNNING)
+            self.assertIs(reg.get("h-done").status, JobStatus.DONE)
+            self.assertTrue(
+                reg.abort_signal("h-waiting").is_set())
+            self.assertTrue(
+                reg.abort_signal("h-running").is_set())
+            ereignisse = []
+            while not queue.empty():
+                rahmen = queue.get_nowait()
+                ereignisse.append(json.loads(rahmen.split("data: ", 1)[1]))
+            self.assertEqual(
+                sorted(eintrag["rid"] for eintrag in ereignisse
+                       if eintrag["status"] == "aborted"),
+                ["h-running", "h-waiting"])
+
+    def test_ausschalten_bricht_keine_jobs_ab(self):
+        fake = _AbortFake()
+        app = self.app(steuer_transport=httpx.MockTransport(fake))
+        with TestClient(app) as c:
+            c.app.state.deps.registry.register(
+                "h1", source="s", model="m", full_prompt="p", now=1000.0,
+                hindsight=True)
+            antwort = c.put("/monitor/hindsight", json={
+                "enabled": False,
+                "markers": list(DEFAULT_HINDSIGHT_MARKERS),
+            })
+            self.assertEqual(antwort.status_code, 200)
+            self.assertEqual(antwort.json()["aborted"], 0)
+            self.assertIs(c.app.state.deps.registry.get("h1").status,
+                          JobStatus.WAITING)
+        self.assertEqual(fake.requests, [])
+
+    def test_aktivierter_blocker_weist_hindsight_ab_und_laesst_normal_durch(self):
+        fake = fakes.FakeSglang(_chat_skript(["Hallo"]))
+        app = self.app(transport=httpx.ASGITransport(app=fake.app))
+        with TestClient(app) as c:
+            aktiviert = c.put("/monitor/hindsight", json={
+                "enabled": True,
+                "markers": list(DEFAULT_HINDSIGHT_MARKERS),
+            })
+            self.assertEqual(aktiviert.status_code, 200)
+            blocked = c.post("/v1/chat/completions", json={
+                "model": "m",
+                "messages": [{"role": "system", "content": (
+                    "Extract SIGNIFICANT facts from text")}],
+            })
+            normal = c.post("/v1/chat/completions", json={
+                "model": "m",
+                "messages": [{"role": "system", "content": DEFAULT_MARKER}],
+            })
+        self.assertEqual(blocked.status_code, 503)
+        self.assertEqual(blocked.json()["error"]["type"],
+                         "hindsight_blocked")
+        self.assertEqual(normal.status_code, 200)
+        self.assertEqual(len(fake.anfragen), 1)
 
 
 class _AbortFake:
