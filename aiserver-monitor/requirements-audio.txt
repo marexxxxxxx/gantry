@@ -1,3 +1,6 @@
 faster-whisper==1.2.1
+# PyAV 17+ entfernt `metadata_errors`, das faster-whisper 1.2.1 beim
+# Dekodieren setzt. 16.0.0 ist die letzte kompatible Version.
+av==16.0.0
 piper-tts==1.8.0
 python-multipart==0.0.20
