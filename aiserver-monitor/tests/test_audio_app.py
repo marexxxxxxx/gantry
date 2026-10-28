@@ -1,6 +1,7 @@
 """Tests fuer die Audio-FastAPI-App (Health, Modelle, Transkription)."""
 
 import asyncio
+import json
 import tempfile
 import time
 import unittest
@@ -48,7 +49,7 @@ class FakeStt:
             "datei_war_da": Path(path).exists(),
         })
         return Transcription(
-            text="Hallo", language=language, duration=2.5,
+            text="Hallo", language=language or "de", duration=2.5,
             segments=(Segment(0.0, 1.0, "Hallo"),
                       Segment(1.0, 2.5, "Welt")))
 
@@ -155,10 +156,14 @@ class AudioAppTestBasis(unittest.IsolatedAsyncioTestCase):
             encoder_factory=kwargs.pop("encoder_factory", FakeEncoder()),
             **kwargs)
 
-    async def request(self, app, methode, pfad, **kwargs):
+    async def request(self, app, methode, pfad, *,
+                      raise_app_exceptions=True, **kwargs):
         async with app.router.lifespan_context(app):
-            async with AsyncClient(transport=ASGITransport(app=app),
-                                   base_url="http://audio") as client:
+            async with AsyncClient(
+                    transport=ASGITransport(
+                        app=app,
+                        raise_app_exceptions=raise_app_exceptions),
+                    base_url="http://audio") as client:
                 return await client.request(methode, pfad, **kwargs)
 
     async def transkription(self, app, daten=None, datei=None, **kwargs):
@@ -193,6 +198,14 @@ class TestHealthUndModelle(AudioAppTestBasis):
                                       preload="whisper-small")
         await self.request(self.app(), "GET", "/healthz")
         self.assertEqual(self.stt.preloaded, ["whisper-small"])
+
+    async def test_unbekannter_pfad_404_mit_fehlerformat(self):
+        antwort = await self.request(
+            self.app(), "GET", "/v1/audio/unbekannt")
+        self.assertEqual(antwort.status_code, 404)
+        fehler = antwort.json()["error"]
+        self.assertEqual(fehler["code"], "invalid_request")
+        self.assertEqual(fehler["type"], "invalid_request_error")
 
 
 class TestTranskription(AudioAppTestBasis):
@@ -241,7 +254,20 @@ class TestTranskription(AudioAppTestBasis):
         antwort = await self.transkription(
             self.app(), daten={"model": "whisper-1", "language": "auto"})
         self.assertEqual(antwort.status_code, 200)
-        self.assertEqual(self.stt.aufrufe[0]["language"], "auto")
+        self.assertIsNone(self.stt.aufrufe[0]["language"])
+
+    async def test_language_code_wird_normalisiert(self):
+        antwort = await self.transkription(
+            self.app(), daten={"language": " DE "})
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(self.stt.aufrufe[0]["language"], "de")
+
+    async def test_unbekannte_sprache_400_ohne_transkription(self):
+        antwort = await self.transkription(
+            self.app(), daten={"language": "xx"})
+        self.assertEqual(antwort.status_code, 400)
+        self.assertEqual(antwort.json()["error"]["code"], "invalid_request")
+        self.assertEqual(self.stt.aufrufe, [])
 
     async def test_prompt_und_temperature_werden_uebergeben(self):
         antwort = await self.transkription(
@@ -279,6 +305,19 @@ class TestTranskription(AudioAppTestBasis):
             data={"model": "whisper-small"})
         self.assertEqual(antwort.status_code, 400)
         self.assertEqual(antwort.json()["error"]["code"], "invalid_request")
+
+    async def test_kaputter_multipart_400_mit_fehlerformat(self):
+        with self.assertLogs("python_multipart.multipart", level="WARNING"):
+            antwort = await self.request(
+                self.app(), "POST", "/v1/audio/transcriptions",
+                content=b"kaputt",
+                headers={"content-type":
+                         "multipart/form-data; boundary=defekt"})
+        self.assertEqual(antwort.status_code, 400)
+        fehler = antwort.json()["error"]
+        self.assertEqual(fehler["code"], "invalid_request")
+        self.assertEqual(fehler["type"], "invalid_request_error")
+        self.assertEqual(self.stt.aufrufe, [])
 
     async def test_zu_grosse_datei_413(self):
         self.settings = AudioSettings(models_dir=self.models_dir,
@@ -329,6 +368,40 @@ class TestTranskription(AudioAppTestBasis):
         antwort = await self.transkription(app)
         self.assertEqual(antwort.status_code, 504)
         self.assertEqual(antwort.json()["error"]["code"], "timeout")
+
+    async def test_timeout_haelt_datei_und_slot_bis_arbeit_endet(self):
+        class Langsam(FakeStt):
+            pfad = None
+
+            def transcribe(self, path, **kwargs):
+                self.pfad = Path(path)
+                time.sleep(0.6)
+                return super().transcribe(path, **kwargs)
+
+        class Zaehler:
+            freigaben = 0
+
+            async def acquire(self):
+                pass
+
+            def release(self):
+                self.freigaben += 1
+
+        stt = Langsam()
+        zaehler = Zaehler()
+        self.settings = AudioSettings(models_dir=self.models_dir,
+                                      preload="", stt_timeout_s=0.1)
+        app = create_audio_app(
+            self.settings, stt_engine=stt, tts_engine=FakeTts(),
+            duration_probe=lambda _: 2.5)
+        app.state.stt_admission = zaehler
+        antwort = await self.transkription(app)
+        self.assertEqual(antwort.status_code, 504)
+        self.assertTrue(stt.pfad.exists())
+        self.assertEqual(zaehler.freigaben, 0)
+        await asyncio.sleep(0.7)
+        self.assertFalse(stt.pfad.exists())
+        self.assertEqual(zaehler.freigaben, 1)
 
     async def test_keine_transkripte_oder_prompts_im_log(self):
         with self.assertLogs("aiserver_audio.app", level="INFO") as logs:
@@ -467,6 +540,45 @@ class TestSprache(AudioAppTestBasis):
         self.assertEqual(antwort.status_code, 504)
         self.assertEqual(antwort.json()["error"]["code"], "timeout")
 
+    async def test_timeout_haelt_slot_bis_synthese_endet(self):
+        class Zaehler:
+            freigaben = 0
+
+            async def acquire(self):
+                pass
+
+            def release(self):
+                self.freigaben += 1
+
+        zaehler = Zaehler()
+        self.settings = AudioSettings(
+            models_dir=self.models_dir, preload="", tts_timeout_s=0.1)
+        self.tts = FakeTts(delay=0.4)
+        app = self.app()
+        app.state.tts_admission = zaehler
+        antwort = await self.sprich(app)
+        self.assertEqual(antwort.status_code, 504)
+        self.assertEqual(zaehler.freigaben, 0)
+        await asyncio.sleep(0.5)
+        self.assertEqual(zaehler.freigaben, 1)
+
+    async def test_engine_fehler_500_mit_fehlerformat(self):
+        class Kaputt(FakeTts):
+            def synthesize(self, text, *, info, speed):
+                raise RuntimeError("kaputt")
+                yield  # pragma: no cover
+
+        self.tts = Kaputt()
+        with self.assertLogs("aiserver_audio.app", level="WARNING"):
+            antwort = await self.request(
+                self.app(), "POST", "/v1/audio/speech",
+                json={"input": "Guten Tag.", "voice": "thorsten"},
+                raise_app_exceptions=False)
+        self.assertEqual(antwort.status_code, 500)
+        fehler = antwort.json()["error"]
+        self.assertEqual(fehler["code"], "internal_error")
+        self.assertEqual(fehler["type"], "server_error")
+
     async def test_umlaute_und_langer_satz_ohne_punkt(self):
         text = "Grüße aus München: " + "ä" * 3000
         antwort = await self.sprich(self.app(), input=text)
@@ -478,6 +590,69 @@ class TestSprache(AudioAppTestBasis):
             antwort = await self.sprich(self.app(), input="streng-geheim")
         self.assertEqual(antwort.status_code, 200)
         self.assertNotIn("streng-geheim", "\n".join(logs.output))
+
+
+class TestDisconnect(unittest.IsolatedAsyncioTestCase):
+    async def test_http_disconnect_beendet_encoder_und_gibt_frei(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            models = Path(tmp)
+            _stimme_anlegen(models, "thorsten")
+            settings = AudioSettings(models_dir=models, preload="")
+            tts = FakeTts(delay=0.3)
+            encoder = FakeEncoder(b"x")
+
+            class Zaehler:
+                def __init__(self):
+                    self.freigaben = 0
+
+                async def acquire(self):
+                    pass
+
+                def release(self):
+                    self.freigaben += 1
+
+            admission = Zaehler()
+            app = create_audio_app(
+                settings, stt_engine=FakeStt(), tts_engine=tts,
+                duration_probe=lambda _: 2.5,
+                encoder_factory=encoder)
+            app.state.tts_admission = admission
+
+            koerper = json.dumps({
+                "input": "Erster Satz. Zweiter Satz.",
+                "voice": "thorsten", "response_format": "mp3"}).encode()
+            scope = {
+                "type": "http", "asgi": {"version": "3.0",
+                                         "spec_version": "2.3"},
+                "http_version": "1.1", "method": "POST", "scheme": "http",
+                "path": "/v1/audio/speech", "raw_path": b"/v1/audio/speech",
+                "query_string": b"", "root_path": "",
+                "headers": [(b"content-type", b"application/json"),
+                            (b"content-length", str(len(koerper)).encode())],
+                "client": ("test", 1), "server": ("test", 80),
+            }
+            erste_ausgabe = asyncio.Event()
+            anfrage_gesendet = False
+
+            async def receive():
+                nonlocal anfrage_gesendet
+                if not anfrage_gesendet:
+                    anfrage_gesendet = True
+                    return {"type": "http.request", "body": koerper}
+                await erste_ausgabe.wait()
+                return {"type": "http.disconnect"}
+
+            async def send(nachricht):
+                if (nachricht["type"] == "http.response.body"
+                        and nachricht.get("body")):
+                    erste_ausgabe.set()
+
+            await app(scope, receive, send)
+            self.assertTrue(encoder.prozesse[0].terminated)
+            self.assertTrue(encoder.prozesse[0].stdin.closed)
+            self.assertEqual(admission.freigaben, 1)
+            await asyncio.sleep(0.4)
+            self.assertEqual(tts.offen, 0)
 
 
 class TestStreaming(unittest.IsolatedAsyncioTestCase):

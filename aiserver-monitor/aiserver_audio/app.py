@@ -13,6 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .catalog import (models_payload, resolve_voice, resolve_whisper,
                       voice_installed, whisper_installed)
@@ -20,7 +21,8 @@ from .config import AudioSettings, load_settings
 from .errors import AudioError, audio_error_body
 from .ffmpeg import probe_duration
 from .queue import Admission, QueueFull
-from .stt import FasterWhisperEngine, Transcription
+from .stt import (FasterWhisperEngine, Transcription,
+                  normalize_language)
 from .tts import (PiperEngine, content_type, split_sentences,
                   start_encoder, stream_audio)
 
@@ -103,14 +105,39 @@ def _voice_download_befehl(info) -> str:
     return f"runtime/audio/download-models.sh --voices {name}"
 
 
+def _pruefe_sprache(language: str) -> str | None:
+    """Normalisiert Sprachcodes und weist unbekannte mit 400 ab."""
+    code = normalize_language(language)
+    if code is None:
+        return None
+    from faster_whisper.tokenizer import _LANGUAGE_CODES
+
+    if code not in _LANGUAGE_CODES:
+        raise AudioError(400, "invalid_request",
+                         f"Unbekannter Sprachcode: {language!r}")
+    return code
+
+
 async def _synthese(tts, satz, info, speed):
     return await asyncio.to_thread(
         lambda: list(tts.synthesize(satz, info=info, speed=speed)))
 
 
+async def _aufraeumen_nach_arbeit(arbeit, pfad: Path | None, admission):
+    """Gibt Slot und Tempdatei erst frei, wenn der Thread wirklich endet."""
+    try:
+        await arbeit
+    except BaseException:
+        pass
+    finally:
+        if pfad is not None:
+            pfad.unlink(missing_ok=True)
+        admission.release()
+
+
 async def stream_speech(tts, text: str, *, info, fmt: str, speed: float,
                         timeout_s: float,
-                        encoder_factory=start_encoder):
+                        encoder_factory=start_encoder, on_late=None):
     """Synthetisiert Satz fuer Satz und liefert die Audiodaten als Stream.
 
     Der erste Satz wird vor dem ersten Byte vollstaendig synthetisiert; bei
@@ -131,9 +158,13 @@ async def stream_speech(tts, text: str, *, info, fmt: str, speed: float,
                                  "Sprachausgabe hat das Zeitlimit "
                                  "ueberschritten")
             try:
+                arbeit = asyncio.create_task(
+                    _synthese(tts, satz, info, speed))
                 teile = await asyncio.wait_for(
-                    _synthese(tts, satz, info, speed), rest)
+                    asyncio.shield(arbeit), rest)
             except asyncio.TimeoutError:
+                if on_late is not None:
+                    on_late(arbeit)
                 raise AudioError(504, "timeout",
                                  "Sprachausgabe hat das Zeitlimit "
                                  "ueberschritten") from None
@@ -195,6 +226,23 @@ def create_audio_app(settings: AudioSettings | None = None, *,
             audio_error_body("Ungueltige Anfrage", "invalid_request"),
             status_code=400)
 
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_fehler(request, exc: StarletteHTTPException):
+        code = ("invalid_request" if 400 <= exc.status_code < 500
+                else "internal_error")
+        return JSONResponse(
+            audio_error_body(str(exc.detail), code),
+            status_code=exc.status_code,
+            headers=exc.headers)
+
+    @app.exception_handler(Exception)
+    async def _unerwartet(request, exc: Exception):
+        logger.warning("audio unerwartet: %s", type(exc).__name__)
+        return JSONResponse(
+            audio_error_body("Audio-Verarbeitung fehlgeschlagen",
+                             "internal_error"),
+            status_code=500)
+
     @app.get("/healthz")
     async def healthz():
         return {"status": "ok"}
@@ -219,6 +267,7 @@ def create_audio_app(settings: AudioSettings | None = None, *,
         if response_format not in _FORMATE:
             raise AudioError(400, "invalid_request",
                              f"Unbekanntes Format: {response_format!r}")
+        sprache = _pruefe_sprache(language)
         if not whisper_installed(settings.models_dir, info):
             raise AudioError(
                 503, "model_not_installed",
@@ -227,6 +276,7 @@ def create_audio_app(settings: AudioSettings | None = None, *,
 
         await app.state.stt_admission.acquire()
         tmp_pfad: Path | None = None
+        aufraeumen_spaeter = False
         try:
             with tempfile.NamedTemporaryFile(
                     delete=False,
@@ -252,15 +302,18 @@ def create_audio_app(settings: AudioSettings | None = None, *,
 
             status = "ok"
             start = time.perf_counter()
+            arbeit = asyncio.create_task(asyncio.to_thread(
+                stt.transcribe, tmp_pfad, info=info,
+                language=sprache, prompt=prompt,
+                temperature=temperature))
             try:
                 ergebnis = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        stt.transcribe, tmp_pfad, info=info,
-                        language=language, prompt=prompt,
-                        temperature=temperature),
-                    timeout=settings.stt_timeout_s)
+                    asyncio.shield(arbeit), timeout=settings.stt_timeout_s)
             except asyncio.TimeoutError:
                 status = "timeout"
+                aufraeumen_spaeter = True
+                asyncio.create_task(_aufraeumen_nach_arbeit(
+                    arbeit, tmp_pfad, app.state.stt_admission))
                 raise AudioError(504, "timeout",
                                  "Transkription hat das Zeitlimit ueberschritten")
             except AudioError:
@@ -284,9 +337,10 @@ def create_audio_app(settings: AudioSettings | None = None, *,
                 media_type=_MEDIA_TYPES[response_format])
         finally:
             await file.close()
-            if tmp_pfad is not None:
-                tmp_pfad.unlink(missing_ok=True)
-            app.state.stt_admission.release()
+            if not aufraeumen_spaeter:
+                if tmp_pfad is not None:
+                    tmp_pfad.unlink(missing_ok=True)
+                app.state.stt_admission.release()
 
     @app.post("/v1/audio/speech")
     async def sprache(anfrage: SpeechRequest):
@@ -309,11 +363,19 @@ def create_audio_app(settings: AudioSettings | None = None, *,
                              "input darf nicht leer sein")
 
         await app.state.tts_admission.acquire()
+        freigabe_spaeter = False
+
+        def spaeter(arbeit):
+            nonlocal freigabe_spaeter
+            freigabe_spaeter = True
+            arbeit.add_done_callback(
+                lambda _: app.state.tts_admission.release())
+
         agen = stream_speech(
             app.state.tts, text, info=info,
             fmt=anfrage.response_format, speed=anfrage.speed,
             timeout_s=settings.tts_timeout_s,
-            encoder_factory=encoder_factory)
+            encoder_factory=encoder_factory, on_late=spaeter)
         try:
             erster = await agen.__anext__()
         except BaseException:
@@ -321,16 +383,20 @@ def create_audio_app(settings: AudioSettings | None = None, *,
                 await agen.aclose()
             except Exception:
                 pass
-            app.state.tts_admission.release()
+            if not freigabe_spaeter:
+                app.state.tts_admission.release()
             raise
 
         freigegeben = False
+        freigabe_lock = asyncio.Lock()
 
-        def freigeben():
+        async def freigeben():
             nonlocal freigegeben
-            if not freigegeben:
+            async with freigabe_lock:
+                if freigegeben or freigabe_spaeter:
+                    return
                 freigegeben = True
-                app.state.tts_admission.release()
+            app.state.tts_admission.release()
 
         start = time.perf_counter()
 
@@ -353,7 +419,7 @@ def create_audio_app(settings: AudioSettings | None = None, *,
                     await agen.aclose()
                 except Exception:
                     pass
-                freigeben()
+                await freigeben()
                 logger.info(
                     "audio tts voice=%s status=%s seconds=%.2f",
                     info.id, status, time.perf_counter() - start)

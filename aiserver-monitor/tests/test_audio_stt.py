@@ -116,6 +116,22 @@ class TestFasterWhisperEngine(unittest.TestCase):
         self.assertEqual(kwargs["initial_prompt"], "Tisch reservieren")
         self.assertEqual(kwargs["temperature"], 0.2)
 
+    def test_sprache_auto_wird_zu_none(self):
+        engine = FasterWhisperEngine(self.settings)
+        with mock.patch.dict(sys.modules, {"faster_whisper": fake_modul()}):
+            engine.transcribe(
+                Path("/tmp/a.wav"), info=self.small, language=" AUTO ",
+                prompt=None, temperature=0.0)
+        self.assertIsNone(FakeWhisperModel.calls[0][1]["language"])
+
+    def test_sprache_wird_kleingeschrieben(self):
+        engine = FasterWhisperEngine(self.settings)
+        with mock.patch.dict(sys.modules, {"faster_whisper": fake_modul()}):
+            engine.transcribe(
+                Path("/tmp/a.wav"), info=self.small, language=" DE ",
+                prompt=None, temperature=0.0)
+        self.assertEqual(FakeWhisperModel.calls[0][1]["language"], "de")
+
     def test_laufendes_modell_wird_nicht_evictet(self):
         engine = FasterWhisperEngine(self.settings)
         FakeWhisperModel.transcribe_started = threading.Event()

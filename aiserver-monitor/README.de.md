@@ -137,7 +137,7 @@ Einstellungen lassen sich vor dem Start des Sidecars über `AUDIO_*`-Variablen
 ändern: `AUDIO_HOST`, `AUDIO_PORT`, `AUDIO_MODELS_DIR` (Default
 `/mnt/models/audio`), `AUDIO_THREADS` (8), `AUDIO_PRELOAD` (`whisper-small`,
 leer deaktiviert), `AUDIO_MODEL_CACHE` (1), `AUDIO_MAX_QUEUE` (8),
-`AUDIO_STT_TIMEOUT_S` (1800), `AUDIO_TTS_TIMEOUT_S` (120) und
+`AUDIO_STT_TIMEOUT` (1800), `AUDIO_TTS_TIMEOUT` (120) und
 `AUDIO_MAX_UPLOAD_MB` (100). Gateway-seitig: `audio_base`,
 `audio_timeout_s` und `audio_max_upload_mb`.
 

@@ -1139,7 +1139,7 @@ async def handle_audio(request: Request, deps: Deps) -> Response:
         return Response(antwort.content, status_code=antwort.status_code,
                         headers=_response_headers(antwort))
 
-    if pfad.endswith("/transcriptions"):
+    if request.method == "POST":
         laenge = request.headers.get("content-length", "").strip()
         if laenge.isdigit() and int(laenge) > grenze:
             return _audio_fehler(
@@ -1147,13 +1147,6 @@ async def handle_audio(request: Request, deps: Deps) -> Response:
                 f"Upload groesser als {deps.config.audio_max_upload_mb} MB.")
         inhalt: bytes | AsyncIterator[bytes] = _begrenzter_upload(
             request, grenze)
-    else:
-        roh = await request.body()
-        if len(roh) > grenze:
-            return _audio_fehler(
-                413, "audio_too_large",
-                f"Upload groesser als {deps.config.audio_max_upload_mb} MB.")
-        inhalt = roh
 
     try:
         anfrage = deps.client.build_request(

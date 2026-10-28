@@ -94,7 +94,7 @@ Endpunkt und VRAM sind nicht nötig.
 ```bash
 bash runtime/audio/setup.sh                      # Abhängigkeiten + ffmpeg-Check
 bash runtime/audio/download-models.sh --all      # ca. 3,8 GB nach /mnt/models/audio
-bash run.sh restart                              # Gateway + Embedding + Audio
+bash aiserver-monitor/run.sh restart             # Gateway + Embedding + Audio
 ```
 
 ```bash
@@ -119,7 +119,7 @@ Akzente werden meist erkannt, Mundart nicht garantiert, und es gibt keine
 AT/CH-Piper-Stimmen. Direkte Steuerung: `runtime/audio/start-audio.sh`,
 `runtime/audio/stop-audio.sh`, `runtime/audio/selftest.sh`. Tuning:
 `AUDIO_MODELS_DIR`, `AUDIO_THREADS`, `AUDIO_PRELOAD`, `AUDIO_MODEL_CACHE`,
-`AUDIO_MAX_QUEUE`, `AUDIO_STT_TIMEOUT_S`, `AUDIO_TTS_TIMEOUT_S`,
+`AUDIO_MAX_QUEUE`, `AUDIO_STT_TIMEOUT`, `AUDIO_TTS_TIMEOUT`,
 `AUDIO_MAX_UPLOAD_MB`, `AUDIO_HOST`, `AUDIO_PORT`.
 
 ## Inhaltsverzeichnis

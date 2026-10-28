@@ -28,9 +28,16 @@ class Transcription:
 class SttEngine(Protocol):
     def preload(self, info: WhisperInfo) -> None: ...
 
-    def transcribe(self, path: Path, *, info: WhisperInfo, language: str,
+    def transcribe(self, path: Path, *, info: WhisperInfo,
+                   language: str | None,
                    prompt: str | None,
                    temperature: float) -> Transcription: ...
+
+
+def normalize_language(language: str | None) -> str | None:
+    """Macht aus ``auto``/leer ``None`` und normalisiert Grossschreibung."""
+    code = (language or "").strip().casefold()
+    return None if code in ("", "auto") else code
 
 
 class FasterWhisperEngine:
@@ -63,14 +70,15 @@ class FasterWhisperEngine:
         with self._lock:
             self._laden(info)
 
-    def transcribe(self, path: Path, *, info: WhisperInfo, language: str,
+    def transcribe(self, path: Path, *, info: WhisperInfo,
+                   language: str | None,
                    prompt: str | None,
                    temperature: float) -> Transcription:
         with self._lock:
             modell = self._laden(info)
             roh_segmente, details = modell.transcribe(
                 str(path),
-                language=language,
+                language=normalize_language(language),
                 task="transcribe",
                 beam_size=1,
                 vad_filter=True,

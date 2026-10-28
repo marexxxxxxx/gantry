@@ -1068,6 +1068,25 @@ class TestAudioRouting(ProxyTestBasis):
         self.assertEqual(inhalt["error"]["code"], "audio_too_large")
         self.assertEqual(self.registry.snapshot(), [])
 
+    async def test_chunked_speech_body_ueber_limit_ergibt_413(self):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            await request.aread()
+            return httpx.Response(200, content=b"{}")
+
+        deps = self.deps(httpx.MockTransport(handler))
+        deps.config.audio_max_upload_mb = 1
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/audio/speech",
+                     teile=[b"a" * 600_000, b"b" * 600_000],
+                     headers={"content-type": "application/json"}),
+            deps)
+
+        self.assertEqual(antwort.status_code, 413)
+        inhalt = json.loads(await _body(antwort))
+        self.assertEqual(inhalt["error"]["code"], "audio_too_large")
+        self.assertEqual(self.registry.snapshot(), [])
+
     async def test_connect_fehler_ergibt_502(self):
         def handler(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("sidecar weg", request=request)

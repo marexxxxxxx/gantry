@@ -1,7 +1,8 @@
 """Einheitliches Fehlerformat des Audio-Sidecars."""
 
 _SERVER_CODES = frozenset((
-    "model_not_installed", "upstream_unavailable", "timeout"))
+    "internal_error", "model_not_installed", "upstream_unavailable",
+    "timeout"))
 
 
 class AudioError(Exception):

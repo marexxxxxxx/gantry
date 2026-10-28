@@ -91,7 +91,7 @@ endpoint and no VRAM are needed.
 ```bash
 bash runtime/audio/setup.sh                      # dependencies + ffmpeg check
 bash runtime/audio/download-models.sh --all      # ~3.8 GB to /mnt/models/audio
-bash run.sh restart                              # gateway + embedding + audio
+bash aiserver-monitor/run.sh restart             # gateway + embedding + audio
 ```
 
 ```bash
@@ -116,7 +116,7 @@ usually recognised, dialects are not guaranteed, and there are no AT/CH Piper
 voices. Direct control: `runtime/audio/start-audio.sh`,
 `runtime/audio/stop-audio.sh`, `runtime/audio/selftest.sh`. Tuning:
 `AUDIO_MODELS_DIR`, `AUDIO_THREADS`, `AUDIO_PRELOAD`, `AUDIO_MODEL_CACHE`,
-`AUDIO_MAX_QUEUE`, `AUDIO_STT_TIMEOUT_S`, `AUDIO_TTS_TIMEOUT_S`,
+`AUDIO_MAX_QUEUE`, `AUDIO_STT_TIMEOUT`, `AUDIO_TTS_TIMEOUT`,
 `AUDIO_MAX_UPLOAD_MB`, `AUDIO_HOST`, `AUDIO_PORT`.
 
 ## Table of contents
