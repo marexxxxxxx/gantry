@@ -53,6 +53,7 @@ mkdir -p "$(dirname "$PIDFILE")" "$(dirname "$LOG")"
 # CPU und darf kein VRAM belegen.
 CUDA_VISIBLE_DEVICES="" \
 OMP_NUM_THREADS="${AUDIO_THREADS:-8}" \
+PYTHONPATH="$ROOT/aiserver-monitor${PYTHONPATH:+:$PYTHONPATH}" \
 nohup nice -n 5 "$PYTHON" -B -m aiserver_audio >>"$LOG" 2>&1 &
 echo $! > "$PIDFILE"
 

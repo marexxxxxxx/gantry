@@ -163,6 +163,27 @@ if (exec 3<>"/dev/tcp/127.0.0.1/39003") 2>/dev/null; then
 fi
 pass "Port 39003 ist frei"
 
+# --- Audio-Sidecar direkt aus einem fremden Arbeitsverzeichnis ---------------
+# start-audio.sh muss das Paket auch finden, wenn es nicht aus
+# aiserver-monitor/ heraus aufgerufen wird (Doku nennt die Repo-Wurzel).
+out=$( (cd "$WORKDIR" && "$PROJEKT/../runtime/audio/start-audio.sh") 2>&1 ); rc=$?
+if [ "$rc" -eq 0 ]; then
+    pass "start-audio.sh funktioniert aus fremdem Arbeitsverzeichnis"
+else
+    fail "start-audio.sh scheitert aus fremdem Arbeitsverzeichnis: $out"
+fi
+if curl -sf -o /dev/null "http://127.0.0.1:39003/healthz"; then
+    pass "direkt gestarteter Audio-Sidecar antwortet"
+else
+    fail "direkt gestarteter Audio-Sidecar antwortet nicht"
+fi
+out=$("$PROJEKT/../runtime/audio/stop-audio.sh" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+    pass "stop-audio.sh stoppt den direkt gestarteten Sidecar"
+else
+    fail "stop-audio.sh lieferte $rc: $out"
+fi
+
 # --- start -------------------------------------------------------------------
 
 out=$("$RUN" start 2>&1); rc=$?
