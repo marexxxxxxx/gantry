@@ -11,7 +11,8 @@ from pathlib import Path
 
 from aiserver_audio.catalog import piper_files, resolve_voice
 from aiserver_audio.config import AudioSettings
-from aiserver_audio.tts import AudioChunk, PiperEngine, split_sentences
+from aiserver_audio.tts import (AudioChunk, PiperEngine, content_type,
+                                split_sentences, stream_audio, wav_header)
 
 
 class FakeAudioChunk:
@@ -188,3 +189,138 @@ class TestPiperEngine(PiperTestBasis):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeStdin:
+    def __init__(self, prozess):
+        self.prozess = prozess
+
+    def write(self, daten):
+        self.prozess.geschrieben.append(daten)
+
+    async def drain(self):
+        self.prozess.drains += 1
+
+    def close(self):
+        self.prozess.stdin_zu = True
+
+
+class FakeStdout:
+    def __init__(self, prozess):
+        self.prozess = prozess
+
+    async def read(self, n):
+        if self.prozess.ausgabe:
+            return self.prozess.ausgabe.pop(0)
+        return b""
+
+
+class FakeProzess:
+    def __init__(self, ausgabe=()):
+        self.ausgabe = list(ausgabe)
+        self.geschrieben = []
+        self.drains = 0
+        self.stdin_zu = False
+        self.terminiert = False
+        self.gekillt = False
+        self.gewartet = False
+        self.returncode = None
+        self.stdin = FakeStdin(self)
+        self.stdout = FakeStdout(self)
+
+    def terminate(self):
+        self.terminiert = True
+        self.returncode = -15
+
+    def kill(self):
+        self.gekillt = True
+        self.returncode = -9
+
+    async def wait(self):
+        self.gewartet = True
+        return self.returncode or 0
+
+
+async def _quelle(*chunks):
+    for chunk in chunks:
+        yield chunk
+
+
+class TestAusgabeformate(unittest.IsolatedAsyncioTestCase):
+    def test_content_types(self):
+        self.assertEqual(content_type("pcm"), "audio/pcm")
+        self.assertEqual(content_type("wav"), "audio/wav")
+        self.assertEqual(content_type("mp3"), "audio/mpeg")
+        self.assertEqual(content_type("opus"), "audio/ogg")
+        with self.assertRaises(ValueError):
+            content_type("flac")
+
+    def test_wav_header(self):
+        header = wav_header(22050)
+        self.assertEqual(len(header), 44)
+        self.assertTrue(header.startswith(b"RIFF"))
+        self.assertEqual(header[8:12], b"WAVE")
+        rate = int.from_bytes(header[24:28], "little")
+        kanaele = int.from_bytes(header[22:24], "little")
+        bits = int.from_bytes(header[34:36], "little")
+        self.assertEqual((rate, kanaele, bits), (22050, 1, 16))
+        self.assertEqual(int.from_bytes(header[4:8], "little"), 0xFFFFFFFF)
+        self.assertEqual(int.from_bytes(header[40:44], "little"), 0xFFFFFFFF)
+
+    async def test_wav_liefert_header_und_pcm(self):
+        chunks = [AudioChunk(b"\x01\x02", 22050),
+                  AudioChunk(b"\x03\x04", 22050)]
+        ausgabe = [b async for b in stream_audio(_quelle(*chunks), "wav")]
+        self.assertEqual(ausgabe[0], wav_header(22050))
+        self.assertEqual(ausgabe[1:], [b"\x01\x02", b"\x03\x04"])
+
+    async def test_pcm_24k_ohne_encoder(self):
+        aufrufe = []
+
+        async def factory(fmt, rate):
+            aufrufe.append((fmt, rate))
+            return FakeProzess()
+
+        chunks = [AudioChunk(b"\x01", 24000), AudioChunk(b"\x02", 24000)]
+        ausgabe = [b async for b in stream_audio(
+            _quelle(*chunks), "pcm", encoder_factory=factory)]
+        self.assertEqual(ausgabe, [b"\x01", b"\x02"])
+        self.assertEqual(aufrufe, [])
+
+    async def test_pcm_22050_nutzt_encoder_einmal(self):
+        prozess = FakeProzess([b"out1", b"out2"])
+        aufrufe = []
+
+        async def factory(fmt, rate):
+            aufrufe.append((fmt, rate))
+            return prozess
+
+        chunks = [AudioChunk(b"\x01", 22050), AudioChunk(b"\x02", 22050)]
+        ausgabe = [b async for b in stream_audio(
+            _quelle(*chunks), "pcm", encoder_factory=factory)]
+        self.assertEqual(aufrufe, [("pcm", 22050)])
+        self.assertEqual(ausgabe, [b"out1", b"out2"])
+        self.assertEqual(prozess.geschrieben, [b"\x01", b"\x02"])
+        self.assertTrue(prozess.stdin_zu)
+        self.assertTrue(prozess.gewartet)
+
+    async def test_mp3_und_opus_ein_encoder_fuer_alle_chunks(self):
+        for fmt, typ in (("mp3", "audio/mpeg"), ("opus", "audio/ogg")):
+            with self.subTest(fmt=fmt):
+                prozess = FakeProzess([b"encoded"])
+                aufrufe = []
+
+                async def factory(f, rate, prozess=prozess, aufrufe=aufrufe):
+                    aufrufe.append((f, rate))
+                    return prozess
+
+                chunks = [AudioChunk(b"\x01", 22050),
+                          AudioChunk(b"\x02", 22050)]
+                ausgabe = [b async for b in stream_audio(
+                    _quelle(*chunks), fmt, encoder_factory=factory)]
+                self.assertEqual(aufrufe, [(fmt, 22050)])
+                self.assertEqual(ausgabe, [b"encoded"])
+                self.assertEqual(prozess.geschrieben, [b"\x01", b"\x02"])
+                self.assertTrue(prozess.stdin_zu)
+                self.assertTrue(prozess.gewartet)
+                self.assertEqual(content_type(fmt), typ)

@@ -1,7 +1,9 @@
 """Piper-TTS auf der CPU: Stimmen-Pool und Satz-Splitting."""
 
+import asyncio
 import json
 import re
+import struct
 import threading
 from dataclasses import dataclass
 from typing import Iterator, Protocol
@@ -101,3 +103,132 @@ class PiperEngine:
                                  sample_rate=chunk.sample_rate)
         finally:
             self._zurueckgeben(info, voice, pool)
+
+
+_CONTENT_TYPES = {
+    "pcm": "audio/pcm",
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
+    "opus": "audio/ogg",
+}
+
+_BLOCKGROESSE = 64 * 1024
+_ENCODER_TIMEOUT_S = 5.0
+
+
+def content_type(fmt: str) -> str:
+    """Content-Type der Ausgabe; unbekannte Formate werden abgelehnt."""
+    try:
+        return _CONTENT_TYPES[fmt]
+    except KeyError:
+        raise ValueError(f"unbekanntes Audioformat: {fmt}") from None
+
+
+def wav_header(sample_rate: int) -> bytes:
+    """Streaming-WAV-Kopf mit unbekannter Gesamtlaenge."""
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 0xFFFFFFFF, b"WAVE",
+        b"fmt ", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16,
+        b"data", 0xFFFFFFFF)
+
+
+async def start_encoder(fmt: str, sample_rate: int):
+    """Startet ffmpeg als Roh-PCM-Encoder fuer MP3/Opus/Resampling."""
+    basis = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "s16le", "-ar", str(sample_rate), "-ac", "1", "-i", "pipe:0",
+    ]
+    if fmt == "pcm":
+        ziel = ["-f", "s16le", "-ar", "24000", "-ac", "1", "pipe:1"]
+    elif fmt == "mp3":
+        ziel = ["-f", "mp3", "-b:a", "64k", "pipe:1"]
+    elif fmt == "opus":
+        ziel = ["-f", "opus", "-c:a", "libopus", "-b:a", "32k", "pipe:1"]
+    else:
+        raise ValueError(f"unbekanntes Audioformat: {fmt}")
+    return await asyncio.create_subprocess_exec(
+        *basis, *ziel,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL)
+
+
+async def _schreiben(prozess, chunks) -> None:
+    try:
+        async for chunk in chunks:
+            prozess.stdin.write(chunk.pcm)
+            await prozess.stdin.drain()
+    finally:
+        try:
+            prozess.stdin.close()
+        except Exception:
+            pass
+
+
+async def _aufraeumen(prozess) -> None:
+    try:
+        prozess.stdin.close()
+    except Exception:
+        pass
+    if getattr(prozess, "returncode", None) is not None:
+        return
+    try:
+        prozess.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.wait_for(prozess.wait(), _ENCODER_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        try:
+            prozess.kill()
+        except ProcessLookupError:
+            pass
+        await prozess.wait()
+
+
+async def stream_audio(chunks, fmt: str, *,
+                       encoder_factory=start_encoder):
+    """Liefert PCM/WAV direkt oder laesst ffmpeg einmal fuer alle Chunks laufen."""
+    content_type(fmt)
+    quelle = chunks.__aiter__()
+    try:
+        erster = await quelle.__anext__()
+    except StopAsyncIteration:
+        return
+
+    if fmt == "wav":
+        yield wav_header(erster.sample_rate)
+        yield erster.pcm
+        async for chunk in quelle:
+            yield chunk.pcm
+        return
+
+    if fmt == "pcm" and erster.sample_rate == 24000:
+        yield erster.pcm
+        async for chunk in quelle:
+            yield chunk.pcm
+        return
+
+    async def alle():
+        yield erster
+        async for chunk in quelle:
+            yield chunk
+
+    prozess = await encoder_factory(fmt, erster.sample_rate)
+    schreiber = asyncio.create_task(_schreiben(prozess, alle()))
+    try:
+        while True:
+            block = await prozess.stdout.read(_BLOCKGROESSE)
+            if not block:
+                break
+            yield block
+        await schreiber
+    finally:
+        if not schreiber.done():
+            schreiber.cancel()
+            try:
+                await schreiber
+            except (asyncio.CancelledError, Exception):
+                pass
+        await _aufraeumen(prozess)
