@@ -27,13 +27,16 @@
 # gehoert runtime/sglang/, der des Gateways hier - zwei getrennte Lebenszyklen.
 # Der CPU-Embedding-Sidecar (runtime/embed/) gehoert zum Gateway: /v1/embeddings
 # ist ohne ihn nicht nutzbar, also startet und stoppt run.sh ihn mit. Ein
-# Backend-Wechsel (server.sh) laesst ihn unberuehrt.
+# Backend-Wechsel (server.sh) laesst ihn unberuehrt. Dasselbe gilt fuer den
+# Audio-Sidecar (runtime/audio/) fuer /v1/audio/* auf 127.0.0.1:30003.
 set -euo pipefail
 
 # run.sh liegt im Projektverzeichnis; `python -m aiserver_monitor` findet das
 # Paket nur von dort aus, und relative Pfade wie `data/monitor.db` stimmen nur
 # von hier.
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Skripte der Sidecars liegen im Repo unter runtime/, nicht im Gateway-Paket.
+RUNTIME="$(cd "$ROOT/.." && pwd)/runtime"
 
 PYTHON="${PYTHON:-/home/user/small_qwen/.venv/bin/python}"
 PORT="${AISERVER_MONITOR_LISTEN_PORT:-30000}"
@@ -57,18 +60,22 @@ else
 fi
 HEALTH="http://127.0.0.1:${PORT}/healthz"
 EMBED_BASE="${AISERVER_MONITOR_EMBED_BASE:-http://127.0.0.1:30002}"
+AUDIO_BASE="${AISERVER_MONITOR_AUDIO_BASE:-http://127.0.0.1:30003}"
 # 20 s sind die Grenze aus dem Muster. Ueberschreibbar, damit ein Test nicht
 # 20 s auf das Beenden wartet.
 STOP_GRACE="${STOP_GRACE:-20}"
 START_WAIT="${START_WAIT:-20}"
 
 usage() {
-    echo "usage: $0 {start|stop|status|restart}"
+    echo "usage: $0 {start|stop|status|restart|audio-setup|audio-models [args...]}"
     echo "  start     Gateway im Hintergrund starten und auf /healthz warten"
     echo "  stop      Gateway beenden (TERM, ${STOP_GRACE}s, dann KILL)"
     echo "  status    Zustand lesen, Exit 1 wenn das Gateway nicht laeuft"
     echo "  restart   stop und start"
+    echo "  audio-setup   Audio-Abhaengigkeiten in die .venv installieren"
+    echo "  audio-models  Whisper/Piper-Modelle verwalten (--all, --check, ...)"
     echo "Umgebung: AISERVER_MONITOR_LISTEN_PORT=$PORT PIDFILE=$PIDFILE"
+    echo "          AUDIO_BASE=$AUDIO_BASE"
     exit 2
 }
 
@@ -167,7 +174,7 @@ kill_one() {
 }
 
 start_embed() {
-    local script="$ROOT/runtime/embed/start-embed.sh"
+    local script="$RUNTIME/embed/start-embed.sh"
     [ -f "$script" ] || return 0
     if ! bash "$script"; then
         echo "[aiserver-monitor] WARNUNG: Embedding-Sidecar (CPU) startet nicht; /v1/embeddings bleibt ohne Upstream." >&2
@@ -175,13 +182,47 @@ start_embed() {
 }
 
 stop_embed() {
-    local script="$ROOT/runtime/embed/stop-embed.sh"
+    local script="$RUNTIME/embed/stop-embed.sh"
     [ -f "$script" ] || return 0
     bash "$script" || true
 }
 
+start_audio() {
+    local script="$RUNTIME/audio/start-audio.sh"
+    [ -f "$script" ] || return 0
+    if ! bash "$script"; then
+        echo "[aiserver-monitor] WARNUNG: Audio-Sidecar (CPU) startet nicht; /v1/audio bleibt ohne Upstream." >&2
+    fi
+}
+
+stop_audio() {
+    local script="$RUNTIME/audio/stop-audio.sh"
+    [ -f "$script" ] || return 0
+    bash "$script" || true
+}
+
+status_audio() {
+    if ! curl -sf -m 2 -o /dev/null "${AUDIO_BASE%/}/healthz" 2>/dev/null; then
+        echo "[aiserver-monitor] Audio-Sidecar (CPU) laeuft nicht; /v1/audio hat keinen Upstream"
+        return 0
+    fi
+    # Die Anzahl installierter Modelle ist eine Information, kein Zustand:
+    # fehlt sie, bleibt die Statuszeile trotzdem stehen.
+    local modelle
+    modelle=$(curl -sf -m 2 "${AUDIO_BASE%/}/v1/audio/models" 2>/dev/null |
+        "$PYTHON" -c 'import json,sys
+d = json.load(sys.stdin)
+w = d["whisper"]["models"]
+v = d["tts"]["voices"]
+print(sum(1 for m in w if m["installed"]), "/", len(w), ", ",
+      sum(1 for m in v if m["installed"]), "/", len(v), sep="")' 2>/dev/null) || true
+    [ -n "${modelle:-}" ] || modelle="0/3, 0/3"
+    echo "[aiserver-monitor] Audio-Sidecar (CPU) laeuft auf $AUDIO_BASE (Modelle: $modelle)"
+}
+
 start() {
     start_embed
+    start_audio
     if is_running; then
         echo "[aiserver-monitor] laeuft bereits (PID $(monitor_pids), Port $PORT)"
         return 0
@@ -241,6 +282,7 @@ stop() {
     if ! is_running; then
         echo "[aiserver-monitor] laeuft nicht"
         rm -f "$PIDFILE"
+        stop_audio
         stop_embed
         return 0
     fi
@@ -283,6 +325,7 @@ stop() {
         echo "[aiserver-monitor] ERROR: $(monitor_pids) laeuft noch nach dem KILL" >&2
         return 1
     fi
+    stop_audio
     stop_embed
     echo "[aiserver-monitor] gestoppt"
 }
@@ -304,12 +347,23 @@ status() {
     else
         echo "[aiserver-monitor] Embedding-Sidecar (CPU) laeuft nicht; /v1/embeddings hat keinen Upstream"
     fi
+    status_audio
+}
+
+audio_setup() {
+    bash "$RUNTIME/audio/setup.sh"
+}
+
+audio_models() {
+    bash "$RUNTIME/audio/download-models.sh" "$@"
 }
 
 case "${1:-}" in
-    start)      start ;;
-    stop)       stop ;;
-    status)     status ;;
-    restart)    stop; start ;;
-    *)          usage ;;
+    start)        start ;;
+    stop)         stop ;;
+    status)       status ;;
+    restart)      stop; start ;;
+    audio-setup)  audio_setup ;;
+    audio-models) shift; audio_models "$@" ;;
+    *)            usage ;;
 esac

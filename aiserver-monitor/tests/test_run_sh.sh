@@ -6,11 +6,13 @@
 # spaetere Gateway-Port 30000 werden nie angefasst - der SGLang-Zustand wird am
 # Ende gegengeprueft.
 #
-# Vier Dinge halten die Testinstanz von der Produktion fern:
+# Sechs Dinge halten die Testinstanz von der Produktion fern:
 #   * eigener Port (39055) ueber AISERVER_MONITOR_LISTEN_PORT
 #   * eigener Upstream (39099) ueber AISERVER_MONITOR_UPSTREAM_BASE
 #   * DB, Anwendungs-Log und Lauf-Log liegen im Temp-Verzeichnis
+#   * Audio-Sidecar auf 39003 mit eigenem PID-File und Modellverzeichnis
 #   * STOP_GRACE=5, damit `stop` im Fehlerfall nicht 20 s wartet
+#   * START_WAIT=15
 #
 # Ohne `-e`: ein Test soll nach dem ersten Fehler weiterlaufen. Mit `-e` bricht
 # die Assertion ab, und der Fehler sieht wie ein Erfolg aus.
@@ -34,6 +36,19 @@ export AISERVER_MONITOR_DB_PATH="$WORKDIR/monitor.db"
 export AISERVER_MONITOR_LOG_PATH="$WORKDIR/aiserver-monitor.log"
 export PIDFILE="$WORKDIR/run.pid"
 export AISERVER_MONITOR_RUN_LOG="$WORKDIR/run.log"
+# Der Audio-Sidecar bekommt einen eigenen Port, ein eigenes PID-File und ein
+# leeres Modellverzeichnis. Die Produktion auf 30003 und /mnt/models/audio
+# bleibt damit unberuehrt; AUDIO_PRELOAD="" verhindert das Laden von Whisper.
+export AISERVER_MONITOR_AUDIO_BASE="http://127.0.0.1:39003"
+export AUDIO_PORT=39003
+export AUDIO_PRELOAD=""
+export AUDIO_MODELS_DIR="$WORKDIR/audio"
+export AUDIO_PIDFILE="$WORKDIR/audio.pid"
+export AUDIO_LOG="$WORKDIR/audio.log"
+# Auch der Embedding-Sidecar braucht ein eigenes PID-File: `run.sh stop` ruft
+# stop-embed.sh auf und darf den Produktions-Ollama auf 30002 nicht beenden.
+export AISERVER_MONITOR_EMBED_BASE="http://127.0.0.1:39002"
+export EMBED_PIDFILE="$WORKDIR/embed.pid"
 export STOP_GRACE=5
 export START_WAIT=15
 
@@ -79,6 +94,28 @@ grep -q 'nohup' "$RUN" && pass "nohup verwendet" || fail "nohup fehlt"
 grep -q 'healthz' "$RUN" && pass "Health-Poll auf /healthz" || fail "Health-Poll auf /healthz fehlt"
 if [ -x "$RUN" ]; then pass "run.sh ist ausfuehrbar"; else fail "run.sh ist nicht ausfuehrbar (chmod +x fehlt)"; fi
 
+for skript in "$PROJEKT/../runtime/audio/setup.sh" \
+              "$PROJEKT/../runtime/audio/download-models.sh" \
+              "$PROJEKT/../runtime/audio/start-audio.sh" \
+              "$PROJEKT/../runtime/audio/stop-audio.sh" \
+              "$PROJEKT/../runtime/audio/selftest.sh"; do
+    name=$(basename "$skript")
+    if [ ! -f "$skript" ]; then
+        fail "$name fehlt"
+    elif ! bash -n "$skript" 2>/dev/null; then
+        fail "Syntaxfehler in $name"
+    elif [ ! -x "$skript" ]; then
+        fail "$name ist nicht ausfuehrbar"
+    else
+        pass "$name: Syntax gueltig und ausfuehrbar"
+    fi
+done
+
+out=$("$RUN" 2>&1); rc=$?
+if [ "$rc" -eq 2 ]; then pass "usage liefert 2"; else fail "usage lieferte $rc statt 2: $out"; fi
+case "$out" in *audio-setup*) pass "usage nennt audio-setup" ;; *) fail "usage nennt audio-setup nicht: $out" ;; esac
+case "$out" in *audio-models*) pass "usage nennt audio-models" ;; *) fail "usage nennt audio-models nicht: $out" ;; esac
+
 # --- Vorbedingung: nichts laeuft --------------------------------------------
 
 if [ -n "$(pgrep -f '[a]iserver_monitor' 2>/dev/null)" ]; then
@@ -111,6 +148,21 @@ if port_busy; then
 fi
 pass "Port $TEST_PORT ist frei"
 
+# --- audio-models --check ohne Modelle ---------------------------------------
+# Das Modellverzeichnis ist leer: --check darf nichts herunterladen und muss
+# mit Exit 1 enden.
+out=$("$RUN" audio-models --check 2>&1); rc=$?
+if [ "$rc" -eq 1 ]; then pass "audio-models --check liefert 1 bei leerem Verzeichnis"; else fail "audio-models --check lieferte $rc statt 1: $out"; fi
+case "$out" in *missing*) pass "audio-models --check meldet fehlende Modelle" ;; *) fail "audio-models --check meldet keine fehlenden Modelle: $out" ;; esac
+
+# --- Audio-Port frei? ---------------------------------------------------------
+if (exec 3<>"/dev/tcp/127.0.0.1/39003") 2>/dev/null; then
+    fail "Port 39003 ist belegt - Audio-Test kann nicht laufen"
+    echo "$FAILURES Skript-Test(s) fehlgeschlagen"
+    exit 1
+fi
+pass "Port 39003 ist frei"
+
 # --- start -------------------------------------------------------------------
 
 out=$("$RUN" start 2>&1); rc=$?
@@ -125,6 +177,17 @@ if curl -sf -o /dev/null "http://127.0.0.1:$TEST_PORT/healthz"; then
     pass "healthz auf $TEST_PORT erreichbar"
 else
     fail "healthz auf $TEST_PORT nicht erreichbar"
+fi
+if curl -sf -o /dev/null "http://127.0.0.1:39003/healthz"; then
+    pass "Audio-Sidecar healthz auf 39003 erreichbar"
+else
+    fail "Audio-Sidecar healthz auf 39003 nicht erreichbar"
+fi
+AUDIO_PID=$(head -n 1 -- "$AUDIO_PIDFILE" 2>/dev/null || true)
+if [ -n "$AUDIO_PID" ] && kill -0 "$AUDIO_PID" 2>/dev/null; then
+    pass "Audio-Sidecar-Prozess laeuft (PID $AUDIO_PID)"
+else
+    fail "kein Audio-Sidecar-Prozess nach start"
 fi
 if [ -n "$PID1" ] && tr '\0' ' ' <"/proc/$PID1/cmdline" 2>/dev/null |
     grep -qE -- '(^|[[:space:]])-m[[:space:]]+aiserver_monitor([[:space:]]|$)'; then
@@ -162,6 +225,7 @@ out=$("$RUN" status 2>&1); rc=$?
 if [ "$rc" -eq 0 ]; then pass "status liefert 0, wenn er laeuft"; else fail "status liefert $rc statt 0: $out"; fi
 case "$out" in *"$PID1"*) pass "status nennt die PID" ;; *) fail "status nennt keine PID: $out" ;; esac
 case "$out" in *"$TEST_PORT"*) pass "status nennt den Port" ;; *) fail "status nennt keinen Port: $out" ;; esac
+case "$out" in *"Audio-Sidecar (CPU) laeuft"*) pass "status meldet den Audio-Sidecar" ;; *) fail "status meldet den Audio-Sidecar nicht: $out" ;; esac
 PID_STILL=$(head -n 1 -- "$PIDFILE" 2>/dev/null || true)
 if [ "$PID_STILL" = "$PID1" ]; then pass "status hat den Prozess nicht angefasst"; else fail "status hat den Prozess ersetzt: $PID1 zu $PID_STILL"; fi
 
@@ -180,6 +244,12 @@ if ! curl -sf -o /dev/null "http://127.0.0.1:$TEST_PORT/healthz"; then
 else
     fail "healthz nach stop noch erreichbar"
 fi
+if ! curl -sf -o /dev/null "http://127.0.0.1:39003/healthz"; then
+    pass "Audio-Sidecar nach stop nicht erreichbar"
+else
+    fail "Audio-Sidecar nach stop noch erreichbar"
+fi
+if [ ! -e "$AUDIO_PIDFILE" ]; then pass "Audio-PID-Datei nach stop entfernt"; else fail "Audio-PID-Datei nach stop nicht entfernt"; fi
 
 out=$("$RUN" stop 2>&1); rc=$?
 if [ "$rc" -eq 0 ]; then pass "stop zweimal liefert 0"; else fail "stop zweimal liefert $rc statt 0: $out"; fi

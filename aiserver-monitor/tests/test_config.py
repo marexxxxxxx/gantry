@@ -111,6 +111,15 @@ class TestLoadConfig(unittest.TestCase):
         self.assertAlmostEqual(cfg.audio_timeout_s, 600.0)
         self.assertEqual(cfg.audio_max_upload_mb, 50)
 
+    def test_nur_das_praefix_audio_base_wirkt(self):
+        # AUDIO_BASE ist die Variable von run.sh, nicht die App-Konfiguration.
+        # Die App liest ausschliesslich AISERVER_MONITOR_AUDIO_BASE.
+        cfg = load_config(env={
+            "AUDIO_BASE": "http://127.0.0.1:39999",
+            "AISERVER_MONITOR_AUDIO_BASE": "http://127.0.0.1:39003",
+        })
+        self.assertEqual(cfg.audio_base, "http://127.0.0.1:39003")
+
     def test_audio_nicht_positive_limits_werden_abgewiesen(self):
         for feld in ("audio_timeout_s", "audio_max_upload_mb"):
             for wert in ("0", "-1", "-0.5"):
