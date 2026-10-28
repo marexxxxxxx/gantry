@@ -40,9 +40,9 @@ bash run.sh restart    # stop, then start
 
 `start` and `stop` are idempotent: a second `start` prints "laeuft bereits"
 and exits 0, a `stop` without a running gateway exits 0 as well. `run.sh`
-starts and stops the CPU embedding sidecar together with the gateway, because
-`/v1/embeddings` has no other upstream. The SGLang server is never started,
-stopped or flipped by `run.sh`.
+starts and stops the CPU embedding and audio sidecars together with the
+gateway, because `/v1/embeddings` and `/v1/audio/*` have no other upstream.
+The SGLang server is never started, stopped or flipped by `run.sh`.
 
 ### Embeddings (CPU)
 
@@ -67,6 +67,88 @@ The sidecar can also be controlled directly:
 bash runtime/embed/start-embed.sh
 bash runtime/embed/stop-embed.sh
 ```
+
+### Audio (CPU)
+
+Whisper speech-to-text and Piper text-to-speech run in an independent FastAPI
+sidecar on `audio_base` (default `http://127.0.0.1:30003`). The gateway only
+streams between client and sidecar; it keeps no audio in memory and creates no
+monitor job.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/audio/models` | installed Whisper models and Piper voices |
+| `POST` | `/v1/audio/transcriptions` | multipart upload, returns text/JSON/SRT/VTT |
+| `POST` | `/v1/audio/speech` | JSON text, returns streamed audio |
+
+Whisper models: `whisper-small` (default, 484 MB), `whisper-medium`
+(1528 MB) and `whisper-large-v3-turbo` (1618 MB). Piper voices:
+`de_DE-thorsten-medium` (`thorsten`, default), `de_DE-kerstin-low`
+(`kerstin`) and `de_DE-eva_k-x_low` (`eva`). Model aliases are accepted, e.g.
+`whisper-1`, `small`, `medium`, `turbo`, `large-v3-turbo`.
+
+```bash
+# One-time setup and model download (from the repo root)
+bash runtime/audio/setup.sh
+bash runtime/audio/download-models.sh --all     # ~3.8 GB
+bash runtime/audio/download-models.sh --check   # exit 0 when complete
+
+# Or through run.sh
+bash run.sh audio-setup
+bash run.sh audio-models --all
+bash run.sh audio-models --check
+```
+
+Transcription fields: `file` (required), `model` (default `whisper-small`),
+`language` (default `de`, `auto` allowed), `response_format`
+(`json`/`text`/`verbose_json`/`srt`/`vtt`), `prompt`, `temperature` and
+`task` (`transcribe`; `translate` returns 400).
+
+```bash
+curl http://127.0.0.1:30000/v1/audio/transcriptions \
+  -F file=@satz.wav -F model=whisper-small -F language=de
+```
+
+Speech fields: `input` (required, max 5000 characters), `model`
+(`piper`/`tts-1`/`tts-1-hd`), `voice` (name or alias), `response_format`
+(`pcm`, `wav`, `mp3`, `opus`) and `speed` (0.5–2.0). Audio is synthesised
+sentence by sentence and the response starts with the first sentence, not
+after the whole text. `wav` uses a streaming header with a placeholder size;
+some players reject that, so `pcm` and `mp3` are the safer streaming formats.
+
+```bash
+curl http://127.0.0.1:30000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "Guten Tag. Wie geht es Ihnen?", "voice": "thorsten", "response_format": "mp3"}' \
+  -o antwort.mp3
+```
+
+Limits and errors: upload 100 MB, audio 60 minutes, TTS text 5000 characters,
+queue 8 per endpoint. A missing model returns `503` with the matching
+`runtime/audio/download-models.sh` command, an unknown model/voice `404`, a
+full queue `429` with `Retry-After`, a stopped sidecar `502` and a timeout
+`504`. Bad multipart input or an unsupported format is `400`.
+
+Settings can be changed with `AUDIO_*` environment variables before starting
+the sidecar: `AUDIO_HOST`, `AUDIO_PORT`, `AUDIO_MODELS_DIR` (default
+`/mnt/models/audio`), `AUDIO_THREADS` (8), `AUDIO_PRELOAD` (`whisper-small`,
+empty disables), `AUDIO_MODEL_CACHE` (1), `AUDIO_MAX_QUEUE` (8),
+`AUDIO_STT_TIMEOUT_S` (1800), `AUDIO_TTS_TIMEOUT_S` (120) and
+`AUDIO_MAX_UPLOAD_MB` (100). Gateway-side knobs are `audio_base`,
+`audio_timeout_s` and `audio_max_upload_mb`.
+
+Direct control and smoke test:
+
+```bash
+bash runtime/audio/start-audio.sh
+bash runtime/audio/selftest.sh
+bash runtime/audio/stop-audio.sh
+```
+
+Audio and transcripts are never written to the log; only kind, model,
+duration, real-time factor and status are recorded. The default language is
+standard German. Austrian and Swiss accents are usually recognised, dialect
+is not guaranteed, and Piper has no AT/CH voices.
 
 ### Switching the server on/off
 
@@ -185,7 +267,9 @@ variables.
   `connect_timeout_s`, `preview_max_chars`, `prompt_start_chars`,
   `retention_jobs_days`, `retention_series_days`, `nonstream_keepalive`,
   `gpu_cmd`, `abort_on_disconnect`, `server_control_enabled`, `server_unit`,
-  `server_start_script`, `server_stop_script`, `server_process_pattern`.
+  `server_start_script`, `server_stop_script`, `server_process_pattern`,
+  `embed_base`, `embed_model`, `audio_base`, `audio_timeout_s`,
+  `audio_max_upload_mb`.
 
 By default (`abort_on_disconnect = true`) the gateway watches the client
 connection: if a client disappears while its job is still waiting, the

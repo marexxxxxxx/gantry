@@ -70,6 +70,55 @@ optional: the gateway maps the Qwen alias and both Ollama model names to
 gateway. Tuning: `EMBED_CTX` (default 8192), `EMBED_PARALLEL` (default 1),
 `EMBED_KEEP_ALIVE` (default -1), `EMBED_MODEL`, `EMBED_HOST`, `EMBED_MODELS`.
 
+**Audio on the CPU (Whisper + Piper):**
+
+Speech-to-text and text-to-speech run in an independent CPU sidecar on
+`127.0.0.1:30003`. Clients keep using the gateway on `:30000`; no second
+endpoint and no VRAM are needed.
+
+| Whisper model | Size | Notes |
+|---|---|---|
+| `whisper-small` | 484 MB | default, fastest |
+| `whisper-medium` | 1528 MB | better accuracy, slower |
+| `whisper-large-v3-turbo` | 1618 MB | best accuracy, slowest on CPU |
+
+| Piper voice | Alias | Rate |
+|---|---|---|
+| `de_DE-thorsten-medium` | `thorsten` | 22.05 kHz, male, default |
+| `de_DE-kerstin-low` | `kerstin` | 22.05 kHz, female |
+| `de_DE-eva_k-x_low` | `eva` | 16 kHz, female |
+
+```bash
+bash runtime/audio/setup.sh                      # dependencies + ffmpeg check
+bash runtime/audio/download-models.sh --all      # ~3.8 GB to /mnt/models/audio
+bash run.sh restart                              # gateway + embedding + audio
+```
+
+```bash
+# Speech to text (language defaults to de)
+curl http://127.0.0.1:30000/v1/audio/transcriptions \
+  -F file=@satz.wav -F model=whisper-small
+
+# Text to speech, streamed as WAV
+curl http://127.0.0.1:30000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "Guten Tag.", "voice": "thorsten", "response_format": "wav"}' \
+  -o antwort.wav
+```
+
+TTS supports `pcm`, `wav`, `mp3` and `opus` and streams sentence by sentence.
+Limits: 100 MB upload, 60 minutes audio, 5000 characters of TTS text and a
+queue of 8. Errors: `503` with a download command for a missing model, `404`
+for an unknown model/voice, `429` when the queue is full, `502` when the
+sidecar is down and `504` on timeout. Audio and transcripts are never logged.
+The default language is standard German; Austrian and Swiss accents are
+usually recognised, dialects are not guaranteed, and there are no AT/CH Piper
+voices. Direct control: `runtime/audio/start-audio.sh`,
+`runtime/audio/stop-audio.sh`, `runtime/audio/selftest.sh`. Tuning:
+`AUDIO_MODELS_DIR`, `AUDIO_THREADS`, `AUDIO_PRELOAD`, `AUDIO_MODEL_CACHE`,
+`AUDIO_MAX_QUEUE`, `AUDIO_STT_TIMEOUT_S`, `AUDIO_TTS_TIMEOUT_S`,
+`AUDIO_MAX_UPLOAD_MB`, `AUDIO_HOST`, `AUDIO_PORT`.
+
 ## Table of contents
 
 1. [Repository layout](#1-repository-layout)

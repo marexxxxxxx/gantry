@@ -73,6 +73,55 @@ stoppt den Sidecar zusammen mit dem Gateway. Tuning: `EMBED_CTX` (Default
 8192), `EMBED_PARALLEL` (Default 1), `EMBED_KEEP_ALIVE` (Default -1),
 `EMBED_MODEL`, `EMBED_HOST`, `EMBED_MODELS`.
 
+**Audio auf der CPU (Whisper + Piper):**
+
+Spracherkennung und Sprachausgabe laufen in einem eigenen CPU-Sidecar auf
+`127.0.0.1:30003`. Clients bleiben beim Gateway auf `:30000`; ein zweiter
+Endpunkt und VRAM sind nicht nötig.
+
+| Whisper-Modell | Größe | Hinweis |
+|---|---|---|
+| `whisper-small` | 484 MB | Default, am schnellsten |
+| `whisper-medium` | 1528 MB | genauer, langsamer |
+| `whisper-large-v3-turbo` | 1618 MB | beste Qualität, auf der CPU am langsamsten |
+
+| Piper-Stimme | Alias | Rate |
+|---|---|---|
+| `de_DE-thorsten-medium` | `thorsten` | 22,05 kHz, männlich, Default |
+| `de_DE-kerstin-low` | `kerstin` | 22,05 kHz, weiblich |
+| `de_DE-eva_k-x_low` | `eva` | 16 kHz, weiblich |
+
+```bash
+bash runtime/audio/setup.sh                      # Abhängigkeiten + ffmpeg-Check
+bash runtime/audio/download-models.sh --all      # ca. 3,8 GB nach /mnt/models/audio
+bash run.sh restart                              # Gateway + Embedding + Audio
+```
+
+```bash
+# Sprache zu Text (language ist standardmäßig de)
+curl http://127.0.0.1:30000/v1/audio/transcriptions \
+  -F file=@satz.wav -F model=whisper-small
+
+# Text zu Sprache, gestreamt als WAV
+curl http://127.0.0.1:30000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "Guten Tag.", "voice": "thorsten", "response_format": "wav"}' \
+  -o antwort.wav
+```
+
+TTS unterstützt `pcm`, `wav`, `mp3` und `opus` und streamt Satz für Satz.
+Grenzen: 100 MB Upload, 60 Minuten Audio, 5000 Zeichen TTS-Text und eine
+Warteschlange von 8. Fehler: `503` mit Download-Befehl bei fehlendem Modell,
+`404` bei unbekanntem Modell/Stimme, `429` bei voller Warteschlange, `502`
+wenn der Sidecar aus ist und `504` bei Timeout. Audio und Transkripte werden
+nie geloggt. Default ist Standarddeutsch; österreichische und Schweizer
+Akzente werden meist erkannt, Mundart nicht garantiert, und es gibt keine
+AT/CH-Piper-Stimmen. Direkte Steuerung: `runtime/audio/start-audio.sh`,
+`runtime/audio/stop-audio.sh`, `runtime/audio/selftest.sh`. Tuning:
+`AUDIO_MODELS_DIR`, `AUDIO_THREADS`, `AUDIO_PRELOAD`, `AUDIO_MODEL_CACHE`,
+`AUDIO_MAX_QUEUE`, `AUDIO_STT_TIMEOUT_S`, `AUDIO_TTS_TIMEOUT_S`,
+`AUDIO_MAX_UPLOAD_MB`, `AUDIO_HOST`, `AUDIO_PORT`.
+
 ## Inhaltsverzeichnis
 
 1. [Repository-Aufbau](#1-repository-aufbau)
