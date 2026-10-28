@@ -51,19 +51,27 @@ PING = b": ping\n\n"
 def _request(methode: str, pfad: str, body: dict | None = None, *,
              roh: bytes | None = None, query: str = "",
              client_ip: str | None = "10.0.0.5",
-             kanal: "_ClientKanal | None" = None) -> Request:
+             kanal: "_ClientKanal | None" = None,
+             headers: dict[str, str] | None = None,
+             teile: list[bytes] | None = None) -> Request:
     """Baut eine Starlette-Anfrage ohne ASGI-Lauf.
 
     ``body`` wird zu JSON kodiert; ``roh`` ersetzt das durch exakte Bytes
-    (z. B. fuer einen Nicht-JSON-Body). ``kanal`` ist die steuerbare
-    receive-Queue der Disconnect-Tests; ohne ihn bleibt die Verbindung nach
-    dem Body offen (kein Disconnect).
+    (z. B. fuer einen Nicht-JSON-Body). ``teile`` liefert den Body stattdessen
+    als mehrere Chunks (Chunked-Upload). ``headers`` ueberschreibt bzw.
+    ergaenzt die Kopfzeilen. ``kanal`` ist die steuerbare receive-Queue der
+    Disconnect-Tests; ohne ihn bleibt die Verbindung nach dem Body offen.
     """
     if roh is None:
         roh = b"" if body is None else json.dumps(body).encode("utf-8")
     if kanal is None:
         kanal = _ClientKanal()
-    kanal.fuellen(roh)
+    kanal.fuellen(roh, teile=teile)
+    kopf: dict[bytes, bytes] = {}
+    if body is not None:
+        kopf[b"content-type"] = b"application/json"
+    for name, wert in (headers or {}).items():
+        kopf[name.lower().encode("latin-1")] = wert.encode("latin-1")
     scope = {
         "type": "http",
         "http_version": "1.1",
@@ -72,8 +80,7 @@ def _request(methode: str, pfad: str, body: dict | None = None, *,
         "path": pfad,
         "raw_path": pfad.encode("utf-8"),
         "query_string": query.encode("ascii"),
-        "headers": ([(b"content-type", b"application/json")]
-                    if body is not None else []),
+        "headers": tuple(kopf.items()),
         "client": None if client_ip is None else (client_ip, 4711),
         "server": ("testserver", 80),
     }
@@ -91,10 +98,20 @@ class _ClientKanal:
     def __init__(self) -> None:
         self._queue: asyncio.Queue[dict] = asyncio.Queue()
 
-    def fuellen(self, roh: bytes) -> None:
-        """Legt den Body als erste receive-Nachricht ab."""
-        self._queue.put_nowait(
-            {"type": "http.request", "body": roh, "more_body": False})
+    def fuellen(self, roh: bytes, *, teile: list[bytes] | None = None) -> None:
+        """Legt den Body als erste receive-Nachricht(en) ab.
+
+        ``teile`` teilt den Body in mehrere ``http.request``-Chunks; das
+        letzte hat ``more_body=False`` (Chunked-Upload-Test).
+        """
+        if teile is None:
+            teile = [roh]
+        for i, teil in enumerate(teile):
+            self._queue.put_nowait({
+                "type": "http.request",
+                "body": teil,
+                "more_body": i < len(teile) - 1,
+            })
 
     def abmelden(self) -> None:
         """Der Client schliesst: ``http.disconnect`` einspielen."""
@@ -895,6 +912,187 @@ class TestEmbeddingRouting(ProxyTestBasis):
         self.assertEqual(
             str(gesehen[0].url),
             "http://127.0.0.1:30001/v1/completions")
+
+
+class TestAudioRouting(ProxyTestBasis):
+    """``/v1/audio/*`` geht an den CPU-Audio-Sidecar, nicht an SGLang."""
+
+    AUDIO = "http://127.0.0.1:30003"
+
+    @staticmethod
+    def _multipart() -> tuple[bytes, str]:
+        roh = (b"--X\r\n"
+               b'Content-Disposition: form-data; name="file"; '
+               b'filename="satz.wav"\r\n'
+               b"Content-Type: audio/wav\r\n\r\n"
+               b"RIFF----WAVEfmt " + b"\x00" * 16 + b"\r\n--X--\r\n")
+        return roh, "multipart/form-data; boundary=X"
+
+    async def test_transkription_geht_an_audio_base_und_streamt(self):
+        fest = b'{"text": "Hallo"}'
+        gesehen: list[tuple[str, dict, bytes]] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            gesehen.append((str(request.url), dict(request.headers),
+                            await request.aread()))
+
+            async def strom():
+                yield fest
+
+            return httpx.Response(200, content=strom(),
+                                  headers={"content-type": "application/json"})
+
+        deps = self.deps(httpx.MockTransport(handler))
+        roh, content_type = self._multipart()
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/audio/transcriptions", roh=roh, query="x=1",
+                     headers={"content-type": content_type}), deps)
+
+        self.assertIsInstance(antwort, StreamingResponse)
+        self.assertEqual(await _body(antwort), fest)
+        self.assertEqual(gesehen[0][0],
+                         f"{self.AUDIO}/v1/audio/transcriptions?x=1")
+        self.assertEqual(gesehen[0][1]["content-type"], content_type)
+        self.assertEqual(gesehen[0][2], roh)          # bytegleich
+        self.assertEqual(self.registry.snapshot(), [])  # kein Job
+
+    async def test_speech_streamt_antwort_von_audio_base(self):
+        fest = b"RIFF----WAVEdata"
+        gesehen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            gesehen.append(str(request.url))
+
+            async def strom():
+                yield fest[:4]
+                yield fest[4:]
+
+            return httpx.Response(200, content=strom(),
+                                  headers={"content-type": "audio/wav"})
+
+        deps = self.deps(httpx.MockTransport(handler))
+        body = {"model": "piper", "input": "Guten Tag.",
+                "voice": "thorsten", "response_format": "wav"}
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/audio/speech", body), deps)
+
+        self.assertIsInstance(antwort, StreamingResponse)
+        self.assertEqual(await _body(antwort), fest)
+        self.assertEqual(antwort.headers["content-type"], "audio/wav")
+        self.assertEqual(gesehen, [f"{self.AUDIO}/v1/audio/speech"])
+        self.assertEqual(self.registry.snapshot(), [])
+
+    async def test_audio_models_ist_get_passthrough(self):
+        fest = b'{"whisper": {"models": []}, "tts": {"voices": []}}'
+        gesehen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            gesehen.append(str(request.url))
+            return httpx.Response(200, content=fest,
+                                  headers={"content-type": "application/json"})
+
+        deps = self.deps(httpx.MockTransport(handler))
+
+        antwort = await handle_v1(
+            _request("GET", "/v1/audio/models", query="x=1"), deps)
+
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(await _body(antwort), fest)
+        self.assertEqual(gesehen, [f"{self.AUDIO}/v1/audio/models?x=1"])
+        self.assertEqual(self.registry.snapshot(), [])
+
+    async def test_unbekannter_pfad_und_falsche_methode_ohne_upstream(self):
+        gesehen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            gesehen.append(str(request.url))
+            return httpx.Response(200, content=b"{}")
+
+        deps = self.deps(httpx.MockTransport(handler))
+        faelle = (
+            ("POST", "/v1/audio/foo", 404),
+            ("GET", "/v1/audio/transcriptions", 405),
+            ("POST", "/v1/audio/models", 405),
+        )
+        for methode, pfad, status in faelle:
+            with self.subTest(methode=methode, pfad=pfad):
+                antwort = await handle_v1(
+                    _request(methode, pfad, {} if methode == "POST" else None),
+                    deps)
+                self.assertEqual(antwort.status_code, status)
+                inhalt = json.loads(await _body(antwort))
+                self.assertIn("error", inhalt)
+
+        self.assertEqual(gesehen, [])                 # kein Upstream-Kontakt
+
+    async def test_content_length_ueber_limit_ergibt_413(self):
+        gesehen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            gesehen.append(request)
+            return httpx.Response(200, content=b"{}")
+
+        deps = self.deps(httpx.MockTransport(handler))
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/audio/transcriptions", roh=b"x",
+                     headers={
+                         "content-type": "application/octet-stream",
+                         "content-length": str(101 * 1024 * 1024),
+                     }), deps)
+
+        self.assertEqual(antwort.status_code, 413)
+        inhalt = json.loads(await _body(antwort))
+        self.assertEqual(inhalt["error"]["code"], "audio_too_large")
+        self.assertEqual(gesehen, [])
+        self.assertEqual(self.registry.snapshot(), [])
+
+    async def test_chunked_body_ueber_limit_ergibt_413(self):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            await request.aread()       # treibt den begrenzten Iterator
+            return httpx.Response(200, content=b"{}")
+
+        deps = self.deps(httpx.MockTransport(handler))
+        deps.config.audio_max_upload_mb = 1
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/audio/transcriptions",
+                     teile=[b"a" * 600_000, b"b" * 600_000],
+                     headers={"content-type": "application/octet-stream"}),
+            deps)
+
+        self.assertEqual(antwort.status_code, 413)
+        inhalt = json.loads(await _body(antwort))
+        self.assertEqual(inhalt["error"]["code"], "audio_too_large")
+        self.assertEqual(self.registry.snapshot(), [])
+
+    async def test_connect_fehler_ergibt_502(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("sidecar weg", request=request)
+
+        deps = self.deps(httpx.MockTransport(handler))
+        antwort = await handle_v1(
+            _request("POST", "/v1/audio/speech", {"input": "Hallo."}), deps)
+
+        self.assertEqual(antwort.status_code, 502)
+        inhalt = json.loads(await _body(antwort))
+        self.assertEqual(inhalt["error"]["code"], "upstream_unavailable")
+        self.assertEqual(self.registry.snapshot(), [])
+
+    async def test_read_timeout_ergibt_504(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("zu langsam", request=request)
+
+        deps = self.deps(httpx.MockTransport(handler))
+        antwort = await handle_v1(
+            _request("POST", "/v1/audio/speech", {"input": "Hallo."}), deps)
+
+        self.assertEqual(antwort.status_code, 504)
+        inhalt = json.loads(await _body(antwort))
+        self.assertEqual(inhalt["error"]["code"], "timeout")
+        self.assertEqual(self.registry.snapshot(), [])
 
 
 class TestNichtstreamPfad(ProxyTestBasis):

@@ -51,7 +51,7 @@ from pathlib import Path
 
 import httpx
 from starlette.requests import Request
-from starlette.responses import Response, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from .cancel import abort_request
 from .config import Config
@@ -1061,6 +1061,134 @@ async def _passthrough(request: Request, deps: Deps, roh: bytes, *,
                     headers=_response_headers(antwort))
 
 
+_AUDIO_METHODEN: dict[str, frozenset[str]] = {
+    "/v1/audio/models": frozenset({"GET"}),
+    "/v1/audio/transcriptions": frozenset({"POST"}),
+    "/v1/audio/speech": frozenset({"POST"}),
+}
+
+
+def _ist_audio_pfad(pfad: str) -> bool:
+    """True fuer den kompletten Audio-Namensraum (auch unbekannte Pfade)."""
+    return pfad == "/v1/audio" or pfad.startswith("/v1/audio/")
+
+
+def _audio_fehler(status: int, code: str, message: str, *,
+                  headers: dict[str, str] | None = None) -> JSONResponse:
+    """Fehlerformat der Audio-Spezifikation (auch fuer Gateway-Fehler)."""
+    typ = ("server_error" if code in ("upstream_unavailable", "timeout")
+           else "invalid_request_error")
+    return JSONResponse(
+        {"error": {"message": message, "type": typ, "code": code}},
+        status_code=status, headers=headers)
+
+
+class _AudioZuGross(Exception):
+    """Der Upload ueberschreitet das Limit waehrend des Streamens."""
+
+
+async def _begrenzter_upload(request: Request, grenze: int) -> AsyncIterator[bytes]:
+    """Reicht den Upload weiter und zaehlt dabei die Bytes mit.
+
+    Der Zaehler greift auch ohne ``Content-Length`` (chunked). Beim
+    Ueberschreiten bricht der Iterator ab; der Aufrufer antwortet 413.
+    """
+    gesamt = 0
+    async for teil in request.stream():
+        gesamt += len(teil)
+        if gesamt > grenze:
+            raise _AudioZuGross()
+        yield teil
+
+
+async def handle_audio(request: Request, deps: Deps) -> Response:
+    """Leitet ``/v1/audio/*`` an den CPU-Audio-Sidecar weiter.
+
+    Transkriptionen werden als Strom hochgeladen (kein 100-MB-Puffer im
+    Gateway), Antworten von Speech und Transkription werden gestreamt.
+    Kein Job, keine Prioritaet, kein Hindsight. ``Content-Length`` ueber dem
+    Limit endet vor dem Upstream-Kontakt mit 413; bei chunked prueft der
+    weiterreichende Iterator mit.
+    """
+    pfad = request.url.path
+    methoden = _AUDIO_METHODEN.get(pfad)
+    if methoden is None:
+        return _audio_fehler(404, "invalid_request",
+                             f"Unbekannter Audio-Pfad: {pfad}")
+    if request.method not in methoden:
+        return _audio_fehler(
+            405, "invalid_request", f"{request.method} ist hier nicht erlaubt.",
+            headers={"allow": ", ".join(sorted(methoden))})
+
+    grenze = deps.config.audio_max_upload_mb * 1024 * 1024
+    kopf = _upstream_headers(request)
+    url = _upstream_url(request, deps.config, base=deps.config.audio_base)
+    zeit = httpx.Timeout(deps.config.audio_timeout_s,
+                         connect=deps.config.connect_timeout_s)
+
+    if request.method == "GET":
+        try:
+            antwort = await deps.client.request(
+                request.method, url, headers=kopf, timeout=zeit)
+        except httpx.TimeoutException:
+            return _audio_fehler(504, "timeout",
+                                 "Audio-Sidecar hat nicht rechtzeitig geantwortet.")
+        except httpx.RequestError:
+            return _audio_fehler(502, "upstream_unavailable",
+                                 "Audio-Sidecar ist nicht erreichbar.")
+        return Response(antwort.content, status_code=antwort.status_code,
+                        headers=_response_headers(antwort))
+
+    if pfad.endswith("/transcriptions"):
+        laenge = request.headers.get("content-length", "").strip()
+        if laenge.isdigit() and int(laenge) > grenze:
+            return _audio_fehler(
+                413, "audio_too_large",
+                f"Upload groesser als {deps.config.audio_max_upload_mb} MB.")
+        inhalt: bytes | AsyncIterator[bytes] = _begrenzter_upload(
+            request, grenze)
+    else:
+        roh = await request.body()
+        if len(roh) > grenze:
+            return _audio_fehler(
+                413, "audio_too_large",
+                f"Upload groesser als {deps.config.audio_max_upload_mb} MB.")
+        inhalt = roh
+
+    try:
+        anfrage = deps.client.build_request(
+            request.method, url, headers=kopf, content=inhalt, timeout=zeit)
+        antwort = await deps.client.send(anfrage, stream=True)
+    except _AudioZuGross:
+        return _audio_fehler(
+            413, "audio_too_large",
+            f"Upload groesser als {deps.config.audio_max_upload_mb} MB.")
+    except httpx.TimeoutException:
+        return _audio_fehler(504, "timeout",
+                             "Audio-Sidecar hat nicht rechtzeitig geantwortet.")
+    except httpx.RequestError:
+        return _audio_fehler(502, "upstream_unavailable",
+                             "Audio-Sidecar ist nicht erreichbar.")
+
+    if antwort.status_code >= 400:
+        try:
+            inhalt = await antwort.aread()
+        finally:
+            await antwort.aclose()
+        return Response(inhalt, status_code=antwort.status_code,
+                        headers=_response_headers(antwort))
+
+    async def weiter() -> AsyncIterator[bytes]:
+        try:
+            async for teil in antwort.aiter_raw():
+                yield teil
+        finally:
+            await antwort.aclose()
+
+    return StreamingResponse(weiter(), status_code=antwort.status_code,
+                             headers=_response_headers(antwort))
+
+
 async def handle_v1(request: Request, deps: Deps) -> Response:
     """Bedient jede ``/v1/*``-Anfrage des Gateways.
 
@@ -1082,6 +1210,10 @@ async def handle_v1(request: Request, deps: Deps) -> Response:
     if _pfad_mit_punktsegment(request.url.path):
         return Response(_BODY_UNGUELTIGER_PFAD, status_code=404,
                         media_type="application/json")
+    if _ist_audio_pfad(request.url.path):
+        # Vor ``request.body()``: Uploads sollen gestreamt werden, nicht
+        # erst komplett im Gateway landen.
+        return await handle_audio(request, deps)
     roh = await request.body()
     koerper = _json_koerper(roh) if request.method == "POST" else None
     if _ist_embedding_pfad(request.url.path):

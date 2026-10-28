@@ -25,6 +25,9 @@ class TestLoadConfig(unittest.TestCase):
         self.assertAlmostEqual(cfg.connect_timeout_s, 10.0)
         self.assertEqual(cfg.embed_base, "http://127.0.0.1:30002")
         self.assertEqual(cfg.embed_model, "qwen3-embedding:0.6b")
+        self.assertEqual(cfg.audio_base, "http://127.0.0.1:30003")
+        self.assertAlmostEqual(cfg.audio_timeout_s, 1800.0)
+        self.assertEqual(cfg.audio_max_upload_mb, 100)
 
     def test_server_steuerung_defaults_und_env(self):
         cfg = load_config(env={})
@@ -97,6 +100,30 @@ class TestLoadConfig(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, feld):
                         load_config(env={
                             f"AISERVER_MONITOR_{feld.upper()}": wert})
+
+    def test_audio_defaults_und_env(self):
+        cfg = load_config(env={
+            "AISERVER_MONITOR_AUDIO_BASE": "http://127.0.0.1:39003",
+            "AISERVER_MONITOR_AUDIO_TIMEOUT_S": "600",
+            "AISERVER_MONITOR_AUDIO_MAX_UPLOAD_MB": "50",
+        })
+        self.assertEqual(cfg.audio_base, "http://127.0.0.1:39003")
+        self.assertAlmostEqual(cfg.audio_timeout_s, 600.0)
+        self.assertEqual(cfg.audio_max_upload_mb, 50)
+
+    def test_audio_nicht_positive_limits_werden_abgewiesen(self):
+        for feld in ("audio_timeout_s", "audio_max_upload_mb"):
+            for wert in ("0", "-1", "-0.5"):
+                with self.subTest(feld=feld, wert=wert):
+                    with self.assertRaisesRegex(ValueError, feld):
+                        load_config(env={
+                            f"AISERVER_MONITOR_{feld.upper()}": wert})
+
+    def test_audio_post_init_wirft_direkt(self):
+        with self.assertRaisesRegex(ValueError, "audio_timeout_s"):
+            Config(audio_timeout_s=0.0)
+        with self.assertRaisesRegex(ValueError, "audio_max_upload_mb"):
+            Config(audio_max_upload_mb=0)
 
     def test_post_init_wirft_direkt(self):
         # Auch ohne load_config: eine direkt gebaute Config ist nie ein

@@ -24,6 +24,11 @@ class Config:
     # Port ist nur lokal gebunden; Clients sehen weiterhin nur listen_port.
     embed_base: str = "http://127.0.0.1:30002"
     embed_model: str = "qwen3-embedding:0.6b"
+    # Audio (Whisper/Piper) laeuft in einem eigenen CPU-Prozess. Auch dieser
+    # Port ist nur lokal gebunden; Clients sehen weiterhin listen_port.
+    audio_base: str = "http://127.0.0.1:30003"
+    audio_timeout_s: float = 1800.0
+    audio_max_upload_mb: int = 100
     db_path: str = "data/monitor.db"
     log_path: str = "data/aiserver-monitor.log"
     heartbeat_s: float = 15.0
@@ -73,6 +78,13 @@ class Config:
         if self.poll_interval_s <= 0:
             raise ValueError(
                 f"poll_interval_s muss positiv sein: {self.poll_interval_s}")
+        if self.audio_timeout_s <= 0:
+            raise ValueError(
+                f"audio_timeout_s muss positiv sein: {self.audio_timeout_s}")
+        if self.audio_max_upload_mb <= 0:
+            raise ValueError(
+                "audio_max_upload_mb muss positiv sein: "
+                f"{self.audio_max_upload_mb}")
 
 
 def _coerce(feld: str, typ: Any, wert: Any) -> Any:
