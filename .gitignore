@@ -7,3 +7,5 @@ nohup.out
 __pycache__/
 .superpowers/
 .worktrees/
+# Laufzeit-PIDfiles der Backend-/Embedding-Sidecars
+runtime/*/*.pid

@@ -23,6 +23,23 @@ class TestLoadConfig(unittest.TestCase):
         self.assertIs(cfg.abort_on_disconnect, True)
         self.assertEqual(cfg.gpu_cmd, "nvidia-smi")
         self.assertAlmostEqual(cfg.connect_timeout_s, 10.0)
+        self.assertEqual(cfg.embed_base, "http://127.0.0.1:30002")
+        self.assertEqual(cfg.embed_model, "qwen3-embedding:0.6b")
+
+    def test_server_steuerung_defaults_und_env(self):
+        cfg = load_config(env={})
+        self.assertIs(cfg.server_control_enabled, True)
+        self.assertEqual(cfg.server_unit, "escha-server.service")
+        self.assertEqual(cfg.server_start_script,
+                         "runtime/sglang/start-penalty.sh")
+        self.assertEqual(cfg.server_stop_script,
+                         "runtime/sglang/stop-server.sh")
+        cfg = load_config(env={
+            "AISERVER_MONITOR_SERVER_CONTROL_ENABLED": "false",
+            "AISERVER_MONITOR_SERVER_UNIT": "test-server.service",
+        })
+        self.assertIs(cfg.server_control_enabled, False)
+        self.assertEqual(cfg.server_unit, "test-server.service")
 
     def test_toml_und_env_override(self):
         # toml: heartbeat_s = 5.0 ; env: AISERVER_MONITOR_LISTEN_PORT=39999

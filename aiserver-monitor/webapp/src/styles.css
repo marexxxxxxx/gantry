@@ -954,3 +954,137 @@ body {
     height: 10rem;
   }
 }
+
+/* --- Server-Steuerung (Modellserver ein/aus) --- */
+
+.server {
+  max-width: 52rem;
+}
+
+.server h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.15rem;
+}
+
+.server h3 {
+  margin: 1.6rem 0 0.3rem;
+  font-size: 0.95rem;
+}
+
+.server-karte {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  padding: 1rem;
+  background: var(--farbe-flaeche);
+  border: 1px solid var(--farbe-rand);
+  border-radius: var(--radius);
+}
+
+.server-karte-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.server-punkt {
+  flex: none;
+  width: 0.7rem;
+  height: 0.7rem;
+  margin-top: 0.35rem;
+  border-radius: 50%;
+  background: var(--farbe-text-gedimmt);
+}
+
+.server-punkt-running {
+  background: var(--farbe-gruen);
+}
+
+.server-punkt-starting,
+.server-punkt-stopping {
+  background: var(--farbe-gelb);
+}
+
+.server-punkt-stopped {
+  background: var(--farbe-rot);
+}
+
+.server-zustand {
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.server-detail {
+  color: var(--farbe-text-gedimmt);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.server-wahl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.server-wahl-knopf {
+  appearance: none;
+  border: 1px solid var(--farbe-rahmen);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--farbe-text);
+  padding: 0.4rem 0.9rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+.server-wahl-knopf:hover:not(:disabled) {
+  border-color: var(--farbe-akzent);
+}
+
+.server-wahl-knopf-aktiv {
+  border-color: var(--farbe-akzent);
+  color: var(--farbe-akzent);
+  font-weight: 600;
+}
+
+.server-wahl-knopf:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.server-aktionen {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.server-einschalten {
+  appearance: none;
+  border: 1px solid var(--farbe-akzent);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--farbe-akzent);
+  padding: 0.45rem 1rem;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.server-einschalten:hover:not(:disabled) {
+  background: var(--farbe-akzent);
+  color: #0f1115;
+}
+
+.server-einschalten:disabled,
+.server .notaus:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.server .prioritaet-hinweis code {
+  margin-left: 0.25rem;
+}

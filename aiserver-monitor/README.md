@@ -40,8 +40,54 @@ bash run.sh restart    # stop, then start
 
 `start` and `stop` are idempotent: a second `start` prints "laeuft bereits"
 and exits 0, a `stop` without a running gateway exits 0 as well. `run.sh`
-only ever touches the gateway process — it never starts, stops or flips the
-SGLang server.
+starts and stops the CPU embedding sidecar together with the gateway, because
+`/v1/embeddings` has no other upstream. The SGLang server is never started,
+stopped or flipped by `run.sh`.
+
+### Embeddings (CPU)
+
+`POST /v1/embeddings` goes to `embed_base` (default
+`http://127.0.0.1:30002`), an independent Ollama process with
+`qwen3-embedding:0.6b`. It runs on the CPU and uses no VRAM, so it works while
+Qwen, Flint or GPT-OSS occupies the GPU. The gateway treats it as a buffered
+passthrough: no job tracking, no keepalives, response unchanged. Known model
+names (Qwen alias, Flint, GPT-OSS, embedding model) and a missing/empty name are
+mapped to `embed_model`; unknown names pass through unchanged, so Ollama can
+answer with a clear "model not found".
+
+```bash
+curl http://127.0.0.1:30000/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "escha-qwen38-27b-w2", "input": "Hallo Welt"}'
+```
+
+The sidecar can also be controlled directly:
+
+```bash
+bash runtime/embed/start-embed.sh
+bash runtime/embed/stop-embed.sh
+```
+
+### Switching the server on/off
+
+The model server can be stopped and started again from the dashboard's
+**Server** tab. The same path in a terminal (repo root):
+
+```bash
+bash server.sh status   # state + /health
+bash server.sh stop     # stop the model server; dashboard stays up
+bash server.sh start    # start and wait for /health (2-4 minutes)
+bash server.sh restart
+```
+
+If the `escha-server.service` systemd user unit is installed, `start`/`stop`
+go through `systemctl --user` (with `--no-block`); only that keeps the
+unit's `Restart=always` from undoing a deliberate shutdown. Without the unit
+it falls back to `runtime/sglang/start-penalty.sh` / `stop-server.sh`.
+Stopping is temporary: the unit stays enabled, so the server starts again
+after a reboot. The controls can be disabled with
+`server_control_enabled = false` (or
+`AISERVER_MONITOR_SERVER_CONTROL_ENABLED=false`).
 
 `run.sh` environment overrides:
 
@@ -49,6 +95,7 @@ SGLang server.
 |---|---|---|
 | `PYTHON` | `/home/user/small_qwen/.venv/bin/python` | interpreter for `python -m aiserver_monitor` |
 | `AISERVER_MONITOR_LISTEN_PORT` | `30000` | port for the health poll (`/healthz`); also the app port unless configured otherwise |
+| `AISERVER_MONITOR_EMBED_BASE` | `http://127.0.0.1:30002` | upstream for `/v1/embeddings` (CPU Ollama); also used by `run.sh status` |
 | `PIDFILE` | `/tmp/aiserver-monitor.pid` | PID file for `stop` |
 | `AISERVER_MONITOR_RUN_LOG` | `/tmp/aiserver-monitor-run.log` | stdout/stderr log of the background process |
 | `AISERVER_MONITOR_PATTERN` | `[a]iserver_monitor` | `pgrep -f` pattern (empty values are rejected, the default applies) |
@@ -137,7 +184,8 @@ variables.
   `upstream_base`, `db_path`, `log_path`, `heartbeat_s`, `poll_interval_s`,
   `connect_timeout_s`, `preview_max_chars`, `prompt_start_chars`,
   `retention_jobs_days`, `retention_series_days`, `nonstream_keepalive`,
-  `gpu_cmd`, `abort_on_disconnect`.
+  `gpu_cmd`, `abort_on_disconnect`, `server_control_enabled`, `server_unit`,
+  `server_start_script`, `server_stop_script`, `server_process_pattern`.
 
 By default (`abort_on_disconnect = true`) the gateway watches the client
 connection: if a client disappears while its job is still waiting, the
@@ -159,7 +207,8 @@ test port instead, e.g. `AISERVER_MONITOR_LISTEN_PORT=39055 bash run.sh start`
 
 Rollback at any time: `bash run.sh stop` (or `systemctl --user disable --now
 aiserver-monitor.service` after the cutover). SGLang keeps running where it
-was — the gateway never changes the server's lifecycle.
+was — only the explicit server control (dashboard "Server" tab or
+`server.sh`) flips it.
 
 ## Further reading
 

@@ -40,6 +40,32 @@
   .tl-entry { padding: 6px 0 6px 10px; margin-bottom: 6px; }
   .muted { color: var(--muted); }
   .hidden { display: none; }
+  /* Warteschlange: eine Zeile je Wartendem, Position 1 zuerst. Kein
+     <table> - die Liste steht in einer Karte, nicht in einem Raster. */
+  .wl-row { display: flex; gap: 12px; align-items: center; padding: 7px 0;
+            border-bottom: 1px solid var(--line); font-size: 13px; }
+  .wl-row:last-child { border-bottom: none; }
+  .wl-pos { color: var(--muted); width: 18px; text-align: right;
+            font-variant-numeric: tabular-nums; }
+  .wl-rid { font-family: ui-monospace, monospace; color: var(--muted);
+            font-size: 12px; }
+  .wl-wait { font-variant-numeric: tabular-nums; color: var(--muted); }
+  .wl-sys { flex: 1; }
+  .wl-empty { margin-top: 4px; }
+  /* Ein Knopf im Dashboard: klein, ohne Eigenleben. `:disabled` graut ab,
+     der Verlauf hinten faengt den Zustand ohnehin ab. */
+  button { background: var(--card); color: var(--text); border: 1px solid var(--line);
+           border-radius: 6px; padding: 5px 11px; font: inherit; font-size: 12px;
+           cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--ok); }
+  button:disabled { opacity: .45; cursor: default; }
+  /* Das Bestaetigungsfenster steht im Fluss, nicht ueber allem: es ist die
+     Antwort auf einen Klick, kein Dialog der Haut. */
+  #confirm { border: 1px solid var(--warn); border-radius: 6px;
+             padding: 12px 14px; margin-top: 12px;
+             background: rgba(240,167,66,.08); }
+  #confirm-actions { display: flex; gap: 8px; margin-top: 10px; }
+  #abort-result { min-height: 16px; }
 </style>
 </head>
 <body>
@@ -83,8 +109,21 @@
     <div class="note" id="slot-note"></div>
   </div>
 
+  <!-- Reihenfolge ist Teil der Abnahme: slot-card < holder-action <
+       queue-list < tab-history. Die Liste steht unter der Halter-Karte. -->
   <div class="card">
+    <div id="holder-action"></div>
+    <div id="queue-list"></div>
+    <div class="note" id="queue-footnote"></div>
     <div class="note" id="queue-note"></div>
+    <div id="confirm" class="hidden">
+      <div id="confirm-text"></div>
+      <div id="confirm-actions">
+        <button id="confirm-yes" onclick="confirmAbort()">Bestaetigen</button>
+        <button id="confirm-no" onclick="closeConfirm()">Zurueck</button>
+      </div>
+    </div>
+    <div class="note" id="abort-result"></div>
   </div>
 </section>
 
@@ -203,15 +242,26 @@ function timeline(data) {
   }
   // FERTIG, grau. `prompt_tokens` entspricht in etwa der
   // Vorverarbeitungslaenge und steht daher als `ctx` (Spec Z. 265-267).
-  return rows.concat(data.history.slice().reverse().map(record => tlEntry(
-    "done", "var(--idle)",
-    record.system || record.ip_port || "unbekannt",
-    `FERTIG - ${duration(record.duration_s)}`
-    + ` - ctx ${num(record.prompt_tokens)}`
-    + ` - ${dec(meanRate(record.completion_tokens, record.duration_s), 1)} tok/s`
-    + ` - ${num(record.completion_tokens)} tok`
-    + ` - ${num(record.cached_tokens)} cache`,
-    record.rid ? `rid ${record.rid}` : "", nameHint(record)))).join("");
+  //
+  // Ein Abbruch ist **kein** FERTIG: der Auftrag wurde abgebrochen, nicht
+  // fertig. Er steht im Verlauf (die Uebergabe hat stattgefunden), faellt
+  // aber aus der Mittelung der Laufzeiten heraus - `averageDuration`
+  // filtert `aborted` bereits, und dieselbe Trennung steht hier als
+  // Label. Farbe `--warn`: die eine Orange, die das Dashboard kennt.
+  return rows.concat(data.history.slice().reverse().map(record => {
+    const gone = record.aborted === true;
+    return tlEntry(
+      gone ? "aborted" : "done",
+      gone ? "var(--warn)" : "var(--idle)",
+      record.system || record.ip_port || "unbekannt",
+      (gone ? "abgebrochen" : "FERTIG")
+      + ` - ${duration(record.duration_s)}`
+      + ` - ctx ${num(record.prompt_tokens)}`
+      + ` - ${dec(meanRate(record.completion_tokens, record.duration_s), 1)} tok/s`
+      + ` - ${num(record.completion_tokens)} tok`
+      + ` - ${num(record.cached_tokens)} cache`,
+      record.rid ? `rid ${record.rid}` : "", nameHint(record));
+  })).join("");
 }
 
 // `log-truncated` sagt dasselbe wie `BLIND_REASON` in `collector.py`. Steht
@@ -374,6 +424,242 @@ function averageDuration(entries) {
   return done.reduce((sum, e) => sum + e.duration_s, 0) / done.length;
 }
 
+// ------------------------------------------------------------------------
+// Warteschlange und Abbruch.
+//
+// Die Liste zeigt die Reihenfolge, in der der Server abarbeitet
+// (`queue.py`): Position 1 ist als naechster dran. Der laufende Halter
+// steht NICHT in der Liste - er wurde bereits aus der Queue in den Slot
+// geholt, und ein Abbruch von "Position 1" muesste sonst den Halter
+// treffen statt eines Wartenden.
+//
+// Alles hier ist eine **Anzeige** der `waiting_list` aus dem Zustand. Der
+// Monitor behauptet keine Zuordnung: ein Wartender hat keine IP, der Name
+// steht nur, wenn dieselbe Adresse aus einem frueheren Abschluss bekannt
+// ist (sonst "unbekannt*" mit Fussnote).
+// ------------------------------------------------------------------------
+
+// Waehrend eines laufenden Abbruchs ist **jeder** Abbruch-Knopf gesperrt.
+// Nicht aus Vorsicht: der Server arbeitet single-flight, und ein zweiter
+// Klick waere ein zweiter Abbruch, der die gerade gelesene Position
+// trifft - moeglicherweise eine andere als die, die der Nutzer sieht.
+let abortPending = false;
+
+// Das Ziel des offenen Bestaetigungsfensters. Es entsteht im Klickmoment
+// und wird dort aufgeloest: die Liste kann sich zwischen Anzeige und
+// Klick verschieben, und die Zahl, die der Nutzer sieht, ist genau die,
+// die gemeint ist.
+let abortTarget = null;
+
+function renderQueueList(data) {
+  const queue = data.queue || {}, slot = data.slot || {}, server = data.server || {};
+  const list = Array.isArray(queue.waiting_list) ? queue.waiting_list : [];
+  const el = document.getElementById("queue-list");
+  const foot = document.getElementById("queue-footnote");
+  if (list.length > 0) {
+    let unknownName = false;
+    el.innerHTML = list.map(entry => {
+      const position = entry && typeof entry.position === "number" ? entry.position : null;
+      // rid auf acht Zeichen. Die **volle** rid steht nirgends in der
+      // Liste - sie steht im Bestaetigungsfenster, das eine bewusste
+      // Entscheidung verlangt.
+      const rid = entry && typeof entry.rid === "string" ? entry.rid.slice(0, 8) : DASH;
+      const since = entry && typeof entry.waiting_since === "number" ? entry.waiting_since : null;
+      const wait = since === null || typeof data.at !== "number" ? DASH
+        : duration(Math.max(0, data.at - since));
+      const named = entry && typeof entry.system === "string" && entry.system !== "";
+      if (!named) unknownName = true;
+      return `<div class="wl-row">`
+        + `<span class="wl-pos">${position === null ? DASH : position}</span>`
+        + `<span class="wl-rid">${rid}</span>`
+        + `<span class="wl-wait">${wait}</span>`
+        + `<span class="wl-sys">${named ? entry.system : "unbekannt*"}</span>`
+        + `<button data-position="${position === null ? "" : position}"`
+        + `${abortPending ? " disabled" : ""}`
+        + ` onclick="askWaiting(${position === null ? -1 : position})">Abbrechen</button>`
+        + `</div>`;
+    }).join("");
+    // Der Fussnote-Satz steht nur, wenn er belegt ist: kennt das
+    // Dashboard jeden Namen, gibt es auch nichts zu erlaeutern.
+    foot.textContent = unknownName ? "* steht erst nach dem Abschluss fest" : "";
+    return;
+  }
+  foot.textContent = "";
+  // Die Begruendung, warum keine Zeile da steht - ein einziger Satz.
+  // Er kommt aus den Daten, nicht aus einer Vermutung.
+  let why;
+  if (server.connected !== true) {
+    why = "Server nicht erreichbar - die Warteschlange ist nicht bekannt.";
+  } else if (typeof slot.legacy === "number" && slot.legacy > 0) {
+    why = `Altbestand: ${slot.legacy} Request(s) vor Aktivierung der Log-Events - `
+      + "ihre Reihenfolge ist nicht ableitbar.";
+  } else if (queue.waiting === 0) {
+    why = "Kein Wartender - die Warteschlange ist leer.";
+  } else if (typeof queue.waiting === "number") {
+    why = `${queue.waiting} Wartende laut /get_load, aber das Log liefert dafuer `
+      + "keine Reihenfolge.";
+  } else {
+    why = "Die Warteschlange ist nicht bekannt - /get_load liefert keine Zahl.";
+  }
+  el.innerHTML = `<div class="note wl-empty">${why}</div>`;
+}
+
+function renderHolderAction(data) {
+  const slot = data.slot || {}, server = data.server || {};
+  // Der Knopf ist nur bei belegtem Slot aktiv. Die drei Gruende sind die
+  // drei Zustaende, in denen es keinen Halter gibt - jeder mit seinem
+  // eigenen Satz, weil jeder ein anderer Fall ist.
+  let reason = null;
+  if (server.connected !== true) {
+    reason = "Server nicht erreichbar - kein Halter bekannt.";
+  } else if (slot.state === "busy") {
+    reason = null;
+  } else if (slot.state === "free") {
+    reason = "Kein Halter - der Slot ist frei.";
+  } else {
+    reason = "Halter nicht bestimmbar - nichts zum Abbrechen.";
+  }
+  const locked = abortPending || reason !== null;
+  document.getElementById("holder-action").innerHTML =
+    `<button id="holder-btn" onclick="askHolder()"${locked ? " disabled" : ""}>`
+    + "Halter abbrechen</button>"
+    + (reason === null ? "" : `<span class="note">${reason}</span>`);
+}
+
+function renderConfirmActions() {
+  document.getElementById("confirm-actions").innerHTML =
+    `<button id="confirm-yes" onclick="confirmAbort()"`
+    + `${abortPending ? " disabled" : ""}>Bestaetigen</button>`
+    + `<button id="confirm-no" onclick="closeConfirm()"`
+    + `${abortPending ? " disabled" : ""}>Zurueck</button>`;
+}
+
+function openConfirm(lines) {
+  document.getElementById("confirm-text").innerHTML =
+    lines.map(line => `<div>${line}</div>`).join("");
+  document.getElementById("confirm").classList.remove("hidden");
+}
+
+// Jede Klick-Folge, die eine Knopf-Sperre aendert, rendert die drei
+// Stellen neu, an denen die Knopfe stehen: die Warteschlangen-Zeilen, der
+// Halter-Knopf und die zwei Buttons des Bestaetigungsfensters. Der
+// Gesamtzustand wird **nicht** neu gerendert - ein Lock waere sonst ein
+// zweiter Sparkline-Punkt.
+function setAbortLocked(value) {
+  abortPending = value;
+  if (lastState !== null) {
+    renderQueueList(lastState);
+    renderHolderAction(lastState);
+  }
+  renderConfirmActions();
+}
+
+function setAbortResult(text) {
+  document.getElementById("abort-result").textContent = text;
+}
+
+function closeConfirm() {
+  abortTarget = null;
+  document.getElementById("confirm").classList.add("hidden");
+}
+
+function askHolder() {
+  if (abortPending || lastState === null) return;
+  const slot = lastState.slot || {};
+  if (slot.state !== "busy" || typeof slot.rid !== "string" || slot.rid === "") return;
+  abortTarget = { kind: "holder", label: "Halter (laufender Auftrag)", rid: slot.rid };
+  openConfirm([
+    "Abbruch bestaetigen",
+    "Ziel: Halter (laufender Auftrag)",
+    `rid: ${slot.rid}`,
+    `Laufzeit: ${duration(slot.duration_s)}`,
+    "Das bricht den Auftrag ab. Es wird kein Ergebnis zurueckgegeben.",
+  ]);
+}
+
+function askWaiting(position) {
+  if (abortPending || lastState === null) return;
+  const queue = lastState.queue || {};
+  const list = Array.isArray(queue.waiting_list) ? queue.waiting_list : [];
+  const entry = typeof position === "number" && Number.isInteger(position) && position >= 1
+    ? list.find(item => item && item.position === position) : undefined;
+  if (entry === undefined) {
+    // Die Position gibt es nicht (mehr). Das ist **kein** Fehler des
+    // Servers und kein Abbruch - die Liste hat sich zwischen Anzeige und
+    // Klick verschoben, und der Monitor sendet nichts, was er nicht
+    // belegen kann.
+    closeConfirm();
+    setAbortResult(`nicht gesendet - Position ${position} steht nicht mehr in der Liste`);
+    return;
+  }
+  abortTarget = { kind: "waiting", position: entry.position,
+                  label: `Position ${entry.position} in der Warteschlange`,
+                  rid: entry.rid };
+  const wait = typeof entry.waiting_since === "number" && typeof lastState.at === "number"
+    ? duration(Math.max(0, lastState.at - entry.waiting_since)) : DASH;
+  openConfirm([
+    "Abbruch bestaetigen",
+    `Ziel: Position ${entry.position} in der Warteschlange`,
+    `rid: ${entry.rid}`,
+    `Wartezeit: ${wait}`,
+    "Das bricht den Auftrag ab. Es wird kein Ergebnis zurueckgegeben.",
+  ]);
+}
+
+// Der Abbruch geht erst nach der Bestaetigung raus - nie beim ersten
+// Klick. Genau EIN `POST` mit genau EINER rid; `abort_all` wird nie
+// gesetzt und eine leere rid nie gesendet (beides haelt `test_abort.py`
+// am *erzeugten* Request fest).
+//
+// Rueckkehr ist immer ein Promise: der Aufrufer kann `await confirmAbort()`
+// schreiben, und ein Doppelklick bekommt sofort ein erfuelltes und sendet
+// nichts (siehe `abortPending` oben).
+function confirmAbort() {
+  if (abortPending || abortTarget === null || lastState === null) {
+    return Promise.resolve();
+  }
+  const target = abortTarget;
+  const url = target.kind === "holder" ? "/api/abort--holder" : "/api/abort--waiting";
+  const request = { method: "POST" };
+  if (target.kind === "waiting") {
+    // Der Nutzer gibt die **Position** an, nie eine rid. Genau das
+    // verhindert, dass eine verschobene Liste die falsche rid trifft.
+    request.body = JSON.stringify({ position: target.position });
+  }
+  setAbortLocked(true);
+  return fetch(url, request)
+    .then(response => {
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.json();
+    })
+    .then(answer => {
+      if (answer === null || typeof answer !== "object"
+          || typeof answer.aborted !== "boolean") {
+        setAbortResult("Fehler: unerwartete Antwort des Servers");
+      } else if (answer.aborted) {
+        // "gesendet", nicht "abgebrochen": der Monitor hat den Befehl
+        // losgeschickt. Ob der Auftrag tatsaechlich stand, zeigt erst
+        // der Verlauf - und genau das steht hier.
+        setAbortResult(`gesendet: ${target.label}, rid ${answer.rid}`
+          + " - ob der Abbruch wirkt, zeigt der Verlauf.");
+      } else {
+        setAbortResult("nicht gesendet - "
+          + (typeof answer.reason === "string" && answer.reason !== ""
+             ? answer.reason : "unbekannter Grund"));
+      }
+    })
+    .catch(error => {
+      // Netzfehler, Timeout, HTTP-Fehlerstatus. Der Satz ist derselbe
+      // Weg wie der des Servers: ein Grund, kein Stacktrace.
+      setAbortResult("Fehler: "
+        + (error && error.message ? error.message : String(error)));
+    })
+    .then(() => {
+      closeConfirm();
+      setAbortLocked(false);
+    });
+}
+
 function render(data) {
   // Ein Fehlerrahmen des SSE-Streams ist **kein** Zustand. Ihn an `render()`
   // zu reichen hiesse `slot.legacy` auf `undefined` zu lesen: der Aufruf
@@ -382,7 +668,7 @@ function render(data) {
   // Spec mit "Kacheln zeigen Alter statt Zahl" beschreibt. Der Client prueft
   // die Bedingung in `onmessage`, `render()` prueft sie noch einmal: eine
   // Bedingung, die nur an einer Stelle steht, steht an der falschen.
-  if (data === null || typeof data !== "object" || data.error) {
+  if (data === null || typeof data !== "object" || data.error || !data.slot) {
     noteStreamError(data && data.error
       ? String(data.error) : "unlesbarer Rahmen ohne Fehlerangabe");
     return;
@@ -476,6 +762,13 @@ function render(data) {
   } else {
     note.textContent = "";
   }
+
+  // Warteschlange, Halter-Knopf und die Buttons des Bestaetigungsfensters.
+  // Das Fenster selbst wird hiervon NICHT angefasst: es steht und faellt
+  // mit der Entscheidung des Nutzers, nicht mit jedem SSE-Tick.
+  renderHolderAction(data);
+  renderQueueList(data);
+  renderConfirmActions();
 
   // Logzeilen
   renderLogNotices(data.log, slot);

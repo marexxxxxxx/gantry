@@ -31,6 +31,7 @@ from aiserver_monitor.jobs import JobStatus
 from aiserver_monitor.metrics_parse import GpuSample
 from aiserver_monitor.priority import DEFAULT_MARKER
 from aiserver_monitor.proxy import Deps
+from aiserver_monitor.serverctl import ServerControl
 
 #: Port des SSE-Integrationstests (39xxx ist fuer Tests freigegeben).
 SSE_PORT = 39127
@@ -109,10 +110,11 @@ class AppTestCase(unittest.TestCase):
 
     def app(self, *, transport=None, steuer_transport=None,
             enable_background: bool = False,
-            gpu_reader=None, **felder):
+            gpu_reader=None, server_control=None, **felder):
         return create_app(self.config(**felder), transport=transport,
                           steuer_transport=steuer_transport,
                           gpu_reader=gpu_reader,
+                          server_control=server_control,
                           enable_background=enable_background)
 
     def db_zeilen(self, sql: str, params=()) -> list[tuple]:
@@ -1170,6 +1172,173 @@ class TestNichtstreamDisconnectSocket(AppTestCase):
             self.assertTrue(aborted, "Job blieb waiting (Zombie)")
         finally:
             self._stop(server, thread)
+
+
+class _ServerRunner:
+    """systemctl/pgrep-Ersatz fuer die Routen-Tests."""
+
+    def __init__(self, *, unit_installiert=True, unit_aktiv=False,
+                 prozess_laeuft=False, start_rc=0):
+        self.unit_installiert = unit_installiert
+        self.unit_aktiv = unit_aktiv
+        self.prozess_laeuft = prozess_laeuft
+        self.start_rc = start_rc
+        self.aufrufe: list[list[str]] = []
+
+    async def __call__(self, args):
+        self.aufrufe.append(list(args))
+        prefix = args[:3]
+        if prefix == ["systemctl", "--user", "cat"]:
+            return (0, "", "") if self.unit_installiert else (1, "", "no unit")
+        if prefix == ["systemctl", "--user", "is-active"]:
+            return (0, "active\n", "") if self.unit_aktiv else (3, "", "")
+        if prefix == ["systemctl", "--user", "start"]:
+            return (self.start_rc, "", "" if self.start_rc == 0 else "kaputt")
+        if prefix == ["systemctl", "--user", "stop"]:
+            return (0, "", "")
+        if args[0] == "pgrep":
+            return (0, "123\n", "") if self.prozess_laeuft else (1, "", "")
+        return (0, "", "")
+
+
+class _ServerHealth:
+    def __init__(self, ok=False):
+        self.ok = ok
+        self.pfade: list[str] = []
+
+    async def __call__(self, pfad: str = ""):
+        self.pfade.append(pfad)
+        return self.ok
+
+
+class _ServerSpawner:
+    def __init__(self):
+        self.aufrufe: list[list[str]] = []
+
+    def __call__(self, args):
+        self.aufrufe.append(list(args))
+
+
+class TestServerRoutes(AppTestCase):
+    """GET/POST /monitor/server mappen auf die ServerControl-Zustaende."""
+
+    def _control(self, *, runner=None, health=None, spawner=None):
+        return ServerControl(
+            upstream_base="http://127.0.0.1:30001",
+            repo_root=Path("/repo"),
+            runner=runner or _ServerRunner(),
+            spawner=spawner or _ServerSpawner(),
+            health_reader=health or _ServerHealth(ok=False),
+        )
+
+    def test_status_liefert_zustand_und_enabled(self):
+        runner = _ServerRunner(unit_installiert=False)
+        control = self._control(runner=runner)
+        with TestClient(self.app(server_control=control)) as client:
+            antwort = client.get("/monitor/server")
+        self.assertEqual(antwort.status_code, 200)
+        daten = antwort.json()
+        self.assertEqual(daten["state"], "stopped")
+        self.assertIs(daten["enabled"], True)
+        self.assertEqual(daten["unit"], "escha-server.service")
+
+    def test_start_ruft_systemctl_und_meldet_starting(self):
+        runner = _ServerRunner(unit_installiert=True, unit_aktiv=False)
+        control = self._control(runner=runner)
+        with TestClient(self.app(server_control=control)) as client:
+            antwort = client.post("/monitor/server/start")
+        self.assertEqual(antwort.status_code, 202)
+        self.assertEqual(antwort.json()["state"], "starting")
+        self.assertIn(
+            ["systemctl", "--user", "start", "--no-block",
+             "escha-server.service"],
+            runner.aufrufe)
+
+    def test_stop_meldet_stopping(self):
+        runner = _ServerRunner(unit_installiert=True, unit_aktiv=True,
+                               prozess_laeuft=True)
+        control = self._control(runner=runner, health=_ServerHealth(ok=True))
+        with TestClient(self.app(server_control=control)) as client:
+            antwort = client.post("/monitor/server/stop")
+        self.assertEqual(antwort.status_code, 202)
+        self.assertEqual(antwort.json()["state"], "stopping")
+
+    def test_zweiter_start_ist_409(self):
+        runner = _ServerRunner(unit_installiert=True, unit_aktiv=False)
+        control = self._control(runner=runner)
+        with TestClient(self.app(server_control=control)) as client:
+            self.assertEqual(client.post("/monitor/server/start").status_code,
+                             202)
+            antwort = client.post("/monitor/server/start")
+        self.assertEqual(antwort.status_code, 409)
+        self.assertIn("error", antwort.json())
+
+    def test_deaktivierte_steuerung_verweigert_start(self):
+        control = self._control()
+        with TestClient(self.app(server_control=control,
+                                 server_control_enabled=False)) as client:
+            status = client.get("/monitor/server")
+            antwort = client.post("/monitor/server/start")
+        self.assertEqual(status.status_code, 200)
+        self.assertIs(status.json()["enabled"], False)
+        self.assertEqual(antwort.status_code, 503)
+
+    def test_start_fehler_ist_502_mit_meldung(self):
+        runner = _ServerRunner(unit_installiert=True, unit_aktiv=False,
+                               start_rc=1)
+        control = self._control(runner=runner)
+        with TestClient(self.app(server_control=control)) as client:
+            antwort = client.post("/monitor/server/start")
+        self.assertEqual(antwort.status_code, 502)
+        self.assertIn("kaputt", antwort.json()["error"])
+
+    def test_status_liefert_backend_liste(self):
+        control = self._control()
+        with TestClient(self.app(server_control=control)) as client:
+            antwort = client.get("/monitor/server")
+        daten = antwort.json()
+        self.assertIsNone(daten["backend"])
+        self.assertEqual([b["name"] for b in daten["backends"]],
+                         ["qwen", "flint", "gptoss"])
+
+    def test_start_mit_backend_gptoss_startet_gptoss(self):
+        runner = _ServerRunner(unit_installiert=False, unit_aktiv=False,
+                               prozess_laeuft=False)
+        spawner = _ServerSpawner()
+        control = self._control(runner=runner, spawner=spawner)
+        with TestClient(self.app(server_control=control)) as client:
+            antwort = client.post("/monitor/server/start",
+                                  json={"backend": "gptoss"})
+        self.assertEqual(antwort.status_code, 202)
+        self.assertEqual(antwort.json()["backend"], "gptoss")
+        self.assertEqual(antwort.json()["state"], "starting")
+        self.assertEqual(
+            spawner.aufrufe,
+            [["bash",
+              str(Path("/repo") / "runtime/gptoss/start-gptoss.sh")]])
+
+    def test_start_mit_backend_flint_startet_flint(self):
+        runner = _ServerRunner(unit_installiert=False, unit_aktiv=False,
+                               prozess_laeuft=False)
+        spawner = _ServerSpawner()
+        control = self._control(runner=runner, spawner=spawner)
+        with TestClient(self.app(server_control=control)) as client:
+            antwort = client.post("/monitor/server/start",
+                                  json={"backend": "flint"})
+        self.assertEqual(antwort.status_code, 202)
+        self.assertEqual(antwort.json()["backend"], "flint")
+        self.assertEqual(antwort.json()["state"], "starting")
+        self.assertEqual(
+            spawner.aufrufe,
+            [["bash", str(Path("/repo") / "runtime/flint/start-flint.sh")]])
+
+    def test_unbekanntes_backend_ist_400(self):
+        control = self._control()
+        with TestClient(self.app(server_control=control)) as client:
+            antwort = client.post("/monitor/server/start",
+                                  json={"backend": "llama"})
+        self.assertEqual(antwort.status_code, 400)
+        self.assertIn("error", antwort.json())
 
 
 if __name__ == "__main__":

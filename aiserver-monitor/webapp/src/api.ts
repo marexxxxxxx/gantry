@@ -102,6 +102,33 @@ export interface HindsightUpdate extends HindsightSettings {
 /** Status der Dashboard-Verbindung (SSE). */
 export type VerbindungsStatus = "verbinde" | "verbunden" | "getrennt";
 
+/** Zustand des Modellservers (GET /monitor/server). */
+export type ServerState = "running" | "starting" | "stopping" | "stopped";
+
+/** Backend hinter dem festen Upstream-Port (30001). */
+export type ServerBackend = "qwen" | "flint" | "gptoss";
+
+/** Zustand eines Backends (GET /monitor/server). */
+export interface BackendStatus {
+  name: ServerBackend;
+  label: string;
+  state: ServerState;
+  unit: string | null;
+  managed_by_systemd: boolean;
+}
+
+/** Antwort von GET/POST /monitor/server*; `enabled` fehlt bei POST-Antworten. */
+export interface ServerStatus {
+  state: ServerState;
+  backend: ServerBackend | null;
+  backends: BackendStatus[];
+  unit: string;
+  managed_by_systemd: boolean;
+  upstream: string;
+  error: string | null;
+  enabled?: boolean;
+}
+
 /** Wartezeiten des eigenen Reconnects in Millisekunden (1 s / 2 s / 5 s). */
 const WARTEZEITEN_MS = [1000, 2000, 5000];
 
@@ -249,5 +276,33 @@ export async function updateHindsightSettings(
     method: "PUT",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(settings),
+  });
+}
+
+/** ``GET /monitor/server`` -> Zustand des SGLang-Modellservers. */
+export async function fetchServerStatus(): Promise<ServerStatus> {
+  return jsonAntwort<ServerStatus>("/monitor/server");
+}
+
+/**
+ * ``POST /monitor/server/start`` -> 202 mit Zustand "starting".
+ *
+ * Laeuft bereits das andere Backend, stoppt der Server es zuerst und
+ * wechselt dann (gleicher Port, keine Client-Aenderung).
+ */
+export async function startServer(
+  backend: ServerBackend,
+): Promise<ServerStatus> {
+  return jsonAntwort<ServerStatus>("/monitor/server/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ backend }),
+  });
+}
+
+/** ``POST /monitor/server/stop`` -> 202 mit Zustand "stopping". */
+export async function stopServer(): Promise<ServerStatus> {
+  return jsonAntwort<ServerStatus>("/monitor/server/stop", {
+    method: "POST",
   });
 }

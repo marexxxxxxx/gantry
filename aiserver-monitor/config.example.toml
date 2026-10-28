@@ -8,6 +8,12 @@
 # listen_port = 30000
 # upstream_base = "http://127.0.0.1:30001"
 
+# --- Embeddings (eigener CPU-Ollama, nur lokal gebunden) ---
+# /v1/embeddings wird hierhin geroutet statt an upstream_base. Das Modell
+# laeuft auf der CPU und kann parallel zum Chat-Backend arbeiten.
+# embed_base = "http://127.0.0.1:30002"
+# embed_model = "qwen3-embedding:0.6b"
+
 # --- Pfade ---
 # db_path = "data/monitor.db"
 # log_path = "data/aiserver-monitor.log"
@@ -34,3 +40,33 @@
 # "aborted" abgeschlossen (dazu best effort abort_request an SGLang).
 # false = altes Verhalten: Jobs laufen immer zu Ende.
 # abort_on_disconnect = true
+
+# --- Server-Steuerung (Dashboard-Tab "Server", server.sh) ---
+# Schaltet den Modellserver ein/aus. Pfade sind relativ zur Repo-Wurzel.
+# Ist die systemd-User-Unit installiert, wird sie fuer start/stop benutzt.
+# server_control_enabled = true
+# server_unit = "escha-server.service"
+# server_start_script = "runtime/sglang/start-penalty.sh"
+# server_stop_script = "runtime/sglang/stop-server.sh"
+# server_process_pattern = "[s]glang.launch_server"
+#
+# Zweites Backend "flint" (Ollama auf demselben Upstream-Port 30001).
+# Die Skripte starten/stoppen einen eigenen ollama-Prozess; der System-Dienst
+# auf Port 11434 bleibt unberuehrt.
+# flint_start_script = "runtime/flint/start-flint.sh"
+# flint_stop_script = "runtime/flint/stop-flint.sh"
+# flint_pidfile = "runtime/flint/flint.pid"
+# flint_health_path = "/api/version"
+#
+# GPT-OSS-Backend: eigener Ollama-Prozess, 64k Kontext, 1 Slot.
+# gptoss_start_script = "runtime/gptoss/start-gptoss.sh"
+# gptoss_stop_script = "runtime/gptoss/stop-gptoss.sh"
+# gptoss_pidfile = "runtime/gptoss/gptoss.pid"
+#
+# Modell-Alias: Clients duerfen weiterhin den Qwen-Namen senden. Laeuft Flint
+# oder GPT-OSS, schreibt das Gateway ihn auf das jeweilige Modell um; bei Qwen
+# bleibt er unveraendert. Fuer GPT-OSS setzt das Gateway zusaetzlich
+# temperature 0 und reasoning_effort "low", wenn der Client nichts vorgibt.
+# model_alias = "escha-qwen38-27b-w2"
+# flint_model = "hf.co/AtomicChat/Flint-GGUF:IQ4_XS"
+# gptoss_model = "gpt-oss:20b"

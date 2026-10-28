@@ -4,6 +4,7 @@ import type { Job, Sample, VerbindungsStatus } from "./api";
 import LiveView from "./LiveView";
 import PreviewModal from "./PreviewModal";
 import PriorityView from "./PriorityView";
+import ServerView from "./ServerView";
 import StatsView from "./StatsView";
 
 /** Serverspalte der Kopfleiste als deutsche Beschriftung. */
@@ -19,7 +20,7 @@ const NOTAUS_FENSTER_MS = 5000;
 /** So viele Stats-Samples haelt der Ringpuffer fuer die Sparkline vor. */
 const RINGLAENGE = 30;
 
-type Tab = "live" | "stats" | "priority";
+type Tab = "live" | "stats" | "priority" | "server";
 
 /** Echter Wert (nicht null/undefined), damit die UI "-" fuer Ungemessenes zeigt. */
 function vorhanden(wert: number | null | undefined): wert is number {
@@ -52,9 +53,9 @@ function istAktiv(job: Job): boolean {
 }
 
 /**
- * Banner, solange der letzte Messwert SGLang als nicht erreichbar meldet
- * (``available === false``). Ohne Sample (noch nie gemessen) bleibt es aus.
- * Eigene Komponente, damit sie sich isoliert rendern laesst.
+ * Banner, solange der letzte Messwert den Modellserver als nicht erreichbar
+ * meldet (``available === false``). Ohne Sample (noch nie gemessen) bleibt es
+ * aus. Eigene Komponente, damit sie sich isoliert rendern laesst.
  */
 export function OfflineHinweis({ sample }: { sample: Sample | null }) {
   if (sample === null || sample.available) {
@@ -66,7 +67,7 @@ export function OfflineHinweis({ sample }: { sample: Sample | null }) {
       role="status"
       data-testid="offline-hinweis"
     >
-      SGLang ist nicht erreichbar — die Messwerte fehlen.
+      Modellserver ist nicht erreichbar — die Messwerte fehlen.
     </div>
   );
 }
@@ -251,6 +252,15 @@ export default function App() {
           >
             Priorität
           </button>
+          <button
+            type="button"
+            className={tab === "server" ? "tab tab-aktiv" : "tab"}
+            aria-pressed={tab === "server"}
+            data-testid="tab-server"
+            onClick={() => setTab("server")}
+          >
+            Server
+          </button>
         </nav>
         <span className="notaus-bereich">
           <button
@@ -290,8 +300,10 @@ export default function App() {
           />
         ) : tab === "stats" ? (
           <StatsView />
-        ) : (
+        ) : tab === "priority" ? (
           <PriorityView />
+        ) : (
+          <ServerView />
         )}
       </main>
       {modalJob !== null && (

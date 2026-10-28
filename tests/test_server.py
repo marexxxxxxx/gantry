@@ -372,7 +372,12 @@ const sessionStorage = { getItem: () => null, setItem: () => {} };
 // Kette aus `.then().then()`, die nie ausgefuehrt wird: der Test ruft
 // `render()` selbst. Ein Stub, der zurueckbricht, wuerde den Test an der
 // Harness-Schnur statt am Verhalten scheitern lassen.
-const fetch = () => ({ then: () => ({ then: () => ({}) }) });
+// `__fetchImpl` setzt `acts()` fuer Klick-Folgen. Ohne sie bleibt es bei der
+// Kette: der Ladeaufruf `fetch("/api/state")` des Dashboards braucht keine Antwort.
+let __fetchImpl = null;
+const fetch = (...args) => (__fetchImpl !== null
+  ? __fetchImpl(...args)
+  : ({ then: () => ({ then: () => ({}) }) }));
 const EventSource = class { constructor(url) { this.url = url; } };
 // Timer werden nicht ausgefuehrt - `node` wuerde sonst ewig haengen. Die
 // Rueckrufe werden aber **gesammelt**, damit der Test sie einmal aufrufen
@@ -418,6 +423,33 @@ process.stdout.write(JSON.stringify(__list && process.argv[4] !== "timers"
   ? __dumps : __dump()));
 """
 
+#: Klick-Folge fuer `acts()`. Die Attrappe antwortet mit `reply` und `status`
+#: oder wirft `error`; jede Anfrage landet unter `#posted`. `__extra` ist die
+#: Ablage fuer Zwischenstaende, die das Snippet selbst nimmt (`#extra`).
+ACTION_RUNNER = """
+const __payload = JSON.parse(require("fs").readFileSync(process.argv[2], "utf8"));
+const __posted = [];
+const __extra = {};
+__fetchImpl = async (url, init) => {
+  __posted.push({ url, method: init.method, body: init.body === undefined ? null : init.body });
+  if (__payload.error !== null) throw new Error(__payload.error);
+  return { ok: __payload.status >= 200 && __payload.status < 300,
+           status: __payload.status, json: async () => __payload.reply };
+};
+render(__payload.state);
+(async () => {
+__SNIPPET__
+})().then(() => {
+  const out = __dump();
+  out["#posted"] = __posted;
+  out["#extra"] = __extra;
+  process.stdout.write(JSON.stringify(out));
+}, (err) => {
+  process.stderr.write(String(err && err.stack ? err.stack : err));
+  process.exit(1);
+});
+"""
+
 #: `node` oder `nodejs`. Ohne einen davon laeuft der `render()`-Test nicht -
 #: dann wird er uebersprungen, aber nicht als bestanden gezaehlt.
 NODE = shutil.which("node") or shutil.which("nodejs")
@@ -461,6 +493,35 @@ def render(state, more=(), run_timers=False):
                               capture_output=True, text=True, timeout=30)
     if done.returncode != 0:
         raise AssertionError(f"render() ist abgebrochen:\n{done.stderr}")
+    return json.loads(done.stdout)
+
+
+def acts(state, snippet, reply=None, status=200, error=None):
+    """Eine Klick-Folge gegen den `<script>`-Block: rendern, dann `snippet` laufen lassen.
+
+    `fetch` ist eine Attrappe: sie antwortet mit `reply` und `status`, oder sie
+    wirft `error`. Der Rueckgabewert ist der DOM-Zustand nach der Folge, dazu
+    `#posted` (jede Anfrage: Adresse, Methode, Body) und `#extra` (was das
+    Snippet selbst unter `__extra` abgelegt hat).
+    """
+    html = read_dashboard()
+    match = SCRIPT_BLOCK.search(html)
+    if match is None:
+        raise AssertionError("dashboard.html hat keinen <script>-Block")
+    ids = sorted(set(re.findall(r'id="([^"]+)"', html)))
+    program = STUB + match.group("code") + ACTION_RUNNER.replace("__SNIPPET__", snippet)
+    with tempfile.TemporaryDirectory(prefix="slotmon-render-") as work:
+        script = os.path.join(work, "click.js")
+        payload = os.path.join(work, "payload.json")
+        with open(script, "w", encoding="utf-8") as handle:
+            handle.write(program)
+        with open(payload, "w", encoding="utf-8") as handle:
+            json.dump({"state": state, "reply": reply, "status": status,
+                       "error": error}, handle)
+        done = subprocess.run([NODE, script, payload, json.dumps(ids)],
+                              capture_output=True, text=True, timeout=30)
+    if done.returncode != 0:
+        raise AssertionError(f"Klick-Folge ist abgebrochen:\n{done.stderr}")
     return json.loads(done.stdout)
 
 
@@ -1311,6 +1372,321 @@ class TestAbgebrochenInDerMittleren(unittest.TestCase):
             entry(duration_s=100.0, aborted=True),
         ]))
         self.assertEqual(dom["k-wait-time"]["html"], "30s (Schaetzung)")
+
+
+#: Ein Wartender, so wie `queue.py` ihn in `waiting_list` ablegt.
+def wl_entry(position, rid, waiting_since, system=None):
+    return {"position": position, "rid": rid, "waiting_since": waiting_since,
+            "system": system}
+
+
+AT = 1791795000.0
+HOLDER_RID = "halter-rid-123456"
+WAITING_RID = "ccc333-volle-rid-ganz"
+
+#: Zelle je Spalte der Warteschlange. Die Reihenfolge der Zellen ist Teil der
+#: Aussage: Position, rid-Kurz, Wartezeit, Systemname.
+WL_CELL = re.compile(r'<span class="wl-(pos|rid|wait|sys)">([^<]*)</span>')
+
+#: Der eine Satz, warum die Warteschlange leer ist.
+WL_EMPTY = re.compile(r'<div class="note wl-empty">([^<]*)</div>')
+
+BUTTON = re.compile(r"<button[^>]*>")
+
+#: Jede Zeile des Bestaetigungsfensters ist ein eigenes `<div>`.
+CONFIRM_LINE = re.compile(r"<div[^>]*>([^<]*)</div>")
+
+
+def busy_queue_state(**queue):
+    """Halter laeuft, zwei Wartende: Position 1 seit 90 s, Position 2 seit 75 s."""
+    waiting = {"waiting": 2, "running": 1, "waiting_list": [
+        wl_entry(1, "bbb222-volle-rid-ganz", AT - 90),
+        wl_entry(2, WAITING_RID, AT - 75),
+    ]}
+    waiting.update(queue)
+    return sample_state(at=AT, slot={"state": "busy", "rid": HOLDER_RID,
+                                     "system": "Laptop", "duration_s": 63.0,
+                                     "complete": False},
+                        queue=waiting)
+
+
+@unittest.skipUnless(NODE, "kein node/nodejs im PATH - render() wird nicht ausgefuehrt")
+class TestWarteschlangenliste(unittest.TestCase):
+    """Die Warteschlange im Reiter "Jetzt", unter der Halter-Karte.
+
+    Position 1 ist der naechste Wartende; der laufende Halter steht nicht in
+    der Liste (`queue.py` ueberspringt ihn). Die rid ist auf acht Zeichen
+    gekuerzt, die Wartezeit ist `at - waiting_since`. Die Liste ist vollstaendig:
+    gekuerzt wird nur im Terminal.
+    """
+
+    def test_rows_show_position_short_rid_wait_and_system(self):
+        dom = render(sample_state(at=AT, queue={"waiting": 2, "waiting_list": [
+            wl_entry(1, "abcdefghIJKLMNOP", AT - 75, None),
+            wl_entry(2, "zyxwvuts-lang", AT - 10, "Laptop"),
+        ]}))
+        self.assertEqual(WL_CELL.findall(dom["queue-list"]["html"]), [
+            ("pos", "1"), ("rid", "abcdefgh"), ("wait", "1m 15s"), ("sys", "unbekannt*"),
+            ("pos", "2"), ("rid", "zyxwvuts"), ("wait", "10s"), ("sys", "Laptop"),
+        ])
+
+    def test_the_full_rid_stays_out_of_the_list(self):
+        dom = render(busy_queue_state())
+        self.assertNotIn(WAITING_RID, dom["queue-list"]["html"])
+
+    def test_the_running_holder_is_not_in_the_list(self):
+        dom = render(busy_queue_state())
+        html = dom["queue-list"]["html"]
+        self.assertEqual(html.count('class="wl-row"'), 2)
+        self.assertNotIn(HOLDER_RID[:8], html)
+
+    def test_an_unknown_name_reads_unbekannt_with_the_footnote(self):
+        dom = render(busy_queue_state())
+        self.assertIn('<span class="wl-sys">unbekannt*</span>', dom["queue-list"]["html"])
+        self.assertEqual(dom["queue-footnote"]["text"],
+                         "* steht erst nach dem Abschluss fest")
+
+    def test_no_footnote_when_every_name_is_known(self):
+        dom = render(busy_queue_state(waiting_list=[
+            wl_entry(1, "bbb222-volle-rid-ganz", AT - 90, "Laptop")]))
+        self.assertEqual(dom["queue-footnote"]["text"], "")
+
+    def test_an_empty_list_says_why_in_one_sentence(self):
+        dom = render(sample_state(queue={"waiting": 0, "waiting_list": []}))
+        html = dom["queue-list"]["html"]
+        self.assertEqual(WL_EMPTY.findall(html),
+                         ["Kein Wartender - die Warteschlange ist leer."])
+        self.assertEqual(html.count('class="wl-row"'), 0)
+        self.assertNotIn("<table", html)
+
+    def test_altbestand_is_named_as_the_reason(self):
+        dom = render(sample_state(slot={"legacy": 3},
+                                  queue={"waiting": 3, "waiting_list": []}))
+        self.assertEqual(WL_EMPTY.findall(dom["queue-list"]["html"]), [
+            "Altbestand: 3 Request(s) vor Aktivierung der Log-Events - "
+            "ihre Reihenfolge ist nicht ableitbar."])
+
+    def test_a_dead_server_is_named_as_the_reason(self):
+        dom = render(sample_state(
+            server={"connected": False, "load_error": "ConnectError", "age_s": None},
+            queue={"waiting": None, "waiting_list": []}))
+        self.assertEqual(WL_EMPTY.findall(dom["queue-list"]["html"]),
+                         ["Server nicht erreichbar - die Warteschlange ist nicht bekannt."])
+
+    def test_waiting_without_an_order_says_so(self):
+        dom = render(sample_state(queue={"waiting": 3, "waiting_list": []}))
+        self.assertEqual(WL_EMPTY.findall(dom["queue-list"]["html"]), [
+            "3 Wartende laut /get_load, aber das Log liefert dafuer keine Reihenfolge."])
+
+    def test_the_list_stands_below_the_holder_card(self):
+        html = read_dashboard()
+        self.assertLess(html.index('id="slot-card"'), html.index('id="holder-action"'))
+        self.assertLess(html.index('id="holder-action"'), html.index('id="queue-list"'))
+        self.assertLess(html.index('id="queue-list"'), html.index('id="tab-history"'))
+
+
+@unittest.skipUnless(NODE, "kein node/nodejs im PATH - render() wird nicht ausgefuehrt")
+class TestHalterKnopf(unittest.TestCase):
+    """Der Halter-Knopf ist nur bei belegtem Slot aktiv - sonst grau, mit Grund."""
+
+    def button(self, dom):
+        found = BUTTON.findall(dom["holder-action"]["html"])
+        self.assertEqual(len(found), 1, dom["holder-action"]["html"])
+        return found[0]
+
+    def test_greyed_out_when_the_slot_is_free_with_the_reason(self):
+        dom = render(sample_state(slot={"state": "free", "complete": True, "reason": None}))
+        self.assertIn("disabled", self.button(dom))
+        self.assertIn("Kein Halter - der Slot ist frei.", dom["holder-action"]["html"])
+
+    def test_active_when_the_slot_is_busy(self):
+        dom = render(busy_queue_state())
+        self.assertNotIn("disabled", self.button(dom))
+        self.assertIn("Halter abbrechen", dom["holder-action"]["html"])
+        self.assertNotIn("Kein Halter", dom["holder-action"]["html"])
+
+    def test_greyed_out_when_the_holder_is_unknown(self):
+        dom = render(sample_state(slot={"state": "unknown", "complete": False,
+                                        "reason": "Halter nicht bestimmbar - kein Befund"}))
+        self.assertIn("disabled", self.button(dom))
+        self.assertIn("Halter nicht bestimmbar - nichts zum Abbrechen.",
+                      dom["holder-action"]["html"])
+
+    def test_greyed_out_without_a_connection_says_so(self):
+        dom = render(sample_state(server={"connected": False, "load_error": "weg",
+                                          "age_s": None}))
+        self.assertIn("disabled", self.button(dom))
+        self.assertIn("Server nicht erreichbar - kein Halter bekannt.",
+                      dom["holder-action"]["html"])
+
+
+@unittest.skipUnless(NODE, "kein node/nodejs im PATH - render() wird nicht ausgefuehrt")
+class TestAbbruchBestaetigung(unittest.TestCase):
+    """Ein Abbruch geht erst nach der Bestaetigung raus - nie beim ersten Klick.
+
+    `fetch` ist eine Attrappe (`acts()`). Geprueft wird, was der Nutzer sieht
+    und was tatsaechlich an den Server geht.
+    """
+
+    ACCEPTED = {"aborted": True, "rid": WAITING_RID, "reason": "abgebrochen"}
+
+    def test_nothing_is_sent_before_the_confirmation(self):
+        dom = acts(busy_queue_state(), "askWaiting(2);")
+        self.assertEqual(dom["#posted"], [])
+        self.assertIn("Bestaetigen", dom["confirm-actions"]["html"])
+
+    def test_the_dialog_shows_the_full_rid_wait_position_and_the_warning(self):
+        dom = acts(busy_queue_state(), "askWaiting(2);")
+        self.assertEqual(CONFIRM_LINE.findall(dom["confirm-text"]["html"]), [
+            "Abbruch bestaetigen",
+            "Ziel: Position 2 in der Warteschlange",
+            "rid: ccc333-volle-rid-ganz",
+            "Wartezeit: 1m 15s",
+            "Das bricht den Auftrag ab. Es wird kein Ergebnis zurueckgegeben.",
+        ])
+
+    def test_the_holder_dialog_shows_the_run_time(self):
+        dom = acts(busy_queue_state(), "askHolder();")
+        self.assertEqual(CONFIRM_LINE.findall(dom["confirm-text"]["html"]), [
+            "Abbruch bestaetigen",
+            "Ziel: Halter (laufender Auftrag)",
+            "rid: halter-rid-123456",
+            "Laufzeit: 1m 3s",
+            "Das bricht den Auftrag ab. Es wird kein Ergebnis zurueckgegeben.",
+        ])
+
+    def test_the_waiting_route_gets_the_position_as_json(self):
+        dom = acts(busy_queue_state(), "askWaiting(2); await confirmAbort();",
+                   reply=self.ACCEPTED)
+        self.assertEqual(dom["#posted"], [
+            {"url": "/api/abort--waiting", "method": "POST", "body": '{"position":2}'}])
+
+    def test_the_holder_route_gets_no_parameter(self):
+        dom = acts(busy_queue_state(), "askHolder(); await confirmAbort();",
+                   reply={"aborted": True, "rid": HOLDER_RID, "reason": "abgebrochen"})
+        self.assertEqual(dom["#posted"], [
+            {"url": "/api/abort--holder", "method": "POST", "body": None}])
+
+    def test_an_accepted_request_reads_gesendet_not_abgebrochen(self):
+        dom = acts(busy_queue_state(), "askWaiting(2); await confirmAbort();",
+                   reply=self.ACCEPTED)
+        self.assertEqual(dom["abort-result"]["text"],
+                         "gesendet: Position 2 in der Warteschlange, rid ccc333-volle-rid-ganz"
+                         " - ob der Abbruch wirkt, zeigt der Verlauf.")
+
+    def test_a_refused_request_shows_the_servers_reason(self):
+        dom = acts(busy_queue_state(), "askWaiting(2); await confirmAbort();",
+                   reply={"aborted": False, "rid": None,
+                          "reason": "Position 2 gibt es nicht (nur 1)"})
+        self.assertEqual(dom["abort-result"]["text"],
+                         "nicht gesendet - Position 2 gibt es nicht (nur 1)")
+
+    def test_a_failed_fetch_is_an_error_not_a_success(self):
+        dom = acts(busy_queue_state(), "askWaiting(2); await confirmAbort();",
+                   error="Failed to fetch")
+        self.assertEqual(dom["abort-result"]["text"], "Fehler: Failed to fetch")
+
+    def test_an_http_error_is_an_error_not_a_success(self):
+        dom = acts(busy_queue_state(), "askHolder(); await confirmAbort();", status=500)
+        self.assertEqual(dom["abort-result"]["text"], "Fehler: HTTP 500")
+
+    def test_an_answer_without_the_aborted_flag_is_an_error(self):
+        dom = acts(busy_queue_state(), "askHolder(); await confirmAbort();",
+                   reply={"reason": "irgendwas"})
+        self.assertEqual(dom["abort-result"]["text"],
+                         "Fehler: unerwartete Antwort des Servers")
+
+    def test_a_double_click_sends_one_request(self):
+        dom = acts(busy_queue_state(),
+                   "askWaiting(1); const __first = confirmAbort();"
+                   " __extra.mid = __dump(); const __second = confirmAbort();"
+                   " await __first; await __second;",
+                   reply=self.ACCEPTED)
+        self.assertEqual(len(dom["#posted"]), 1)
+
+    def test_while_the_request_runs_every_abort_button_is_locked(self):
+        dom = acts(busy_queue_state(),
+                   "askWaiting(1); const __first = confirmAbort();"
+                   " __extra.mid = __dump(); await __first;",
+                   reply=self.ACCEPTED)
+        mid = dom["#extra"]["mid"]
+        rows = BUTTON.findall(mid["queue-list"]["html"])
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all("disabled" in tag for tag in rows), rows)
+        self.assertIn("disabled", BUTTON.findall(mid["holder-action"]["html"])[0])
+        confirm = BUTTON.findall(mid["confirm-actions"]["html"])
+        self.assertEqual(len(confirm), 2)
+        self.assertTrue(all("disabled" in tag for tag in confirm), confirm)
+
+    def test_after_the_answer_the_buttons_are_free_and_the_result_stays(self):
+        dom = acts(busy_queue_state(), "askWaiting(2); await confirmAbort();",
+                   reply=self.ACCEPTED)
+        self.assertIn("hidden", dom["confirm"]["classes"])
+        rows = BUTTON.findall(dom["queue-list"]["html"])
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all("disabled" not in tag for tag in rows), rows)
+        self.assertTrue(dom["abort-result"]["text"].startswith("gesendet"))
+
+    def test_zurueck_sends_nothing(self):
+        dom = acts(busy_queue_state(), "askHolder(); closeConfirm();")
+        self.assertEqual(dom["#posted"], [])
+        self.assertIn("hidden", dom["confirm"]["classes"])
+
+    def test_a_position_that_left_the_list_is_reported_not_sent(self):
+        dom = acts(busy_queue_state(), "askWaiting(7);")
+        self.assertEqual(dom["#posted"], [])
+        self.assertEqual(dom["abort-result"]["text"],
+                         "nicht gesendet - Position 7 steht nicht mehr in der Liste")
+
+
+@unittest.skipUnless(NODE, "kein node/nodejs im PATH - render() wird nicht ausgefuehrt")
+class TestAbgebrochenImVerlauf(unittest.TestCase):
+    """Ein abgebrochener Eintrag ist kein FERTIG - und zaehlt nicht in die Mittelung."""
+
+    HISTORY = [
+        entry(rid="rid-normal", duration_s=10.0, completion_tokens=20),
+        entry(rid="rid-abbruch", duration_s=100.0, completion_tokens=500, aborted=True),
+    ]
+
+    def test_an_aborted_entry_is_labelled_abgebrochen(self):
+        dom = render(sample_state(slot={"state": "free", "complete": True},
+                                  history=self.HISTORY))
+        cls, colour, html = entry_with(dom, "rid-abbruch")
+        self.assertEqual(meta_of(html),
+                         "abgebrochen - 1m 40s - ctx 1000 - 5.0 tok/s - 500 tok - 50 cache")
+        self.assertNotIn("FERTIG", html)
+        self.assertEqual(colour, "var(--warn)")
+
+    def test_a_normal_entry_stays_fertig(self):
+        dom = render(sample_state(slot={"state": "free", "complete": True},
+                                  history=self.HISTORY))
+        cls, colour, html = entry_with(dom, "rid-normal")
+        self.assertEqual(meta_of(html),
+                         "FERTIG - 10s - ctx 1000 - 2.0 tok/s - 20 tok - 50 cache")
+        self.assertEqual(colour, "var(--idle)")
+
+    def test_the_abort_counts_as_a_handover_but_not_in_the_mean(self):
+        dom = render(sample_state(slot={"state": "free", "complete": True},
+                                  history=self.HISTORY))
+        self.assertEqual(dom["h-count"]["text"], 2)
+        self.assertEqual(dom["h-avg"]["text"], "10s")
+
+
+class TestDashboardDatei(unittest.TestCase):
+    """Die Datei selbst: ASCII-only und nur die beiden Abbruch-Routen."""
+
+    def test_dashboard_is_ascii_only(self):
+        """Umlaute als ae/oe/ue, keine Emojis, keine Typografie-Zeichen.
+
+        Die Liste nennt die Zeichen, die stoeren - ein blosses "stimmt nicht"
+        waere kein Befund.
+        """
+        self.assertEqual(sorted({ch for ch in read_dashboard() if ord(ch) > 127}), [])
+
+    def test_the_dashboard_calls_only_the_two_abort_routes(self):
+        paths = sorted(set(re.findall(r'"(/api/[^"]*)"', read_dashboard())))
+        self.assertEqual(paths, ["/api/abort--holder", "/api/abort--waiting",
+                                 "/api/state", "/api/stream"])
 
 
 class AbortCollector:

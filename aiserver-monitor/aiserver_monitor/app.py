@@ -36,7 +36,14 @@ from .history import History
 from .jobs import ACTIVE_STATUSES, JobRegistry, JobStatus, job_to_dict
 from .metrics_parse import GpuSample
 from .priority import PriorityManager
-from .proxy import Deps, handle_v1
+from .proxy import BackendProbe, Deps, handle_v1
+from .serverctl import (
+    BACKEND_NAMES,
+    ServerConflictError,
+    ServerControl,
+    ServerControlError,
+    standard_repo_root,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -139,13 +146,15 @@ def create_app(config: Config, *,
                transport: httpx.AsyncBaseTransport | None = None,
                steuer_transport: httpx.AsyncBaseTransport | None = None,
                gpu_reader: Callable[[], Awaitable[GpuSample]] | None = None,
+               server_control: ServerControl | None = None,
                enable_background: bool = True) -> FastAPI:
     """Baut die Gateway-App aus Config, optionalem Transport und GPU-Reader.
 
     ``transport`` ersetzt den httpx-Transport der Clients (Tests),
     ``steuer_transport`` den des dedizierten Steuer-Clients; ohne Angabe
     faellt der Steuer-Client auf ``transport`` zurueck. ``gpu_reader``
-    ersetzt den nvidia-smi-Aufruf des Sammlers. ``enable_background=False``
+    ersetzt den nvidia-smi-Aufruf des Sammlers, ``server_control`` die
+    Start/Stop-Logik des Modellservers (Tests). ``enable_background=False``
     startet keinen Collector (Tests). Die Lifespan initialisiert und raeumt
     die History auf, markiert haengengebliebene Jobs als error und
     startet/stoppt den Collector.
@@ -170,6 +179,8 @@ def create_app(config: Config, *,
     steuer_client = httpx.AsyncClient(
         transport=transport if steuer_transport is None else steuer_transport,
         timeout=httpx.Timeout(_STEUER_TIMEOUT_S))
+    if server_control is None:
+        server_control = ServerControl.from_config(config, client=steuer_client)
     priority = PriorityManager(history)
     hindsight = HindsightBlocker(history)
     deps = Deps(
@@ -180,6 +191,10 @@ def create_app(config: Config, *,
         client=client,
         priority=priority,
         hindsight=hindsight,
+        # Eigener Pool (Steuer-Client): die Probe darf nicht hinter langen
+        # Relay-Streams im Proxy-Pool warten.
+        backend=BackendProbe(config, steuer_client,
+                             repo_root=standard_repo_root()),
     )
     collector = Collector(deps, gpu_reader=gpu_reader, client=collector_client)
 
@@ -216,6 +231,7 @@ def create_app(config: Config, *,
     app.state.collector_task = None
     app.state.collector_client = collector_client
     app.state.steuer_client = steuer_client
+    app.state.server_control = server_control
 
     async def _abbrechen(*, rid: str | None, abort_all: bool) -> bool:
         """``abort_request`` ueber den Steuer-Client: Netzfehler -> False.
@@ -368,6 +384,64 @@ def create_app(config: Config, *,
         antwort = hindsight.as_dict()
         antwort["aborted"] = abgebrochen
         return JSONResponse(content=antwort)
+
+    @app.get("/monitor/server")
+    async def monitor_server() -> Response:
+        """Zustand des Modellservers; ``enabled`` steuert die UI."""
+        antwort = await server_control.snapshot()
+        antwort["enabled"] = config.server_control_enabled
+        return JSONResponse(content=antwort)
+
+    @app.post("/monitor/server/start")
+    async def monitor_server_start(request: Request) -> Response:
+        """Startet ein Backend; 400 unbekannt, 409 bei laufendem Uebergang.
+
+        Ohne Body (oder ohne ``backend``) startet das laufende Backend bzw.
+        Qwen. Der Body ist optional, damit bestehende Clients unveraendert
+        weiter funktionieren.
+        """
+        if not config.server_control_enabled:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "Server-Steuerung ist deaktiviert."})
+        backend = None
+        if await request.body():
+            try:
+                daten = await request.json()
+            except ValueError:
+                daten = None
+            if not isinstance(daten, dict):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "JSON-Objekt erwartet"})
+            backend = daten.get("backend")
+            if backend is not None and backend not in BACKEND_NAMES:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "backend muss "
+                                      f"{' oder '.join(BACKEND_NAMES)} sein"})
+        try:
+            antwort = await server_control.start(backend)
+        except ServerConflictError as exc:
+            return JSONResponse(status_code=409, content={"error": str(exc)})
+        except ServerControlError as exc:
+            return JSONResponse(status_code=502, content={"error": str(exc)})
+        return JSONResponse(status_code=202, content=antwort)
+
+    @app.post("/monitor/server/stop")
+    async def monitor_server_stop() -> Response:
+        """Stoppt den Modellserver; das Gateway laeuft weiter."""
+        if not config.server_control_enabled:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "Server-Steuerung ist deaktiviert."})
+        try:
+            antwort = await server_control.stop()
+        except ServerConflictError as exc:
+            return JSONResponse(status_code=409, content={"error": str(exc)})
+        except ServerControlError as exc:
+            return JSONResponse(status_code=502, content={"error": str(exc)})
+        return JSONResponse(status_code=202, content=antwort)
 
     @app.get("/monitor/stats")
     async def monitor_stats(

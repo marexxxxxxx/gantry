@@ -169,8 +169,9 @@ class TestSampleOnce(CollectorTestBasis):
                 def handler(request: httpx.Request) -> httpx.Response:
                     if request.url.path == kaputter_pfad:
                         return httpx.Response(500)
-                    return httpx.Response(
-                        200, content=fakes.meter_text().encode("utf-8"))
+                    # /api/version 404: kein Flint, also bleibt es bei
+                    # "SGLang kaputt" statt eines Flint-Samples.
+                    return httpx.Response(404)
 
                 collector = Collector(self.deps(httpx.MockTransport(handler)),
                                       gpu_reader=_FakeGpuReader())
@@ -456,6 +457,39 @@ class TestRunLoop(CollectorTestBasis):
             self.assertTrue(aufgabe.cancelled())
             # Die neuen Samples des laufenden Betriebs bleiben in der DB.
             self.assertIsNotNone(hist.last_sample())
+
+
+class TestFlintSample(CollectorTestBasis):
+    """Laeuft Flint (Ollama) statt SGLang, liefert der Sammler Live-Werte."""
+
+    async def test_flint_upstream_ergibt_verfuegbares_sample(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            pfad = request.url.path
+            if pfad == "/api/version":
+                return httpx.Response(200, json={"version": "0.40.11"})
+            if pfad == "/api/ps":
+                return httpx.Response(200, json={"models": [
+                    {"name": "flint", "context_length": 32768}]})
+            return httpx.Response(404)
+
+        deps = self.deps(httpx.MockTransport(handler))
+        deps.registry.register(
+            "flint-1", source="test", model="flint",
+            full_prompt="Hallo", now=time.time())
+        collector = Collector(deps,
+                              gpu_reader=_FakeGpuReader(41, 13200, 16384))
+
+        sample = await collector.sample_once()
+
+        self.assertIs(sample["available"], True)
+        self.assertEqual(sample["max_tokens"], 32768.0)
+        self.assertEqual(sample["waiting"], 1)
+        self.assertEqual(sample["running"], 0)
+        self.assertEqual(sample["gpu_util"], 41)
+        self.assertEqual(sample["vram_used_mb"], 13200)
+        self.assertNotIn("token_usage", sample)
+        self.assertEqual(_frames(self.queue), [("event: stats", sample)])
+        self.assertEqual(self.history.samples, [sample])
 
 
 if __name__ == "__main__":

@@ -39,7 +39,7 @@ from aiserver_monitor.priority import (
     NORMAL_PRIORITY,
     PriorityManager,
 )
-from aiserver_monitor.proxy import Deps, ensure_rid, handle_v1
+from aiserver_monitor.proxy import BackendProbe, Deps, ensure_rid, handle_v1
 
 #: rid-Muster des Gateways: uuid4().hex
 RID_MUSTER = re.compile(r"^[0-9a-f]{32}$")
@@ -158,7 +158,8 @@ class ProxyTestBasis(unittest.IsolatedAsyncioTestCase):
              nonstream_keepalive: bool = True,
              abort_on_disconnect: bool = True,
              priority: PriorityManager | None = None,
-             hindsight: HindsightBlocker | None = None) -> Deps:
+             hindsight: HindsightBlocker | None = None,
+             backend: "BackendProbe | None" = None) -> Deps:
         """Deps mit dem gegebenen Transport; der Client wird am Testende geschlossen."""
         if self._client is None:
             self._client = httpx.AsyncClient(transport=transport)
@@ -174,6 +175,7 @@ class ProxyTestBasis(unittest.IsolatedAsyncioTestCase):
             client=self._client,
             priority=priority if priority is not None else PriorityManager(),
             hindsight=hindsight,
+            backend=backend,
         )
 
 
@@ -761,8 +763,33 @@ class TestPassthroughOhneStream(ProxyTestBasis):
 
     async def test_anderer_post_pfad_bleibt_passthrough_ohne_job(self):
         # R1/R7.5: nur ``chat/completions`` wird intern gestreamt; andere
-        # JSON-POSTs (z. B. ``/v1/embeddings``) bleiben der getreue,
+        # JSON-POSTs (z. B. ``/v1/tokenize``) bleiben der getreue,
         # gepufferte Byte-Passthrough ohne Job und ohne stream-Umschreibung.
+        fest = b'{"tokens": [1, 2, 3]}'
+        gesehen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            gesehen.append(request)
+            return httpx.Response(200, content=fest, headers={
+                "content-type": "application/json"})
+
+        deps = self.deps(httpx.MockTransport(handler))
+        body = {"model": "fake-modell", "prompt": "Hallo", "stream": False}
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/tokenize", body), deps)
+
+        self.assertNotIsInstance(antwort, StreamingResponse)
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(await _body(antwort), fest)     # byte-identisch
+        self.assertEqual(json.loads(gesehen[0].content), body)  # unveraendert
+        self.assertEqual(self.registry.snapshot(), [])  # kein Job
+
+
+class TestEmbeddingRouting(ProxyTestBasis):
+    """``/v1/embeddings`` geht an den CPU-Embedding-Upstream, nicht an SGLang."""
+
+    async def test_embedding_geht_an_embed_base_statt_upstream(self):
         fest = b'{"data": [{"embedding": [0.1], "index": 0}]}'
         gesehen: list[httpx.Request] = []
 
@@ -772,16 +799,102 @@ class TestPassthroughOhneStream(ProxyTestBasis):
                 "content-type": "application/json"})
 
         deps = self.deps(httpx.MockTransport(handler))
-        body = {"model": "fake-modell", "input": "Hallo", "stream": False}
+        body = {"model": "qwen3-embedding:0.6b", "input": "Hallo"}
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/embeddings", body, query="x=1"), deps)
+
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(await _body(antwort), fest)      # byte-identisch
+        self.assertEqual(
+            str(gesehen[0].url),
+            "http://127.0.0.1:30002/v1/embeddings?x=1")
+        self.assertEqual(json.loads(gesehen[0].content), body)
+        self.assertEqual(self.registry.snapshot(), [])    # kein Job
+
+    async def test_embedding_alias_wird_auf_embed_modell_abgebildet(self):
+        fest = b'{"data": [{"embedding": [0.1], "index": 0}]}'
+        gesehen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            gesehen.append(request)
+            return httpx.Response(200, content=fest, headers={
+                "content-type": "application/json"})
+
+        deps = self.deps(httpx.MockTransport(handler))
+        body = {
+            "model": Config().model_alias,
+            "input": "Hallo",
+            "messages": [{"role": "system", "content": DEFAULT_MARKER}],
+        }
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/embeddings", body), deps)
+        await _body(antwort)
+
+        weiter = json.loads(gesehen[0].content)
+        self.assertEqual(weiter["model"], Config().embed_model)
+        self.assertNotIn("priority", weiter)     # keine Chat-Marker
+        self.assertEqual(weiter["messages"], body["messages"])
+        self.assertEqual(self.registry.snapshot(), [])
+
+    async def test_leerer_oder_fehlender_modellname_wird_abgebildet(self):
+        fest = b'{"data": [{"embedding": [0.1], "index": 0}]}'
+        gesehen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            gesehen.append(request)
+            return httpx.Response(200, content=fest, headers={
+                "content-type": "application/json"})
+
+        deps = self.deps(httpx.MockTransport(handler))
+        for body in ({"input": "Hallo"}, {"model": "", "input": "Hallo"}):
+            with self.subTest(body=body):
+                await _body(await handle_v1(
+                    _request("POST", "/v1/embeddings", body), deps))
+
+        self.assertEqual([json.loads(r.content)["model"] for r in gesehen],
+                         [Config().embed_model, Config().embed_model])
+
+    async def test_unbekanntes_embedding_modell_bleibt_unveraendert(self):
+        # Kein stilles Umschreiben fremder Namen: der Embed-Upstream soll
+        # mit einem klaren "model not found" antworten.
+        fest = b'{"error": "model not found"}'
+        gesehen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            gesehen.append(request)
+            return httpx.Response(404, content=fest, headers={
+                "content-type": "application/json"})
+
+        deps = self.deps(httpx.MockTransport(handler))
+        body = {"model": "text-embedding-3-small", "input": "Hallo"}
 
         antwort = await handle_v1(
             _request("POST", "/v1/embeddings", body), deps)
 
-        self.assertNotIsInstance(antwort, StreamingResponse)
-        self.assertEqual(antwort.status_code, 200)
-        self.assertEqual(await _body(antwort), fest)     # byte-identisch
-        self.assertEqual(json.loads(gesehen[0].content), body)  # unveraendert
-        self.assertEqual(self.registry.snapshot(), [])  # kein Job
+        self.assertEqual(antwort.status_code, 404)
+        self.assertEqual(json.loads(gesehen[0].content), body)
+
+    async def test_completions_bleiben_auf_upstream_base(self):
+        fest = b'{"ok": true}'
+        gesehen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            gesehen.append(request)
+            return httpx.Response(200, content=fest, headers={
+                "content-type": "application/json"})
+
+        deps = self.deps(httpx.MockTransport(handler))
+        body = {"model": "fake-modell", "prompt": "Hallo", "stream": False}
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/completions", body), deps)
+        await _body(antwort)
+
+        self.assertEqual(
+            str(gesehen[0].url),
+            "http://127.0.0.1:30001/v1/completions")
 
 
 class TestNichtstreamPfad(ProxyTestBasis):
@@ -1730,6 +1843,247 @@ class TestHistoryAnbindung(ProxyTestBasis):
         self.assertIs(self.registry.get("hist-kaputt").status, JobStatus.DONE)
         ereignisse = _rahmen_lesen(queue)
         self.assertEqual(ereignisse[-1]["status"], "done")
+
+
+class _FakeProbe:
+    """Ersatz-Probe: meldet ein aktives Modell ohne HTTP und zaehlt Aufrufe."""
+
+    def __init__(self, modell: str | None):
+        self.modell = modell
+        self.aufrufe = 0
+
+    async def aktives_modell(self) -> str | None:
+        self.aufrufe += 1
+        return self.modell
+
+
+class TestBackendProbe(unittest.IsolatedAsyncioTestCase):
+    async def test_probe_erkennt_flint_und_cached(self):
+        pfade: list[str] = []
+        modell = Config().flint_model
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            pfade.append(request.url.path)
+            return httpx.Response(200, json={"models": [{"name": modell}]})
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        self.addAsyncCleanup(client.aclose)
+        jetzt = [100.0]
+        probe = BackendProbe(Config(), client, ttl_s=2.0,
+                             clock=lambda: jetzt[0])
+
+        self.assertEqual(await probe.aktives_modell(), modell)
+        self.assertEqual(await probe.aktives_modell(), modell)
+        self.assertEqual(pfade, ["/api/ps"])
+
+        jetzt[0] += 3.0
+        self.assertEqual(await probe.aktives_modell(), modell)
+        self.assertEqual(len(pfade), 2)
+
+    async def test_probe_erkennt_gptoss(self):
+        modell = Config().gptoss_model
+        client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, json={"models": [{"name": modell}]})))
+        self.addAsyncCleanup(client.aclose)
+        self.assertEqual(await BackendProbe(Config(), client).aktives_modell(),
+                         modell)
+
+    async def test_probe_ohne_ollama_und_bei_fehler_ist_none(self):
+        client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(404)))
+        self.addAsyncCleanup(client.aclose)
+        self.assertIsNone(await BackendProbe(Config(), client).aktives_modell())
+
+        kaputt = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: (_ for _ in ()).throw(
+                httpx.ConnectError("weg"))))
+        self.addAsyncCleanup(kaputt.aclose)
+        self.assertIsNone(
+            await BackendProbe(Config(), kaputt).aktives_modell())
+
+    async def test_probe_pidfile_gewinnt_ohne_http(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pfad = Path(tmp) / "runtime/flint/flint.pid"
+            pfad.parent.mkdir(parents=True)
+            pfad.write_text(str(os.getpid()))
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                raise AssertionError("HTTP darf nicht gefragt werden")
+
+            client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler))
+            self.addAsyncCleanup(client.aclose)
+            probe = BackendProbe(Config(), client, repo_root=Path(tmp))
+            self.assertEqual(await probe.aktives_modell(),
+                             Config().flint_model)
+
+
+class TestBackendModellAlias(ProxyTestBasis):
+    """Bei aktivem Ollama-Backend wird der Qwen-Alias umgeschrieben."""
+
+    async def test_flint_aktiv_schreibt_alias_um(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("flint-modell")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.flint_model = "flint-modell"
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "escha-qwen38-27b-w2",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "max_tokens": 4,
+            }), deps)
+        await _body(antwort)
+
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(fake.anfragen[0]["model"], "flint-modell")
+        self.assertNotIn("reasoning_effort", fake.anfragen[0])
+        self.assertEqual(probe.aufrufe, 1)
+
+    async def test_gptoss_setzt_hindsight_defaults(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("gpt-oss:20b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.gptoss_model = "gpt-oss:20b"
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "escha-qwen38-27b-w2",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "max_tokens": 4,
+            }), deps)
+        await _body(antwort)
+
+        gesendet = fake.anfragen[0]
+        self.assertEqual(gesendet["model"], "gpt-oss:20b")
+        self.assertEqual(gesendet["temperature"], 0)
+        self.assertEqual(gesendet["reasoning_effort"], "low")
+
+    async def test_gptoss_laesst_client_werte_stehen(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("gpt-oss:20b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.gptoss_model = "gpt-oss:20b"
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "escha-qwen38-27b-w2",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "temperature": 0.7,
+                "reasoning_effort": "high",
+                "max_tokens": 4,
+            }), deps)
+        await _body(antwort)
+
+        gesendet = fake.anfragen[0]
+        self.assertEqual(gesendet["temperature"], 0.7)
+        self.assertEqual(gesendet["reasoning_effort"], "high")
+
+    async def test_gptoss_ohne_reasoning_effort_bei_completions(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("gpt-oss:20b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.gptoss_model = "gpt-oss:20b"
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/completions", {
+                "model": "escha-qwen38-27b-w2",
+                "prompt": "Hallo",
+                "max_tokens": 4,
+            }), deps)
+        await _body(antwort)
+
+        gesendet = fake.anfragen[0]
+        self.assertEqual(gesendet["model"], "gpt-oss:20b")
+        self.assertEqual(gesendet["temperature"], 0)
+        self.assertNotIn("reasoning_effort", gesendet)
+
+    async def test_flint_modell_wird_auf_aktives_gptoss_umgebogen(self):
+        # Hindsight schickt je nach Lauf den Flint-Namen. Der Schalter im
+        # Dashboard ist autoritativ: aktiv ist GPT-OSS, also GPT-OSS laden.
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("gpt-oss:20b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.flint_model = "flint-modell"
+        deps.config.gptoss_model = "gpt-oss:20b"
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "flint-modell",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "max_tokens": 4,
+            }), deps)
+        await _body(antwort)
+
+        gesendet = fake.anfragen[0]
+        self.assertEqual(gesendet["model"], "gpt-oss:20b")
+        self.assertEqual(gesendet["temperature"], 0)
+        self.assertEqual(gesendet["reasoning_effort"], "low")
+
+    async def test_gptoss_modell_wird_auf_aktives_flint_umgebogen(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("flint-modell")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.flint_model = "flint-modell"
+        deps.config.gptoss_model = "gpt-oss:20b"
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "gpt-oss:20b",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "max_tokens": 4,
+            }), deps)
+        await _body(antwort)
+
+        gesendet = fake.anfragen[0]
+        self.assertEqual(gesendet["model"], "flint-modell")
+        self.assertNotIn("temperature", gesendet)
+        self.assertNotIn("reasoning_effort", gesendet)
+
+    async def test_qwen_aktiv_laesst_alias_unveraendert(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe(None)
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.flint_model = "flint-modell"
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "escha-qwen38-27b-w2",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "max_tokens": 4,
+            }), deps)
+        await _body(antwort)
+
+        self.assertEqual(fake.anfragen[0]["model"], "escha-qwen38-27b-w2")
+
+    async def test_fremdes_modell_wird_nicht_umgeschrieben(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("flint-modell")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.flint_model = "flint-modell"
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "etwas-anderes",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "max_tokens": 4,
+            }), deps)
+        await _body(antwort)
+
+        self.assertEqual(fake.anfragen[0]["model"], "etwas-anderes")
+        self.assertEqual(probe.aufrufe, 0)
 
 
 if __name__ == "__main__":

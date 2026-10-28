@@ -113,3 +113,27 @@ def extract_sample(parsed: dict[str, float], gpu: GpuSample, ts: float,
         if value is not None:
             sample[key] = value
     return sample
+
+
+def extract_flint_sample(werte: dict, gpu: GpuSample, ts: float) -> dict:
+    """Baut das Sample fuer Flint (Ollama) aus ``/api/ps`` und der Registry.
+
+    Flint liefert keine Prometheus-Metriken. ``werte`` enthaelt daher die aus
+    ``/api/ps`` gelesene Kontextgroesse (``max_tokens``) sowie ``running``,
+    ``waiting`` und ``throughput`` aus den Job-Daten des Gateways. Nur
+    gemessene Werte landen im dict; ``available`` ist hier immer True, denn
+    das Sample entsteht nur, wenn ``/api/version`` geantwortet hat.
+    """
+    sample: dict = {"ts": ts, "available": True}
+    for key in ("running", "waiting"):
+        if werte.get(key) is not None:
+            sample[key] = int(werte[key])
+    for key in ("throughput", "max_tokens"):
+        if werte.get(key) is not None:
+            sample[key] = float(werte[key])
+    for key, value in (("gpu_util", gpu.util_pct),
+                       ("vram_used_mb", gpu.vram_used_mb),
+                       ("vram_total_mb", gpu.vram_total_mb)):
+        if value is not None:
+            sample[key] = value
+    return sample

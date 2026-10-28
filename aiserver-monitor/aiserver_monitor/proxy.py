@@ -20,8 +20,10 @@ geht es als einzelne Response ohne Leerzeichen raus; sonst folgen je
 Heartbeat Leerzeichen (WS-Keepalive, abschaltbar) vor dem JSON. Ein
 Abbruch-Signal je Job (Cancel-Route) beendet den lokalen Lauf wirklich: 499
 mit ``aborted``-JSON vor dem Antwortstart, sonst dasselbe JSON hinter den
-Leerzeichen. Andere JSON-POSTs (z. B. ``/v1/embeddings``), GETs und POSTs
-ohne JSON-Objekt bleiben der getreue, gepufferte Byte-Passthrough ohne Job.
+Leerzeichen. Andere JSON-POSTs, GETs und POSTs ohne JSON-Objekt bleiben der
+getreue, gepufferte Byte-Passthrough ohne Job. ``/v1/embeddings`` ist die
+Ausnahme: Es geht immer an ``embed_base`` (eigener CPU-Ollama) statt an
+SGLang; bekannte Chat-Modellnamen werden auf ``embed_model`` abgebildet.
 Faellt der Upstream vor dem Antwortstart aus, kommt 502; ein spaeter
 erkannter Transportfehler steht als 502-Koerper hinter den Leerzeichen.
 Anfragen mit Punkt-Segmenten im Pfad (``.``/``..``) werden vor jedem
@@ -40,10 +42,12 @@ alles wie bisher zu Ende (kein Disconnect-Handling).
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 from starlette.requests import Request
@@ -91,6 +95,10 @@ _BODY_UNGUELTIGER_PFAD = (
     b'{"error": {"message": "ungueltiger Pfad", '
     b'"type": "invalid_path"}}')
 
+#: Zeitlimit der Backend-Probe (``/api/version``): lokal und billig, aber
+#: ein haengender Upstream darf den Request nicht aufhalten.
+_PROBE_TIMEOUT_S = 1.0
+
 #: Anfrage-Kopfzeilen, die nie zum Upstream gehen: ``host`` gehoert zur
 #: Ziel-URL, Laenge und Verbindung setzen httpx und uvicorn.
 _NIE_ZUM_UPSTREAM = frozenset((
@@ -121,6 +129,151 @@ class Deps:
     client: httpx.AsyncClient
     priority: PriorityManager | None = None
     hindsight: HindsightBlocker | None = None
+    backend: "BackendProbe | None" = None
+
+
+class BackendProbe:
+    """Erkennt, welches Ollama-Backend (Flint/GPT-OSS) gerade laeuft.
+
+    SGLang hat ``/api/ps`` nicht (404). Ollama listet dort das geladene
+    Modell; die Startskripte laden ihr Modell mit ``keep_alive=-1`` vor,
+    damit die Zuordnung sofort stimmt. Zusaetzlich zaehlt das PID-File des
+    Backends, falls das Modell (noch) nicht geladen ist. Das Ergebnis wird
+    ``ttl_s`` lang gecacht: die Abfrage laeuft je Request, ein Modellwechsel
+    (Sekunden) soll aber nicht bei jedem Token erneut messen. Jeder Fehler
+    und "kein Treffer" bedeuten None - dann bleibt der Modelname unveraendert
+    (Qwen).
+    """
+
+    def __init__(self, config: Config, client: httpx.AsyncClient, *,
+                 repo_root: Path | None = None,
+                 ttl_s: float = 2.0,
+                 clock: Callable[[], float] = time.monotonic):
+        self._config = config
+        self._client = client
+        self._repo_root = repo_root
+        self._ttl_s = ttl_s
+        self._clock = clock
+        self._stand: str | None = None
+        self._gemessen: float | None = None
+
+    def _pidfile_modell(self) -> str | None:
+        """Backend aus dem PID-File, wenn der Prozess noch lebt."""
+        if self._repo_root is None:
+            return None
+        for pfad, modell in (
+                (self._config.flint_pidfile, self._config.flint_model),
+                (self._config.gptoss_pidfile, self._config.gptoss_model)):
+            try:
+                pid = int((self._repo_root / pfad).read_text().strip())
+                os.kill(pid, 0)
+            except (OSError, ValueError):
+                continue
+            return modell
+        return None
+
+    async def aktives_modell(self) -> str | None:
+        jetzt = self._clock()
+        if self._gemessen is not None \
+                and jetzt - self._gemessen < self._ttl_s:
+            return self._stand
+        modell = self._pidfile_modell()
+        if modell is None:
+            basis = self._config.upstream_base.rstrip("/")
+            try:
+                antwort = await self._client.get(
+                    f"{basis}/api/ps", timeout=_PROBE_TIMEOUT_S)
+                if antwort.status_code == 200:
+                    geladen = {
+                        eintrag.get("name")
+                        for eintrag in antwort.json().get("models", [])
+                        if isinstance(eintrag, dict)
+                    }
+                    for bekannt in (self._config.flint_model,
+                                    self._config.gptoss_model):
+                        if bekannt in geladen:
+                            modell = bekannt
+                            break
+            except Exception as exc:
+                logger.debug("Backend-Probe fehlgeschlagen: %s: %s",
+                             type(exc).__name__, exc)
+        self._stand = modell
+        self._gemessen = jetzt
+        return modell
+
+
+def _ist_completion_pfad(pfad: str) -> bool:
+    """Chat- und Text-Completion: nur dort wird der Modelname gemappt."""
+    return pfad.endswith(("/chat/completions", "/completions"))
+
+
+def _ist_embedding_pfad(pfad: str) -> bool:
+    """Embeddings laufen im CPU-Sidecar, nicht im Chat-Backend."""
+    return pfad.endswith("/embeddings")
+
+
+def _embedding_modell_anpassen(deps: "Deps", koerper: dict) -> bool:
+    """Bildet bekannte Modellnamen auf ``embed_model`` ab.
+
+    Es gibt genau ein Embedding-Modell. Clients duerfen deshalb den
+    Chat-Alias, den Flint-/GPT-OSS-Namen oder gar keinen Namen schicken.
+    Unbekannte Namen bleiben unveraendert: das Sidecar antwortet dann mit
+    einem klaren "model not found", statt still ein anderes Modell zu
+    benutzen. Rueckgabe: True, wenn der Body geaendert wurde.
+    """
+    bekannt = {
+        name for name in (deps.config.model_alias,
+                          deps.config.flint_model,
+                          deps.config.gptoss_model,
+                          deps.config.embed_model)
+        if name
+    }
+    modell = koerper.get("model")
+    if modell and modell not in bekannt:
+        return False
+    if modell == deps.config.embed_model:
+        return False
+    koerper["model"] = deps.config.embed_model
+    return True
+
+
+async def _modell_anpassen(deps: "Deps", koerper: dict, *,
+                           chat: bool = False) -> bool:
+    """Bildet bekannte Modellnamen auf das aktive Backend ab.
+
+    Angenommen werden Alias, Flint- und GPT-OSS-Modell: Der Schalter im
+    Dashboard ist autoritativ, weil ohnehin nur ein Ollama-Modell ins VRAM
+    passt. Clients duerfen also weiterhin ihren gewohnten Namen schicken
+    (Hindsight schickt je nach Lauf Alias, Flint- oder GPT-OSS-Namen).
+    Unbekannte Modelle gehen unveraendert weiter; laeuft Qwen, bleibt alles
+    unveraendert. Fuer GPT-OSS setzt das Gateway ausserdem die
+    Hindsight-Defaults ``temperature: 0`` und ``reasoning_effort: "low"`` -
+    nur wenn der Client sie nicht selbst mitschickt. Rueckgabe: True, wenn
+    der Body geaendert wurde.
+    """
+    if deps.backend is None:
+        return False
+    bekannt = {
+        name for name in (deps.config.model_alias,
+                          deps.config.flint_model,
+                          deps.config.gptoss_model)
+        if name
+    }
+    if koerper.get("model") not in bekannt:
+        return False
+    ziel = await deps.backend.aktives_modell()
+    if ziel is None:
+        return False
+    geaendert = koerper["model"] != ziel
+    koerper["model"] = ziel
+    if ziel == deps.config.gptoss_model:
+        if "temperature" not in koerper:
+            koerper["temperature"] = 0
+            geaendert = True
+        if chat and "reasoning_effort" not in koerper:
+            koerper["reasoning_effort"] = "low"
+            geaendert = True
+    return geaendert
 
 
 def ensure_rid(body: dict) -> str:
@@ -196,9 +349,10 @@ def _pfad_mit_punktsegment(pfad: str) -> bool:
     return any(segment in (".", "..") for segment in pfad.split("/"))
 
 
-def _upstream_url(request: Request, config: Config) -> str:
+def _upstream_url(request: Request, config: Config, *,
+                  base: str | None = None) -> str:
     """Upstream-URL aus Basis, Originalpfad und Query."""
-    url = config.upstream_base.rstrip("/") + request.url.path
+    url = (base or config.upstream_base).rstrip("/") + request.url.path
     if request.url.query:
         url += "?" + request.url.query
     return url
@@ -888,16 +1042,17 @@ async def _nichtstream(request: Request, deps: Deps, koerper: dict, *,
                 wache.stop()
 
 
-async def _passthrough(request: Request, deps: Deps, roh: bytes) -> Response:
+async def _passthrough(request: Request, deps: Deps, roh: bytes, *,
+                       base: str | None = None) -> Response:
     """Getreuer, gepufferter Passthrough fuer GET und Nicht-JSON-POSTs.
 
     Status und Body kommen unveraendert zurueck, ohne Job und ohne
     Keepalives; die getrackten Pfade (SSE-Relay, Nicht-Stream mit Jobs)
-    liegen daneben.
+    liegen daneben. ``base`` ueberschreibt den Upstream (Embeddings).
     """
     antwort = await deps.client.request(
         request.method,
-        _upstream_url(request, deps.config),
+        _upstream_url(request, deps.config, base=base),
         headers=_upstream_headers(request),
         content=roh if roh else None,
         timeout=_timeout(deps.config),
@@ -929,8 +1084,25 @@ async def handle_v1(request: Request, deps: Deps) -> Response:
                         media_type="application/json")
     roh = await request.body()
     koerper = _json_koerper(roh) if request.method == "POST" else None
+    if _ist_embedding_pfad(request.url.path):
+        # Embeddings gehoeren dem CPU-Sidecar, nie dem Chat-Backend: kein
+        # Job, keine Prioritaet, kein Hindsight, keine Keepalives.
+        if koerper is not None and _embedding_modell_anpassen(deps, koerper):
+            roh = json.dumps(koerper, ensure_ascii=False).encode("utf-8")
+        return await _passthrough(request, deps, roh,
+                                  base=deps.config.embed_base)
     if koerper is None:
         return await _passthrough(request, deps, roh)
+    if _ist_completion_pfad(request.url.path):
+        # Ollama kennt den Qwen-Alias nicht; bei aktivem Flint/GPT-OSS
+        # umschreiben, bevor Prioritaet/Hindsight/rid den Body sehen.
+        geaendert = await _modell_anpassen(
+            deps, koerper,
+            chat=request.url.path.endswith(_CHAT_COMPLETIONS))
+        if geaendert:
+            # Der Passthrough (z. B. /v1/completions ohne stream) schickt
+            # sonst die alten Bytes weiter.
+            roh = json.dumps(koerper, ensure_ascii=False).encode("utf-8")
     ist_hindsight = False
     if request.url.path.endswith(_CHAT_COMPLETIONS):
         # Marker nur auf Chat-Bodies anwenden; andere JSON-POSTs

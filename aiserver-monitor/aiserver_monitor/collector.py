@@ -1,11 +1,15 @@
-"""Metrik-Sammler: Upstream-Werte plus GPU je ``poll_interval_s``.
+"""Metrik-Sammler: SGLang-Metriken oder Flint-Werte plus GPU je ``poll_interval_s``.
 
 Der Sammler laeuft als Hintergrundtask der App: :meth:`Collector.run` holt je
-Durchlauf ``/metrics`` und ``/health`` vom SGLang-Upstream, liest die GPU
-ueber ``config.gpu_cmd`` (oder einen injizierten ``gpu_reader``), baut mit
-:func:`extract_sample` das Sample-Dict und meldet es an die History und den
-SSE-Hub (Ereignis ``stats``). Ist der Upstream weg, entsteht trotzdem ein
-Sample mit ``available=False``; nur gemessene Werte stehen im Sample
+Durchlauf die Werte des Upstreams, liest die GPU ueber ``config.gpu_cmd``
+(oder einen injizierten ``gpu_reader``), baut das Sample-Dict und meldet es an
+die History und den SSE-Hub (Ereignis ``stats``).
+
+Zwei Backends: SGLang liefert ``/metrics`` + ``/health`` (Prometheus); Flint
+(Ollama) hat beides nicht, antwortet aber auf ``/api/version``. Dann kommen
+Modell/Kontext aus ``/api/ps``, laufende/wartende Anfragen und der Durchsatz
+aus der Job-Registry des Gateways. Ist der Upstream weg, entsteht trotzdem
+ein Sample mit ``available=False``; nur gemessene Werte stehen im Sample
 ("nicht gemessen" heisst fehlender Key, nie 0).
 """
 
@@ -19,6 +23,7 @@ import httpx
 from .config import Config
 from .metrics_parse import (
     GpuSample,
+    extract_flint_sample,
     extract_sample,
     parse_nvidia_smi,
     parse_prometheus,
@@ -49,6 +54,14 @@ _GPU_ARGUMENTE = (
     "--query-gpu=utilization.gpu,memory.used,memory.total",
     "--format=csv,noheader,nounits",
 )
+
+#: Flint (Ollama) hat kein ``/metrics``; ``/api/ps`` liefert Modell und
+#: Kontextgroesse, ``/api/version`` ist der Erkennungs-Endpunkt.
+_FLINT_PS_PATH = "/api/ps"
+
+#: Zeitfenster fuer die Durchsatz-Schaetzung aus fertigen Jobs: nur was
+#: gerade eben fertig wurde, zaehlt als "aktueller" Durchsatz.
+_FLINT_DURCHSATZ_FENSTER_S = 5.0
 
 
 async def _nvidia_smi_lesen(config: Config) -> GpuSample:
@@ -117,12 +130,14 @@ class Collector:
             return await self._gpu_reader()
         return await _nvidia_smi_lesen(self._deps.config)
 
-    async def _upstream_werte(self) -> tuple[dict[str, float], bool]:
-        """Holt ``/metrics`` und ``/health``; liefert (Werte, available).
+    async def _upstream_werte(self) -> tuple[dict[str, float], bool, dict | None]:
+        """Holt SGLang-Metriken oder Flint-Daten.
 
-        ``available`` ist nur True, wenn beide Antworten HTTP 200 sind und der
-        Metrik-Text gelesen werden konnte. Jeder Fehler (auch ein Timeout)
-        wird geloggt und ergibt leere Werte statt einer Exception.
+        Rueckgabe ``(werte, available, flint)``: Bei SGLang sind ``werte`` die
+        Prometheus-Summen und ``flint`` None. Antwortet ``/metrics`` oder
+        ``/health`` nicht mit 200, wird ``/api/version`` probiert: 200 heisst
+        Flint (Ollama), dann kommen die Werte aus :meth:`_flint_werte`.
+        Scheitert beides, ist ``available`` False und alle Messwerte fehlen.
         """
         basis = self._deps.config.upstream_base.rstrip("/")
         try:
@@ -133,14 +148,81 @@ class Collector:
         except Exception as exc:
             logger.warning("Upstream nicht erreichbar: %s: %s",
                            type(exc).__name__, exc)
-            return {}, False
-        if (metrik_antwort.status_code != 200
-                or health_antwort.status_code != 200):
-            logger.warning("Upstream-Status unerwartet: metrics=%s health=%s",
-                           metrik_antwort.status_code,
-                           health_antwort.status_code)
-            return {}, False
-        return parse_prometheus(metrik_antwort.text), True
+        else:
+            if (metrik_antwort.status_code == 200
+                    and health_antwort.status_code == 200):
+                return parse_prometheus(metrik_antwort.text), True, None
+            logger.debug("SGLang-Metriken fehlen (metrics=%s health=%s)",
+                         metrik_antwort.status_code,
+                         health_antwort.status_code)
+
+        flint = await self._flint_werte()
+        if flint is not None:
+            return {}, True, flint
+        logger.warning("Upstream weder SGLang noch Flint erreichbar")
+        return {}, False, None
+
+    async def _flint_werte(self) -> dict | None:
+        """Flint-Daten aus ``/api/version`` und ``/api/ps``; None = kein Flint.
+
+        ``/api/version`` ist der Erkennungs-Endpunkt (SGLang: 404). ``/api/ps``
+        liefert die Kontextgroesse des geladenen Modells; fehlt sie, bleibt
+        ``max_tokens`` weg ("nicht gemessen", nie 0).
+        """
+        basis = self._deps.config.upstream_base.rstrip("/")
+        try:
+            version = await self._client.get(
+                f"{basis}{self._deps.config.flint_health_path}",
+                timeout=_HTTP_TIMEOUT_S)
+        except Exception as exc:
+            logger.debug("Flint-Probe fehlgeschlagen: %s: %s",
+                         type(exc).__name__, exc)
+            return None
+        if version.status_code != 200:
+            return None
+
+        werte: dict = {}
+        try:
+            ps = await self._client.get(
+                f"{basis}{_FLINT_PS_PATH}", timeout=_HTTP_TIMEOUT_S)
+            daten = ps.json() if ps.status_code == 200 else None
+        except Exception as exc:
+            logger.debug("/api/ps nicht lesbar: %s: %s",
+                         type(exc).__name__, exc)
+            daten = None
+        modelle = daten.get("models") if isinstance(daten, dict) else None
+        if isinstance(modelle, list) and modelle:
+            modell = modelle[0]
+            if isinstance(modell, dict):
+                kontext = modell.get("context_length")
+                if isinstance(kontext, int) and kontext > 0:
+                    werte["max_tokens"] = kontext
+        return werte
+
+    def _job_werte(self) -> dict:
+        """Laufende/wartende Jobs und frischer Durchsatz aus der Registry.
+
+        Flint meldet keine eigenen Zaehler; das Gateway kennt seine Jobs.
+        ``throughput`` ist die Summe der tok/s von Jobs, die innerhalb des
+        Fensters fertig wurden (bei np=2 also beide Slots zusammen).
+        """
+        jetzt = time.time()
+        werte = {"running": 0, "waiting": 0}
+        durchsatz: float | None = None
+        for job in self._deps.registry.snapshot():
+            status = job.get("status")
+            if status == "running":
+                werte["running"] += 1
+            elif status == "waiting":
+                werte["waiting"] += 1
+            rate = job.get("tok_per_s")
+            fertig = job.get("finished_at_ms")
+            if (status == "done" and rate and fertig is not None
+                    and jetzt - fertig / 1000.0 <= _FLINT_DURCHSATZ_FENSTER_S):
+                durchsatz = (durchsatz or 0.0) + float(rate)
+        if durchsatz is not None:
+            werte["throughput"] = round(durchsatz, 3)
+        return werte
 
     async def sample_once(self) -> dict:
         """Ein Durchlauf: Upstream und GPU lesen, Sample melden, zurueckgeben.
@@ -150,9 +232,13 @@ class Collector:
         als Ereignis ``stats`` an den Hub. Zurueck kommt genau dieses dict.
         """
         ts = time.time()
-        parsed, available = await self._upstream_werte()
+        parsed, available, flint = await self._upstream_werte()
         gpu = await self._gpu_lesen()
-        sample = extract_sample(parsed, gpu, ts, available)
+        if flint is not None:
+            werte = {**flint, **self._job_werte()}
+            sample = extract_flint_sample(werte, gpu, ts)
+        else:
+            sample = extract_sample(parsed, gpu, ts, available)
         if self._deps.history is not None:
             self._deps.history.record_sample(sample)
         self._deps.hub.publish("stats", sample)

@@ -40,8 +40,55 @@ bash run.sh restart    # stop und start
 
 `start` und `stop` sind idempotent: Ein zweiter `start` meldet „laeuft
 bereits“ und liefert Exit 0, ein `stop` ohne laufendes Gateway ebenfalls.
-`run.sh` fasst ausschließlich den Gateway-Prozess an — der SGLang-Server
-wird nie gestartet, gestoppt oder umgestellt.
+`run.sh` startet und stoppt den CPU-Embedding-Sidecar zusammen mit dem
+Gateway, weil `/v1/embeddings` keinen anderen Upstream hat. Der SGLang-Server
+wird davon nie gestartet, gestoppt oder umgestellt.
+
+### Embeddings (CPU)
+
+`POST /v1/embeddings` geht an `embed_base` (Default
+`http://127.0.0.1:30002`), einen eigenstaendigen Ollama-Prozess mit
+`qwen3-embedding:0.6b`. Er laeuft auf der CPU und belegt keinen VRAM,
+funktioniert also, waehrend Qwen, Flint oder GPT-OSS die GPU nutzt. Das Gateway
+behandelt ihn als gepufferten Passthrough: kein Job-Tracking, keine
+Keepalives, Antwort unveraendert. Bekannte Modellnamen (Qwen-Alias, Flint,
+GPT-OSS, Embedding-Modell) und ein fehlender/leerer Name werden auf
+`embed_model` abgebildet; unbekannte Namen laufen unveraendert durch, damit
+Ollama mit einem klaren „model not found“ antworten kann.
+
+```bash
+curl http://127.0.0.1:30000/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "escha-qwen38-27b-w2", "input": "Hallo Welt"}'
+```
+
+Der Sidecar laesst sich auch direkt steuern:
+
+```bash
+bash runtime/embed/start-embed.sh
+bash runtime/embed/stop-embed.sh
+```
+
+### Server ein-/ausschalten
+
+Der Modellserver lässt sich im Dashboard unter **Server** ausschalten und
+wieder einschalten. Derselbe Weg im Terminal (Repo-Wurzel):
+
+```bash
+bash server.sh status   # Zustand + /health
+bash server.sh stop     # Modellserver stoppen, Dashboard laeuft weiter
+bash server.sh start    # starten, wartet auf /health (2-4 Minuten)
+bash server.sh restart
+```
+
+Ist die systemd-User-Unit `escha-server.service` installiert, laufen
+`start`/`stop` über `systemctl --user` (mit `--no-block`); nur so bleibt der
+`Restart=always`-Schutz beim bewussten Ausschalten wirkungslos. Ohne Unit
+werden `runtime/sglang/start-penalty.sh` bzw. `stop-server.sh` benutzt.
+Ausschalten ist temporär: Die Unit bleibt enabled, beim nächsten Reboot
+startet der Server wieder automatisch. Die Steuerung lässt sich mit
+`server_control_enabled = false` (bzw.
+`AISERVER_MONITOR_SERVER_CONTROL_ENABLED=false`) abschalten.
 
 Umgebungs-Overrides von `run.sh`:
 
@@ -49,6 +96,7 @@ Umgebungs-Overrides von `run.sh`:
 |---|---|---|
 | `PYTHON` | `/home/user/small_qwen/.venv/bin/python` | Interpreter für `python -m aiserver_monitor` |
 | `AISERVER_MONITOR_LISTEN_PORT` | `30000` | Port für den Health-Poll (`/healthz`); zugleich der App-Port, solange nicht anders konfiguriert |
+| `AISERVER_MONITOR_EMBED_BASE` | `http://127.0.0.1:30002` | Upstream für `/v1/embeddings` (CPU-Ollama); wird auch von `run.sh status` genutzt |
 | `PIDFILE` | `/tmp/aiserver-monitor.pid` | PID-Datei für `stop` |
 | `AISERVER_MONITOR_RUN_LOG` | `/tmp/aiserver-monitor-run.log` | stdout/stderr-Log des Hintergrundprozesses |
 | `AISERVER_MONITOR_PATTERN` | `[a]iserver_monitor` | `pgrep -f`-Muster (leere Werte werden abgewiesen, der Default gilt) |
@@ -137,7 +185,8 @@ Umgebungsvariablen.
   `upstream_base`, `db_path`, `log_path`, `heartbeat_s`, `poll_interval_s`,
   `connect_timeout_s`, `preview_max_chars`, `prompt_start_chars`,
   `retention_jobs_days`, `retention_series_days`, `nonstream_keepalive`,
-  `gpu_cmd`, `abort_on_disconnect`.
+  `gpu_cmd`, `abort_on_disconnect`, `server_control_enabled`, `server_unit`,
+  `server_start_script`, `server_stop_script`, `server_process_pattern`.
 
 Standardmäßig (`abort_on_disconnect = true`) überwacht das Gateway die
 Client-Verbindung: verschwindet ein Client, während sein Job noch wartet,
@@ -160,7 +209,8 @@ stattdessen auf einem Testport prüfen, z. B.
 
 Rollback jederzeit: `bash run.sh stop` (bzw. nach dem Cutover
 `systemctl --user disable --now aiserver-monitor.service`). SGLang läuft
-weiter, wo er lief — das Gateway ändert den Lebenszyklus des Servers nie.
+weiter, wo er lief — nur die ausdrückliche Server-Steuerung (Dashboard-Tab
+„Server“ oder `server.sh`) schaltet ihn um.
 
 ## Weiterlesen
 

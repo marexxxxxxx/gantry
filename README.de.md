@@ -26,6 +26,53 @@ MODEL=./Qwen3.8-27B-Escha-W2 OTP=1 bash runtime/sglang/serve.sh
 
 Details, GPU-Profile und Troubleshooting: [`runtime/sglang/INSTALL.de.md`](runtime/sglang/INSTALL.de.md).
 
+**Backend wechseln (Qwen ↔ Flint ↔ GPT-OSS):**
+
+```bash
+bash server.sh start flint   # Flint (Ollama, 2 parallele Slots à 32k) auf 30001
+bash server.sh switch gptoss # GPT-OSS 20B (Ollama, 64k, 1 Slot) auf 30001
+bash server.sh switch qwen   # zurueck auf Qwen/SGLang
+bash server.sh status        # zeigt alle Backends
+```
+
+Beide Backends lauschen auf demselben Upstream-Port `127.0.0.1:30001`; das
+Gateway auf `:30000` und alle Clients bleiben unveraendert. Der Wechsel stoppt
+das laufende Backend, wartet auf die Portfreigabe und startet das andere.
+Flint laeuft als eigener `ollama serve`-Prozess (`runtime/flint/start-flint.sh`)
+auf dem System-Modelstore und entlaedt beim Start die Modelle des
+System-Ollama auf `:11434`, damit die GPU frei wird. Konfigurierbar per
+`FLINT_CTX` (Default 32768), `FLINT_PARALLEL` (Default 2) und
+`FLINT_KEEP_ALIVE` (Default -1). GPT-OSS laeuft genauso als eigener Prozess
+(`runtime/gptoss/start-gptoss.sh`) mit `GPTOSS_CTX` (Default 65536),
+`GPTOSS_PARALLEL` (Default 1) und `GPTOSS_KEEP_ALIVE` (Default -1). Im
+Dashboard gibt es denselben Umschalter im Tab **Server**.
+
+Clients duerfen ihren Modellnamen behalten: laeuft Flint oder GPT-OSS, bildet
+das Gateway den Qwen-Alias, den Flint-Namen und den GPT-OSS-Namen
+(`model_alias`, `flint_model`, `gptoss_model`) automatisch auf das aktive
+Backend-Modell ab – der Schalter im Dashboard ist also autoritativ. Fuer
+GPT-OSS setzt es zusaetzlich `temperature: 0` und `reasoning_effort: "low"`
+(Hindsight-Defaults), sofern der Client nichts anderes mitschickt. Das
+Dashboard zeigt bei beiden Ollama-Backends Live-Werte (Anfragen, tok/s,
+Kontext, VRAM), auch ohne SGLang-`/metrics`.
+
+**Embeddings auf der CPU:**
+
+```bash
+bash runtime/embed/start-embed.sh   # qwen3-embedding:0.6b auf 127.0.0.1:30002
+bash runtime/embed/stop-embed.sh
+```
+
+Das Gateway routet `POST /v1/embeddings` an diesen Sidecar; Clients bleiben bei
+`:30000` und brauchen keinen zweiten Endpunkt. Er laeuft komplett auf der CPU
+(kein VRAM) und funktioniert deshalb parallel zu Qwen, Flint oder GPT-OSS. Der
+Modellname ist optional: Das Gateway bildet den Qwen-Alias und beide
+Ollama-Modellnamen auf `qwen3-embedding:0.6b` ab; unbekannte Namen laufen
+unveraendert durch und erhalten Ollamas „model not found“. `run.sh` startet und
+stoppt den Sidecar zusammen mit dem Gateway. Tuning: `EMBED_CTX` (Default
+8192), `EMBED_PARALLEL` (Default 1), `EMBED_KEEP_ALIVE` (Default -1),
+`EMBED_MODEL`, `EMBED_HOST`, `EMBED_MODELS`.
+
 ## Inhaltsverzeichnis
 
 1. [Repository-Aufbau](#1-repository-aufbau)
@@ -44,6 +91,7 @@ Details, GPU-Profile und Troubleshooting: [`runtime/sglang/INSTALL.de.md`](runti
 | [`docs/`](docs/) | Technische Vertiefungen: FP8-KV-Cache-Quantisierung |
 | [`slotmon/`](slotmon/) | **GPU-Slot-Monitor**: liest das Server-Log passiv mit und zeigt, welcher Auftrag den Slot hält (`monitor.sh start` → `http://0.0.0.0:8090`) |
 | `ctxmon.sh` | Live-Monitor für den Server: tok/s, aktuelle Kontextbelegung, Kontext-Peak |
+| `server.sh` | Modellserver starten/stoppen/Status (`bash server.sh start\|stop\|status`); das Dashboard läuft weiter |
 
 ## 2. Dokumentationskarte
 

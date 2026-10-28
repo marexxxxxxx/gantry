@@ -25,7 +25,9 @@
 #
 # Der SGLang-Server wird von diesem Skript nicht angefasst. Sein Lebenszyklus
 # gehoert runtime/sglang/, der des Gateways hier - zwei getrennte Lebenszyklen.
-# Wer den Server killt, hat den Falschen.
+# Der CPU-Embedding-Sidecar (runtime/embed/) gehoert zum Gateway: /v1/embeddings
+# ist ohne ihn nicht nutzbar, also startet und stoppt run.sh ihn mit. Ein
+# Backend-Wechsel (server.sh) laesst ihn unberuehrt.
 set -euo pipefail
 
 # run.sh liegt im Projektverzeichnis; `python -m aiserver_monitor` findet das
@@ -54,6 +56,7 @@ else
     PATTERN='[a]iserver_monitor'
 fi
 HEALTH="http://127.0.0.1:${PORT}/healthz"
+EMBED_BASE="${AISERVER_MONITOR_EMBED_BASE:-http://127.0.0.1:30002}"
 # 20 s sind die Grenze aus dem Muster. Ueberschreibbar, damit ein Test nicht
 # 20 s auf das Beenden wartet.
 STOP_GRACE="${STOP_GRACE:-20}"
@@ -163,7 +166,22 @@ kill_one() {
     fi
 }
 
+start_embed() {
+    local script="$ROOT/runtime/embed/start-embed.sh"
+    [ -f "$script" ] || return 0
+    if ! bash "$script"; then
+        echo "[aiserver-monitor] WARNUNG: Embedding-Sidecar (CPU) startet nicht; /v1/embeddings bleibt ohne Upstream." >&2
+    fi
+}
+
+stop_embed() {
+    local script="$ROOT/runtime/embed/stop-embed.sh"
+    [ -f "$script" ] || return 0
+    bash "$script" || true
+}
+
 start() {
+    start_embed
     if is_running; then
         echo "[aiserver-monitor] laeuft bereits (PID $(monitor_pids), Port $PORT)"
         return 0
@@ -223,6 +241,7 @@ stop() {
     if ! is_running; then
         echo "[aiserver-monitor] laeuft nicht"
         rm -f "$PIDFILE"
+        stop_embed
         return 0
     fi
 
@@ -264,6 +283,7 @@ stop() {
         echo "[aiserver-monitor] ERROR: $(monitor_pids) laeuft noch nach dem KILL" >&2
         return 1
     fi
+    stop_embed
     echo "[aiserver-monitor] gestoppt"
 }
 
@@ -278,6 +298,11 @@ status() {
     echo "[aiserver-monitor] laeuft (PID $(monitor_pids), Port $PORT)"
     if ! curl -sf -m 5 -o /dev/null "$HEALTH" 2>/dev/null; then
         echo "[aiserver-monitor] /healthz antwortet nicht (laeuft das Gateway wirklich?)"
+    fi
+    if curl -sf -m 2 -o /dev/null "${EMBED_BASE%/}/api/version" 2>/dev/null; then
+        echo "[aiserver-monitor] Embedding-Sidecar (CPU) laeuft auf $EMBED_BASE"
+    else
+        echo "[aiserver-monitor] Embedding-Sidecar (CPU) laeuft nicht; /v1/embeddings hat keinen Upstream"
     fi
 }
 
