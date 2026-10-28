@@ -10,10 +10,13 @@ import httpx
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
-from aiserver_audio.app import create_audio_app, format_transcript
+from aiserver_audio.app import create_audio_app, format_transcript, stream_speech
+from aiserver_audio.catalog import piper_files, resolve_voice
 from aiserver_audio.config import AudioSettings
+from aiserver_audio.errors import AudioError
 from aiserver_audio.queue import QueueFull
 from aiserver_audio.stt import Segment, Transcription
+from aiserver_audio.tts import AudioChunk
 
 
 def _modelle_anlegen(models_dir: Path, modell: str = "small") -> None:
@@ -21,6 +24,13 @@ def _modelle_anlegen(models_dir: Path, modell: str = "small") -> None:
     ziel.mkdir(parents=True, exist_ok=True)
     for name in ("model.bin", "config.json", "tokenizer.json"):
         (ziel / name).write_bytes(b"x")
+
+
+def _stimme_anlegen(models_dir: Path, name: str) -> None:
+    onnx, config = piper_files(models_dir, resolve_voice(name))
+    onnx.parent.mkdir(parents=True, exist_ok=True)
+    onnx.write_bytes(b"x")
+    config.write_text("{}", encoding="utf-8")
 
 
 class FakeStt:
@@ -44,7 +54,86 @@ class FakeStt:
 
 
 class FakeTts:
-    pass
+    def __init__(self, *, rate=22050, pcm=b"\x01\x00" * 32,
+                 delay=0.0, events=None):
+        self.rate = rate
+        self.pcm = pcm
+        self.delay = delay
+        self.events = events if events is not None else []
+        self.aufrufe = []
+        self.offen = 0
+
+    def synthesize(self, text, *, info, speed):
+        self.aufrufe.append({"text": text, "info": info, "speed": speed})
+        self.offen += 1
+        self.events.append(("start", text))
+        try:
+            if self.delay:
+                time.sleep(self.delay)
+            yield AudioChunk(self.pcm, self.rate)
+        finally:
+            self.offen -= 1
+            self.events.append(("ende", text))
+
+
+class _FakeStdin:
+    def __init__(self):
+        self.closed = False
+        self.daten = bytearray()
+
+    def write(self, block):
+        self.daten.extend(block)
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeStdout:
+    def __init__(self, ausgabe):
+        self.ausgabe = ausgabe
+        self.gelesen = False
+
+    async def read(self, _groesse):
+        if self.gelesen:
+            return b""
+        self.gelesen = True
+        return self.ausgabe
+
+
+class _FakeProzess:
+    def __init__(self, ausgabe):
+        self.stdin = _FakeStdin()
+        self.stdout = _FakeStdout(ausgabe)
+        self.returncode = None
+        self.terminated = False
+        self.killed = False
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+    async def wait(self):
+        self.returncode = 0
+        return 0
+
+
+class FakeEncoder:
+    def __init__(self, ausgabe=b"encoded"):
+        self.ausgabe = ausgabe
+        self.prozesse = []
+
+    async def __call__(self, fmt, sample_rate):
+        prozess = _FakeProzess(self.ausgabe)
+        prozess.fmt = fmt
+        prozess.sample_rate = sample_rate
+        self.prozesse.append(prozess)
+        return prozess
+
 
 
 class AudioAppTestBasis(unittest.IsolatedAsyncioTestCase):
@@ -52,6 +141,7 @@ class AudioAppTestBasis(unittest.IsolatedAsyncioTestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.models_dir = Path(self._tmp.name)
         self.stt = FakeStt()
+        self.tts = FakeTts()
         self.settings = AudioSettings(models_dir=self.models_dir,
                                       preload="")
 
@@ -60,8 +150,9 @@ class AudioAppTestBasis(unittest.IsolatedAsyncioTestCase):
 
     def app(self, **kwargs):
         return create_audio_app(
-            self.settings, stt_engine=self.stt, tts_engine=FakeTts(),
+            self.settings, stt_engine=self.stt, tts_engine=self.tts,
             duration_probe=kwargs.pop("duration_probe", lambda _: 2.5),
+            encoder_factory=kwargs.pop("encoder_factory", FakeEncoder()),
             **kwargs)
 
     async def request(self, app, methode, pfad, **kwargs):
@@ -247,6 +338,193 @@ class TestTranskription(AudioAppTestBasis):
         ausgabe = "\n".join(logs.output)
         self.assertNotIn("Hallo", ausgabe)
         self.assertNotIn("streng-geheim", ausgabe)
+
+
+class TestSprache(AudioAppTestBasis):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        for name in ("thorsten", "kerstin", "eva"):
+            _stimme_anlegen(self.models_dir, name)
+
+    async def sprich(self, app, **daten):
+        koerper = {"input": "Guten Tag.",
+                   "model": "piper",
+                   "voice": "thorsten",
+                   "response_format": "wav"}
+        koerper.update(daten)
+        return await self.request(app, "POST", "/v1/audio/speech",
+                                  json=koerper)
+
+    async def test_defaults_und_wav(self):
+        antwort = await self.sprich(self.app())
+        self.assertEqual(antwort.status_code, 200)
+        self.assertTrue(antwort.headers["content-type"].startswith("audio/wav"))
+        self.assertEqual(antwort.content[:4], b"RIFF")
+        self.assertIn(self.tts.pcm, antwort.content)
+        self.assertEqual(self.tts.aufrufe[0]["text"], "Guten Tag.")
+        self.assertEqual(self.tts.aufrufe[0]["info"].id,
+                         "de_DE-thorsten-medium")
+        self.assertEqual(self.tts.aufrufe[0]["speed"], 1.0)
+
+    async def test_speed_wird_weitergereicht(self):
+        antwort = await self.sprich(self.app(), speed=1.5)
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(self.tts.aufrufe[0]["speed"], 1.5)
+
+    async def test_modell_und_stimmen_aliase(self):
+        faelle = (("tts-1", "kerstin", "de_DE-kerstin-low"),
+                  ("tts-1-hd", "eva", "de_DE-eva_k-x_low"))
+        for model, voice, erwartet in faelle:
+            with self.subTest(model=model, voice=voice):
+                antwort = await self.sprich(
+                    self.app(), model=model, voice=voice)
+                self.assertEqual(antwort.status_code, 200)
+                self.assertEqual(self.tts.aufrufe[-1]["info"].id, erwartet)
+
+    async def test_alle_formate(self):
+        for fmt, ctype in (("wav", "audio/wav"), ("pcm", "audio/pcm"),
+                           ("mp3", "audio/mpeg"), ("opus", "audio/ogg")):
+            with self.subTest(fmt=fmt):
+                if fmt == "wav":
+                    antwort = await self.sprich(
+                        self.app(), response_format=fmt)
+                    self.assertEqual(antwort.content[:4], b"RIFF")
+                    self.assertIn(self.tts.pcm, antwort.content)
+                else:
+                    encoder = FakeEncoder(f"enc:{fmt}".encode())
+                    antwort = await self.sprich(
+                        self.app(encoder_factory=encoder),
+                        response_format=fmt)
+                    self.assertEqual(antwort.content,
+                                     f"enc:{fmt}".encode())
+                    self.assertEqual(encoder.prozesse[0].fmt, fmt)
+                self.assertEqual(antwort.status_code, 200)
+                self.assertTrue(antwort.headers["content-type"]
+                                .startswith(ctype))
+
+    async def test_pcm_24k_ohne_encoder(self):
+        pcm = b"\x01\x02" * 16
+        self.tts = FakeTts(rate=24000, pcm=pcm)
+
+        def nie(*_args):
+            raise AssertionError("Encoder darf nicht starten")
+
+        antwort = await self.sprich(
+            self.app(encoder_factory=nie), response_format="pcm")
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(antwort.content, pcm)
+
+    async def test_unbekanntes_modell_und_stimme_404(self):
+        for daten in ({"model": "gibtsnicht"}, {"voice": "gibtsnicht"}):
+            with self.subTest(daten=daten):
+                antwort = await self.sprich(self.app(), **daten)
+                self.assertEqual(antwort.status_code, 404)
+                self.assertEqual(antwort.json()["error"]["code"],
+                                 "model_not_found")
+
+    async def test_nicht_installierte_stimme_503(self):
+        self.settings = AudioSettings(
+            models_dir=self.models_dir / "leer", preload="")
+        antwort = await self.sprich(self.app(), voice="kerstin")
+        self.assertEqual(antwort.status_code, 503)
+        fehler = antwort.json()["error"]
+        self.assertEqual(fehler["code"], "model_not_installed")
+        self.assertIn("--voices kerstin", fehler["message"])
+
+    async def test_ungueltige_eingaben_400_ohne_synthese(self):
+        faelle = ({"input": ""}, {"input": "   "},
+                  {"input": "x" * 5001}, {"speed": 0.4},
+                  {"speed": 2.1}, {"response_format": "flac"})
+        for daten in faelle:
+            with self.subTest(daten=daten):
+                self.tts = FakeTts()
+                antwort = await self.sprich(self.app(), **daten)
+                self.assertEqual(antwort.status_code, 400)
+                self.assertEqual(antwort.json()["error"]["code"],
+                                 "invalid_request")
+                self.assertEqual(self.tts.aufrufe, [])
+
+    async def test_queue_voll_429(self):
+        class Voll:
+            async def acquire(self):
+                raise QueueFull(5)
+
+            def release(self):
+                pass
+
+        app = self.app()
+        app.state.tts_admission = Voll()
+        antwort = await self.sprich(app)
+        self.assertEqual(antwort.status_code, 429)
+        self.assertEqual(antwort.json()["error"]["code"], "queue_full")
+        self.assertEqual(antwort.headers["retry-after"], "5")
+
+    async def test_timeout_vor_dem_antwortstart_504(self):
+        self.settings = AudioSettings(
+            models_dir=self.models_dir, preload="", tts_timeout_s=0.05)
+        self.tts = FakeTts(delay=0.2)
+        antwort = await self.sprich(self.app())
+        self.assertEqual(antwort.status_code, 504)
+        self.assertEqual(antwort.json()["error"]["code"], "timeout")
+
+    async def test_umlaute_und_langer_satz_ohne_punkt(self):
+        text = "Grüße aus München: " + "ä" * 3000
+        antwort = await self.sprich(self.app(), input=text)
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(self.tts.aufrufe[0]["text"], text)
+
+    async def test_text_steht_nicht_im_log(self):
+        with self.assertLogs("aiserver_audio.app", level="INFO") as logs:
+            antwort = await self.sprich(self.app(), input="streng-geheim")
+        self.assertEqual(antwort.status_code, 200)
+        self.assertNotIn("streng-geheim", "\n".join(logs.output))
+
+
+class TestStreaming(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.info = resolve_voice("thorsten")
+
+    async def test_erster_chunk_vor_zweitem_satz(self):
+        events = []
+        engine = FakeTts(events=events)
+        agen = stream_speech(
+            engine, "Erster Satz. Zweiter Satz.", info=self.info,
+            fmt="wav", speed=1.0, timeout_s=5)
+        header = await agen.__anext__()
+        self.assertEqual(header[:4], b"RIFF")
+        starts = [e for e in events if e[0] == "start"]
+        self.assertEqual(starts, [("start", "Erster Satz.")])
+        await agen.__anext__()  # erster PCM-Block
+        self.assertEqual([e for e in events if e[0] == "start"], starts)
+        await agen.__anext__()  # jetzt beginnt der zweite Satz
+        starts = [e for e in events if e[0] == "start"]
+        self.assertEqual(starts, [("start", "Erster Satz."),
+                                  ("start", "Zweiter Satz.")])
+        await agen.aclose()
+
+    async def test_disconnect_raeumt_encoder_und_engine_auf(self):
+        engine = FakeTts()
+        encoder = FakeEncoder(b"x")
+        agen = stream_speech(
+            engine, "Erster Satz. Zweiter Satz.", info=self.info,
+            fmt="mp3", speed=1.0, timeout_s=5,
+            encoder_factory=encoder)
+        await agen.__anext__()
+        await agen.aclose()
+        self.assertTrue(encoder.prozesse[0].terminated)
+        self.assertTrue(encoder.prozesse[0].stdin.closed)
+        self.assertEqual(engine.offen, 0)
+
+    async def test_timeout_wirft_audio_fehler(self):
+        engine = FakeTts(delay=0.2)
+        agen = stream_speech(
+            engine, "Erster Satz.", info=self.info, fmt="wav",
+            speed=1.0, timeout_s=0.05)
+        with self.assertRaises(AudioError) as ctx:
+            await agen.__anext__()
+        self.assertEqual(ctx.exception.status_code, 504)
+        self.assertEqual(ctx.exception.code, "timeout")
+        await agen.aclose()
 
 
 class TestFormatierung(unittest.TestCase):

@@ -10,15 +10,19 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
-from .catalog import models_payload, resolve_whisper, whisper_installed
+from .catalog import (models_payload, resolve_voice, resolve_whisper,
+                      voice_installed, whisper_installed)
 from .config import AudioSettings, load_settings
 from .errors import AudioError, audio_error_body
 from .ffmpeg import probe_duration
 from .queue import Admission, QueueFull
 from .stt import FasterWhisperEngine, Transcription
-from .tts import PiperEngine
+from .tts import (PiperEngine, content_type, split_sentences,
+                  start_encoder, stream_audio)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,18 @@ _MEDIA_TYPES = {
 _FORMATE = frozenset(_MEDIA_TYPES)
 _MAX_AUDIO_S = 3600
 _BLOCKGROESSE = 64 * 1024
+_TTS_MODELS = frozenset({"piper", "tts-1", "tts-1-hd"})
+_TTS_FORMATE = frozenset({"pcm", "wav", "mp3", "opus"})
+
+
+class SpeechRequest(BaseModel):
+    """OpenAI-kompatibler Text-fuer-Sprache-Request."""
+
+    input: str = Field(..., max_length=5000)
+    model: str = "piper"
+    voice: str = "de_DE-thorsten-medium"
+    response_format: str = "wav"
+    speed: float = Field(1.0, ge=0.5, le=2.0)
 
 
 def _zeitstempel(sekunden: float, trenner: str) -> str:
@@ -82,14 +98,65 @@ def _download_befehl(info) -> str:
     return f"runtime/audio/download-models.sh --whisper {name}"
 
 
+def _voice_download_befehl(info) -> str:
+    name = info.aliases[0] if info.aliases else info.id
+    return f"runtime/audio/download-models.sh --voices {name}"
+
+
+async def _synthese(tts, satz, info, speed):
+    return await asyncio.to_thread(
+        lambda: list(tts.synthesize(satz, info=info, speed=speed)))
+
+
+async def stream_speech(tts, text: str, *, info, fmt: str, speed: float,
+                        timeout_s: float,
+                        encoder_factory=start_encoder):
+    """Synthetisiert Satz fuer Satz und liefert die Audiodaten als Stream.
+
+    Der erste Satz wird vor dem ersten Byte vollstaendig synthetisiert; bei
+    einem Timeout vor dem Antwortstart kann der Aufrufer noch 504 liefern.
+    Nach dem Start beendet ein Timeout den Stream und wird nur geloggt.
+    """
+    saetze = split_sentences(text)
+    if not saetze:
+        raise AudioError(400, "invalid_request", "input darf nicht leer sein")
+    loop = asyncio.get_running_loop()
+    ende = loop.time() + timeout_s
+
+    async def chunks():
+        for satz in saetze:
+            rest = ende - loop.time()
+            if rest <= 0:
+                raise AudioError(504, "timeout",
+                                 "Sprachausgabe hat das Zeitlimit "
+                                 "ueberschritten")
+            try:
+                teile = await asyncio.wait_for(
+                    _synthese(tts, satz, info, speed), rest)
+            except asyncio.TimeoutError:
+                raise AudioError(504, "timeout",
+                                 "Sprachausgabe hat das Zeitlimit "
+                                 "ueberschritten") from None
+            for teil in teile:
+                yield teil
+
+    audio = stream_audio(chunks(), fmt, encoder_factory=encoder_factory)
+    try:
+        async for block in audio:
+            yield block
+    finally:
+        await audio.aclose()
+
 def create_audio_app(settings: AudioSettings | None = None, *,
                      stt_engine=None, tts_engine=None,
-                     duration_probe=probe_duration) -> FastAPI:
+                     duration_probe=probe_duration,
+                     encoder_factory=start_encoder) -> FastAPI:
     """Baut die Audio-App; Engines und Zeitmessung sind austauschbar."""
     settings = settings or load_settings()
     stt = stt_engine if stt_engine is not None else FasterWhisperEngine(settings)
     tts = tts_engine if tts_engine is not None else PiperEngine(settings)
     admission = Admission(1, settings.max_queue)
+    tts_admission = Admission(2, settings.max_queue)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -107,6 +174,7 @@ def create_audio_app(settings: AudioSettings | None = None, *,
     app.state.stt = stt
     app.state.tts = tts
     app.state.stt_admission = admission
+    app.state.tts_admission = tts_admission
 
     @app.exception_handler(AudioError)
     async def _audio_fehler(request, exc: AudioError):
@@ -219,5 +287,81 @@ def create_audio_app(settings: AudioSettings | None = None, *,
             if tmp_pfad is not None:
                 tmp_pfad.unlink(missing_ok=True)
             app.state.stt_admission.release()
+
+    @app.post("/v1/audio/speech")
+    async def sprache(anfrage: SpeechRequest):
+        info = resolve_voice(anfrage.voice)
+        if anfrage.model.strip().casefold() not in _TTS_MODELS:
+            raise AudioError(404, "model_not_found",
+                             f"Unbekanntes TTS-Modell: {anfrage.model!r}")
+        if not voice_installed(settings.models_dir, info):
+            raise AudioError(
+                503, "model_not_installed",
+                f"Stimme {info.id} ist nicht installiert. Bitte "
+                f"{_voice_download_befehl(info)} ausfuehren.")
+        if anfrage.response_format not in _TTS_FORMATE:
+            raise AudioError(400, "invalid_request",
+                             f"Unbekanntes Format: "
+                             f"{anfrage.response_format!r}")
+        text = anfrage.input.strip()
+        if not text:
+            raise AudioError(400, "invalid_request",
+                             "input darf nicht leer sein")
+
+        await app.state.tts_admission.acquire()
+        agen = stream_speech(
+            app.state.tts, text, info=info,
+            fmt=anfrage.response_format, speed=anfrage.speed,
+            timeout_s=settings.tts_timeout_s,
+            encoder_factory=encoder_factory)
+        try:
+            erster = await agen.__anext__()
+        except BaseException:
+            try:
+                await agen.aclose()
+            except Exception:
+                pass
+            app.state.tts_admission.release()
+            raise
+
+        freigegeben = False
+
+        def freigeben():
+            nonlocal freigegeben
+            if not freigegeben:
+                freigegeben = True
+                app.state.tts_admission.release()
+
+        start = time.perf_counter()
+
+        async def koerper():
+            status = "ok"
+            try:
+                yield erster
+                async for block in agen:
+                    yield block
+            except AudioError as exc:
+                status = "timeout" if exc.code == "timeout" else "error"
+                logger.warning("audio tts abgebrochen: %s: %s",
+                               exc.code, exc.message)
+            except Exception as exc:
+                status = "error"
+                logger.warning("audio tts fehlgeschlagen: %s: %s",
+                               type(exc).__name__, exc)
+            finally:
+                try:
+                    await agen.aclose()
+                except Exception:
+                    pass
+                freigeben()
+                logger.info(
+                    "audio tts voice=%s status=%s seconds=%.2f",
+                    info.id, status, time.perf_counter() - start)
+
+        return StreamingResponse(
+            koerper(),
+            media_type=content_type(anfrage.response_format),
+            headers={"Cache-Control": "no-store"},
+            background=BackgroundTask(freigeben))
 
     return app
