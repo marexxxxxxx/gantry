@@ -45,6 +45,11 @@ export AUDIO_PRELOAD=""
 export AUDIO_MODELS_DIR="$WORKDIR/audio"
 export AUDIO_PIDFILE="$WORKDIR/audio.pid"
 export AUDIO_LOG="$WORKDIR/audio.log"
+export AISERVER_MONITOR_CHATTERBOX_BASE="http://127.0.0.1:39004"
+export CHATTERBOX_PORT=39004
+export CHATTERBOX_PIDFILE="$WORKDIR/chatterbox.pid"
+export CHATTERBOX_LOG="$WORKDIR/chatterbox.log"
+export CHATTERBOX_VENV="$WORKDIR/chatterbox-venv"
 # Auch der Embedding-Sidecar braucht ein eigenes PID-File: `run.sh stop` ruft
 # stop-embed.sh auf und darf den Produktions-Ollama auf 30002 nicht beenden.
 export AISERVER_MONITOR_EMBED_BASE="http://127.0.0.1:39002"
@@ -94,7 +99,11 @@ grep -q 'nohup' "$RUN" && pass "nohup verwendet" || fail "nohup fehlt"
 grep -q 'healthz' "$RUN" && pass "Health-Poll auf /healthz" || fail "Health-Poll auf /healthz fehlt"
 if [ -x "$RUN" ]; then pass "run.sh ist ausfuehrbar"; else fail "run.sh ist nicht ausfuehrbar (chmod +x fehlt)"; fi
 
-for skript in "$PROJEKT/../runtime/audio/setup.sh" \
+for skript in "$PROJEKT/../runtime/chatterbox/setup.sh" \
+              "$PROJEKT/../runtime/chatterbox/download-models.sh" \
+              "$PROJEKT/../runtime/chatterbox/start-chatterbox.sh" \
+              "$PROJEKT/../runtime/chatterbox/stop-chatterbox.sh" \
+              "$PROJEKT/../runtime/audio/setup.sh" \
               "$PROJEKT/../runtime/audio/download-models.sh" \
               "$PROJEKT/../runtime/audio/start-audio.sh" \
               "$PROJEKT/../runtime/audio/stop-audio.sh" \

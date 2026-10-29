@@ -27,6 +27,17 @@ class PiperInfo:
     sample_rate: int
 
 
+@dataclass(frozen=True)
+class ChatterboxInfo:
+    id: str
+    aliases: tuple[str, ...]
+    size_mb: int
+    dirname: str
+    required_files: tuple[str, ...] = (
+        "ve.pt", "s3gen.pt", "t3_mtl23ls_v3.safetensors",
+        "grapheme_mtl_merged_expanded_v1.json", "Cangjie5_TC.json")
+
+
 WHISPER_MODELS: tuple[WhisperInfo, ...] = (
     WhisperInfo("whisper-small", ("small", "whisper-1"),
                 "Systran/faster-whisper-small", 484, "small"),
@@ -52,6 +63,9 @@ PIPER_VOICES: tuple[PiperInfo, ...] = (
 
 DEFAULT_WHISPER = "whisper-small"
 DEFAULT_VOICE = "de_DE-thorsten-medium"
+
+CHATTERBOX_MODEL = ChatterboxInfo(
+    "chatterbox", ("chatterbox-v3",), 3000, "chatterbox")
 
 
 def _aufloesen(name: str | None, modelle, default: str, art: str):
@@ -80,6 +94,16 @@ def whisper_dir(models_dir: Path, info: WhisperInfo) -> Path:
 def piper_files(models_dir: Path, info: PiperInfo) -> tuple[Path, Path]:
     basis = Path(models_dir) / "piper" / info.id
     return basis.with_suffix(".onnx"), basis.with_suffix(".onnx.json")
+
+
+def chatterbox_dir(models_dir: Path) -> Path:
+    return Path(models_dir) / CHATTERBOX_MODEL.dirname
+
+
+def chatterbox_installed(models_dir: Path) -> bool:
+    ziel = chatterbox_dir(models_dir)
+    return all(_datei_ok(ziel / name)
+               for name in CHATTERBOX_MODEL.required_files)
 
 
 def _datei_ok(pfad: Path) -> bool:
@@ -112,6 +136,12 @@ def models_payload(models_dir: Path) -> dict:
         "tts": {
             "default_model": "piper",
             "default_voice": DEFAULT_VOICE,
+            "models": [
+                {"id": "piper", "installed": True, "size_mb": 0},
+                {"id": "chatterbox",
+                 "installed": chatterbox_installed(models_dir),
+                 "size_mb": CHATTERBOX_MODEL.size_mb},
+            ],
             "voices": [
                 {"id": info.id,
                  "installed": voice_installed(models_dir, info),

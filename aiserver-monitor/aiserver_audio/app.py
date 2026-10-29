@@ -15,8 +15,10 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .catalog import (models_payload, resolve_voice, resolve_whisper,
+from .catalog import (CHATTERBOX_MODEL, chatterbox_installed,
+                      models_payload, resolve_voice, resolve_whisper,
                       voice_installed, whisper_installed)
+from .chatterbox import ChatterboxClient
 from .config import AudioSettings, load_settings
 from .errors import AudioError, audio_error_body
 from .ffmpeg import probe_duration
@@ -39,6 +41,7 @@ _FORMATE = frozenset(_MEDIA_TYPES)
 _MAX_AUDIO_S = 3600
 _BLOCKGROESSE = 64 * 1024
 _TTS_MODELS = frozenset({"piper", "tts-1", "tts-1-hd"})
+_CHATTERBOX_MODELS = frozenset({"chatterbox", "chatterbox-v3"})
 _TTS_FORMATE = frozenset({"pcm", "wav", "mp3", "opus"})
 
 
@@ -180,12 +183,15 @@ async def stream_speech(tts, text: str, *, info, fmt: str, speed: float,
 
 def create_audio_app(settings: AudioSettings | None = None, *,
                      stt_engine=None, tts_engine=None,
+                     chatterbox_engine=None,
                      duration_probe=probe_duration,
                      encoder_factory=start_encoder) -> FastAPI:
     """Baut die Audio-App; Engines und Zeitmessung sind austauschbar."""
     settings = settings or load_settings()
     stt = stt_engine if stt_engine is not None else FasterWhisperEngine(settings)
     tts = tts_engine if tts_engine is not None else PiperEngine(settings)
+    chatterbox = (chatterbox_engine if chatterbox_engine is not None
+                  else ChatterboxClient(settings))
     admission = Admission(1, settings.max_queue)
     tts_admission = Admission(2, settings.max_queue)
 
@@ -204,6 +210,7 @@ def create_audio_app(settings: AudioSettings | None = None, *,
     app.state.settings = settings
     app.state.stt = stt
     app.state.tts = tts
+    app.state.chatterbox = chatterbox
     app.state.stt_admission = admission
     app.state.tts_admission = tts_admission
 
@@ -344,15 +351,32 @@ def create_audio_app(settings: AudioSettings | None = None, *,
 
     @app.post("/v1/audio/speech")
     async def sprache(anfrage: SpeechRequest):
-        info = resolve_voice(anfrage.voice)
-        if anfrage.model.strip().casefold() not in _TTS_MODELS:
-            raise AudioError(404, "model_not_found",
-                             f"Unbekanntes TTS-Modell: {anfrage.model!r}")
-        if not voice_installed(settings.models_dir, info):
-            raise AudioError(
-                503, "model_not_installed",
-                f"Stimme {info.id} ist nicht installiert. Bitte "
-                f"{_voice_download_befehl(info)} ausfuehren.")
+        modell = anfrage.model.strip().casefold()
+        if modell in _CHATTERBOX_MODELS:
+            if anfrage.voice.strip().casefold() not in ("default",
+                                                        "chatterbox"):
+                raise AudioError(
+                    404, "model_not_found",
+                    f"Unbekannte Chatterbox-Stimme: {anfrage.voice!r}")
+            info = CHATTERBOX_MODEL
+            if not chatterbox_installed(settings.models_dir):
+                raise AudioError(
+                    503, "model_not_installed",
+                    "Chatterbox ist nicht installiert. Bitte "
+                    "runtime/chatterbox/download-models.sh ausfuehren.")
+            engine = app.state.chatterbox
+        else:
+            info = resolve_voice(anfrage.voice)
+            if modell not in _TTS_MODELS:
+                raise AudioError(
+                    404, "model_not_found",
+                    f"Unbekanntes TTS-Modell: {anfrage.model!r}")
+            if not voice_installed(settings.models_dir, info):
+                raise AudioError(
+                    503, "model_not_installed",
+                    f"Stimme {info.id} ist nicht installiert. Bitte "
+                    f"{_voice_download_befehl(info)} ausfuehren.")
+            engine = app.state.tts
         if anfrage.response_format not in _TTS_FORMATE:
             raise AudioError(400, "invalid_request",
                              f"Unbekanntes Format: "
@@ -372,7 +396,7 @@ def create_audio_app(settings: AudioSettings | None = None, *,
                 lambda _: app.state.tts_admission.release())
 
         agen = stream_speech(
-            app.state.tts, text, info=info,
+            engine, text, info=info,
             fmt=anfrage.response_format, speed=anfrage.speed,
             timeout_s=settings.tts_timeout_s,
             encoder_factory=encoder_factory, on_late=spaeter)

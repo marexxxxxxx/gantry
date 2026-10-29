@@ -172,3 +172,27 @@ Enable it server-side for all requests with `OTP=1`, or per request via
   ([arXiv:2606.00206](https://arxiv.org/abs/2606.00206)).
 - The adaptations in this repo (payload builder, server-default patch, docs) are local work;
   errors are on us.
+
+### Chatterbox (optional, CPU)
+
+Chatterbox Multilingual V3 can be used as an additional TTS model. It runs in
+its own CPU worker on `127.0.0.1:30004` with a separate virtualenv (torch 2.6,
+numpy < 2), because its dependencies differ from Piper/Whisper. Clients still
+use the gateway on `:30000`; Piper remains the default.
+
+```bash
+bash aiserver-monitor/run.sh chatterbox-setup   # create runtime/chatterbox/venv
+bash aiserver-monitor/run.sh chatterbox-models  # ~3 GB to /mnt/models/audio/chatterbox
+bash aiserver-monitor/run.sh restart            # gateway + all CPU sidecars
+
+curl http://127.0.0.1:30000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "chatterbox-v3", "voice": "default", "input": "Guten Tag.", "response_format": "wav"}' \
+  -o antwort.wav
+```
+
+Model aliases are `chatterbox` and `chatterbox-v3`; the only voice is
+`default` (fixed voice from the checkpoint). All audio formats work as before.
+On eight CPU threads Chatterbox is roughly 2.6x slower than realtime and the
+first request loads the model in about 8 seconds. A stopped worker returns
+`502`, a timeout `504`.

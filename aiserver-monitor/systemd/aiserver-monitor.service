@@ -9,13 +9,16 @@ Environment=AISERVER_MONITOR_LISTEN_PORT=30000
 Environment=AISERVER_MONITOR_UPSTREAM_BASE=http://127.0.0.1:30001
 Environment=AISERVER_MONITOR_EMBED_BASE=http://127.0.0.1:30002
 Environment=AISERVER_MONITOR_AUDIO_BASE=http://127.0.0.1:30003
+Environment=AISERVER_MONITOR_CHATTERBOX_BASE=http://127.0.0.1:30004
 # CPU-Embedding-Sidecar gehoert zum Gateway; '-' ignoriert Fehler, damit ein
 # Embedding-Problem den Chat-Betrieb nicht blockiert.
 ExecStartPre=-/home/user/small_qwen/runtime/embed/start-embed.sh
 # Audio-Sidecar (Whisper/Piper) ebenso; Audio darf den Chat nie blockieren.
 ExecStartPre=-/home/user/small_qwen/runtime/audio/start-audio.sh
+ExecStartPre=-/home/user/small_qwen/runtime/chatterbox/start-chatterbox.sh
 ExecStopPost=-/home/user/small_qwen/runtime/embed/stop-embed.sh
 ExecStopPost=-/home/user/small_qwen/runtime/audio/stop-audio.sh
+ExecStopPost=-/home/user/small_qwen/runtime/chatterbox/stop-chatterbox.sh
 ExecStart=/home/user/small_qwen/.venv/bin/python -m aiserver_monitor
 Restart=always
 RestartSec=3

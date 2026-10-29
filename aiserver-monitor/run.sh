@@ -61,21 +61,25 @@ fi
 HEALTH="http://127.0.0.1:${PORT}/healthz"
 EMBED_BASE="${AISERVER_MONITOR_EMBED_BASE:-http://127.0.0.1:30002}"
 AUDIO_BASE="${AISERVER_MONITOR_AUDIO_BASE:-http://127.0.0.1:30003}"
+CHATTERBOX_BASE="${AISERVER_MONITOR_CHATTERBOX_BASE:-http://127.0.0.1:30004}"
 # 20 s sind die Grenze aus dem Muster. Ueberschreibbar, damit ein Test nicht
 # 20 s auf das Beenden wartet.
 STOP_GRACE="${STOP_GRACE:-20}"
 START_WAIT="${START_WAIT:-20}"
 
 usage() {
-    echo "usage: $0 {start|stop|status|restart|audio-setup|audio-models [args...]}"
+    echo "usage: $0 {start|stop|status|restart|audio-setup|audio-models|chatterbox-setup|chatterbox-models [args...]}"
     echo "  start     Gateway im Hintergrund starten und auf /healthz warten"
     echo "  stop      Gateway beenden (TERM, ${STOP_GRACE}s, dann KILL)"
     echo "  status    Zustand lesen, Exit 1 wenn das Gateway nicht laeuft"
     echo "  restart   stop und start"
     echo "  audio-setup   Audio-Abhaengigkeiten in die .venv installieren"
     echo "  audio-models  Whisper/Piper-Modelle verwalten (--all, --check, ...)"
+    echo "  chatterbox-setup   Chatterbox-venv und -Abhaengigkeiten installieren"
+    echo "  chatterbox-models  Chatterbox-Modelldateien herunterladen"
     echo "Umgebung: AISERVER_MONITOR_LISTEN_PORT=$PORT PIDFILE=$PIDFILE"
     echo "          AUDIO_BASE=$AUDIO_BASE"
+    echo "          CHATTERBOX_BASE=$CHATTERBOX_BASE"
     exit 2
 }
 
@@ -220,9 +224,40 @@ print(sum(1 for m in w if m["installed"]), "/", len(w), ", ",
     echo "[aiserver-monitor] Audio-Sidecar (CPU) laeuft auf $AUDIO_BASE (Modelle: $modelle)"
 }
 
+start_chatterbox() {
+    local script="$RUNTIME/chatterbox/start-chatterbox.sh"
+    [ -f "$script" ] || return 0
+    if ! bash "$script"; then
+        echo "[aiserver-monitor] WARNUNG: Chatterbox-Worker startet nicht; model=chatterbox bleibt ohne Upstream." >&2
+    fi
+}
+
+stop_chatterbox() {
+    local script="$RUNTIME/chatterbox/stop-chatterbox.sh"
+    [ -f "$script" ] || return 0
+    bash "$script" || true
+}
+
+status_chatterbox() {
+    if ! curl -sf -m 2 -o /dev/null "${CHATTERBOX_BASE%/}/healthz" 2>/dev/null; then
+        echo "[aiserver-monitor] Chatterbox-Worker (CPU) laeuft nicht; model=chatterbox hat keinen Upstream"
+        return 0
+    fi
+    echo "[aiserver-monitor] Chatterbox-Worker (CPU) laeuft auf $CHATTERBOX_BASE"
+}
+
+chatterbox_setup() {
+    bash "$RUNTIME/chatterbox/setup.sh"
+}
+
+chatterbox_models() {
+    bash "$RUNTIME/chatterbox/download-models.sh" "$@"
+}
+
 start() {
     start_embed
     start_audio
+    start_chatterbox
     if is_running; then
         echo "[aiserver-monitor] laeuft bereits (PID $(monitor_pids), Port $PORT)"
         return 0
@@ -283,6 +318,7 @@ stop() {
         echo "[aiserver-monitor] laeuft nicht"
         rm -f "$PIDFILE"
         stop_audio
+        stop_chatterbox
         stop_embed
         return 0
     fi
@@ -326,6 +362,7 @@ stop() {
         return 1
     fi
     stop_audio
+    stop_chatterbox
     stop_embed
     echo "[aiserver-monitor] gestoppt"
 }
@@ -348,6 +385,7 @@ status() {
         echo "[aiserver-monitor] Embedding-Sidecar (CPU) laeuft nicht; /v1/embeddings hat keinen Upstream"
     fi
     status_audio
+    status_chatterbox
 }
 
 audio_setup() {
@@ -365,5 +403,7 @@ case "${1:-}" in
     restart)      stop; start ;;
     audio-setup)  audio_setup ;;
     audio-models) shift; audio_models "$@" ;;
+    chatterbox-setup) chatterbox_setup ;;
+    chatterbox-models) shift; chatterbox_models "$@" ;;
     *)            usage ;;
 esac

@@ -300,3 +300,22 @@ was — only the explicit server control (dashboard "Server" tab or
   (repo path `docs/superpowers/specs/2026-10-13-aiserver-monitor-design.md`)
 - Implementation plan (German):
   [`../docs/superpowers/plans/2026-10-13-aiserver-monitor.md`](../docs/superpowers/plans/2026-10-13-aiserver-monitor.md)
+
+#### Chatterbox (optional, CPU)
+
+`model=chatterbox` or `chatterbox-v3` routes TTS text to a separate worker on
+`127.0.0.1:30004`; voice `default` is the fixed checkpoint voice. The worker
+uses its own venv under `runtime/chatterbox/venv` because it needs torch 2.6
+and numpy < 2. Setup and models:
+
+```bash
+bash run.sh chatterbox-setup
+bash run.sh chatterbox-models
+bash run.sh status
+```
+
+Models live in `/mnt/models/audio/chatterbox` (~3 GB). Piper remains the
+default. The first request loads the model (~8 s); subsequent synthesis is
+about 2.6x slower than realtime on eight CPU threads. Formats, limits and
+error codes are shared with Piper; a stopped worker returns `502` and a
+timeout `504`.

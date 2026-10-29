@@ -9,3 +9,6 @@ __pycache__/
 .worktrees/
 # Laufzeit-PIDfiles der Backend-/Embedding-Sidecars
 runtime/*/*.pid
+
+# Python-venv der optionalen Runtime-Worker
+runtime/*/venv/

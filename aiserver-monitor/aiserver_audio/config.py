@@ -18,6 +18,8 @@ class AudioSettings:
     stt_timeout_s: int = 1800
     tts_timeout_s: int = 120
     max_upload_mb: int = 100
+    chatterbox_base: str = "http://127.0.0.1:30004"
+    chatterbox_timeout_s: int = 120
 
 
 def _wert(env: Mapping[str, str], name: str, default: str) -> str:
@@ -42,12 +44,19 @@ def load_settings(env: Mapping[str, str] | None = None) -> AudioSettings:
         stt_timeout_s=int(_wert(quelle, "STT_TIMEOUT", "1800")),
         tts_timeout_s=int(_wert(quelle, "TTS_TIMEOUT", "120")),
         max_upload_mb=int(_wert(quelle, "MAX_UPLOAD_MB", "100")),
+        chatterbox_base=_wert(quelle, "CHATTERBOX_BASE",
+                             "http://127.0.0.1:30004"),
+        chatterbox_timeout_s=int(
+            _wert(quelle, "CHATTERBOX_TIMEOUT", "120")),
     )
     for feld in ("port", "threads", "model_cache", "max_queue",
-                 "stt_timeout_s", "tts_timeout_s", "max_upload_mb"):
+                 "stt_timeout_s", "tts_timeout_s", "max_upload_mb",
+                 "chatterbox_timeout_s"):
         if getattr(settings, feld) <= 0:
             raise ValueError(f"AUDIO_{feld.upper()} muss positiv sein: "
                              f"{getattr(settings, feld)}")
     if not settings.host.strip():
         raise ValueError("AUDIO_HOST darf nicht leer sein")
+    if not settings.chatterbox_base.strip():
+        raise ValueError("AUDIO_CHATTERBOX_BASE darf nicht leer sein")
     return settings
