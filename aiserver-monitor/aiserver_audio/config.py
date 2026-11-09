@@ -20,6 +20,11 @@ class AudioSettings:
     max_upload_mb: int = 100
     chatterbox_base: str = "http://127.0.0.1:30004"
     chatterbox_timeout_s: int = 120
+    qwen_tts_base: str = "http://127.0.0.1:30005"
+    qwen_tts_timeout_s: int = 600
+    audio8_base: str = "http://127.0.0.1:30006"
+    audio8_timeout_s: int = 600
+    audio8_model_dir: Path = Path("/mnt/models/audio/audio8")
 
 
 def _wert(env: Mapping[str, str], name: str, default: str) -> str:
@@ -48,10 +53,21 @@ def load_settings(env: Mapping[str, str] | None = None) -> AudioSettings:
                              "http://127.0.0.1:30004"),
         chatterbox_timeout_s=int(
             _wert(quelle, "CHATTERBOX_TIMEOUT", "120")),
+        qwen_tts_base=_wert(quelle, "QWEN_TTS_BASE",
+                            "http://127.0.0.1:30005"),
+        qwen_tts_timeout_s=int(
+            _wert(quelle, "QWEN_TTS_TIMEOUT", "600")),
+        audio8_base=_wert(quelle, "AUDIO8_BASE",
+                          "http://127.0.0.1:30006"),
+        audio8_timeout_s=int(
+            _wert(quelle, "AUDIO8_TIMEOUT", "600")),
+        audio8_model_dir=Path(
+            _wert(quelle, "AUDIO8_MODEL_DIR", "/mnt/models/audio/audio8")),
     )
     for feld in ("port", "threads", "model_cache", "max_queue",
                  "stt_timeout_s", "tts_timeout_s", "max_upload_mb",
-                 "chatterbox_timeout_s"):
+                 "chatterbox_timeout_s", "qwen_tts_timeout_s",
+                 "audio8_timeout_s"):
         if getattr(settings, feld) <= 0:
             raise ValueError(f"AUDIO_{feld.upper()} muss positiv sein: "
                              f"{getattr(settings, feld)}")
@@ -59,4 +75,10 @@ def load_settings(env: Mapping[str, str] | None = None) -> AudioSettings:
         raise ValueError("AUDIO_HOST darf nicht leer sein")
     if not settings.chatterbox_base.strip():
         raise ValueError("AUDIO_CHATTERBOX_BASE darf nicht leer sein")
+    if not settings.qwen_tts_base.strip():
+        raise ValueError("AUDIO_QWEN_TTS_BASE darf nicht leer sein")
+    if not settings.audio8_base.strip():
+        raise ValueError("AUDIO_AUDIO8_BASE darf nicht leer sein")
+    if not str(settings.audio8_model_dir).strip():
+        raise ValueError("AUDIO_AUDIO8_MODEL_DIR darf nicht leer sein")
     return settings

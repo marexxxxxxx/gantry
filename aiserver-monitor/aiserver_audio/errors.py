@@ -2,7 +2,8 @@
 
 _SERVER_CODES = frozenset((
     "internal_error", "model_not_installed", "upstream_unavailable",
-    "timeout"))
+    "timeout", "upstream_error", "vram_exhausted", "reference_missing",
+    "reference_invalid"))
 
 
 class AudioError(Exception):
