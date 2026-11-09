@@ -4,6 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from fastapi.testclient import TestClient
+
+from aiserver_audio8_tts.app import create_audio8_tts_app
 from aiserver_audio8_tts.config import Audio8Settings, load_settings
 from aiserver_audio8_tts.engine import Audio8Engine
 from aiserver_audio8_tts.errors import Audio8TTSError
@@ -243,3 +246,71 @@ class TestAudio8EngineSynthese(unittest.TestCase):
             with self.assertRaises(Audio8TTSError) as ctx:
                 engine.synthesize("Guten Tag.")
         self.assertEqual(ctx.exception.code, "vram_exhausted")
+
+
+class FakeAudio8Engine:
+    def __init__(self):
+        self.model_loaded = False
+        self.loads = 0
+        self.unloads = 0
+        self.calls = []
+
+    def load(self):
+        self.loads += 1
+        self.model_loaded = True
+
+    def unload(self):
+        self.unloads += 1
+        self.model_loaded = False
+
+    def synthesize(self, text, *, language="German"):
+        self.calls.append((text, language))
+        return b"\x01\x00" * 8, 44100
+
+
+class TestAudio8App(unittest.TestCase):
+    def _app(self, engine=None):
+        return create_audio8_tts_app(
+            Audio8Settings(model_dir=Path("/tmp/audio8")),
+            engine=engine or FakeAudio8Engine())
+
+    def test_healthz_load_und_unload_kommt_aus_dem_gemeinsamen_geruest(self):
+        engine = FakeAudio8Engine()
+        with TestClient(self._app(engine)) as c:
+            self.assertEqual(c.get("/healthz").json(),
+                             {"status": "ok", "model_loaded": False})
+            self.assertEqual(c.post("/load").status_code, 200)
+            self.assertEqual(c.post("/unload").status_code, 200)
+        self.assertEqual((engine.loads, engine.unloads), (1, 1))
+
+    def test_synthese_liefert_pcm_und_44100(self):
+        engine = FakeAudio8Engine()
+        with TestClient(self._app(engine)) as c:
+            r = c.post("/synthesize", json={
+                "text": "Guten Tag.", "voice": "de_male",
+                "language": "German"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, b"\x01\x00" * 8)
+        self.assertEqual(r.headers["x-sample-rate"], "44100")
+        self.assertEqual(engine.calls, [("Guten Tag.", "German")])
+
+    def test_leerer_text_ist_400(self):
+        with TestClient(self._app()) as c:
+            self.assertEqual(
+                c.post("/synthesize", json={"text": "  "}).status_code, 400)
+
+    def test_unbekannte_stimme_ist_400(self):
+        with TestClient(self._app()) as c:
+            self.assertEqual(
+                c.post("/synthesize", json={
+                    "text": "Hallo", "voice": "Unbekannt"}).status_code, 400)
+
+    def test_engine_fehler_kommt_mit_code(self):
+        class OomEngine(FakeAudio8Engine):
+            def synthesize(self, text, *, language="German"):
+                raise Audio8TTSError(503, "vram_exhausted", "kein VRAM")
+
+        with TestClient(self._app(OomEngine())) as c:
+            r = c.post("/synthesize", json={"text": "Hallo"})
+        self.assertEqual(r.status_code, 503)
+        self.assertEqual(r.json()["error"]["code"], "vram_exhausted")
