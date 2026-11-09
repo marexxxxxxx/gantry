@@ -281,7 +281,7 @@ class ModelLifecycle:
                             "/v1/unload ausfuehren.")
             if chat:
                 for tts_backend in self._tts_backends().values():
-                    if await self._tts_bereit(tts_backend):
+                    if await self._tts_health(tts_backend) is not None:
                         raise LifecycleConflictError(
                             f"{tts_backend.label} laeuft noch; "
                             "zuerst entladen.")
@@ -329,23 +329,28 @@ class ModelLifecycle:
         async with self._lock:
             vorher = await self.status()
             vorher_namen = {eintrag["profile"] for eintrag in vorher["loaded"]}
+            entladen: list[dict] = []
             for treffer in profile:
+                if treffer.kind == "tts":
+                    tts_backend = self._tts_backends().get(treffer.backend)
+                    if (tts_backend is not None
+                            and await self._unload_tts(tts_backend)):
+                        entladen.append(_profil_dict(treffer))
+                    continue
                 if treffer.name not in vorher_namen:
                     continue
                 if treffer.kind == "chat":
                     await self._unload_chat(treffer)
-                elif treffer.kind == "tts":
-                    tts_backend = self._tts_backends().get(treffer.backend)
-                    if tts_backend is not None:
-                        await self._unload_tts(tts_backend)
                 else:
                     await self._unload_embed()
 
             nachher = await self.status()
             nachher_namen = {eintrag["profile"]
                              for eintrag in nachher["loaded"]}
-            entladen = [eintrag for eintrag in vorher["loaded"]
-                        if eintrag["profile"] not in nachher_namen]
+            for eintrag in vorher["loaded"]:
+                if (eintrag["profile"] not in nachher_namen
+                        and eintrag not in entladen):
+                    entladen.append(eintrag)
             return {
                 "requested": ("all" if names is None
                               else [p.name for p in profile]),
@@ -505,9 +510,9 @@ class ModelLifecycle:
             backend.load_timeout_s,
             f"Laden von {backend.label}")
 
-    async def _unload_tts(self, backend: TTSBackend) -> None:
+    async def _unload_tts(self, backend: TTSBackend) -> bool:
         if await self._tts_health(backend) is None:
-            return
+            return False
         try:
             antwort = await self.client.post(
                 f"{backend.base}/unload",
@@ -524,6 +529,7 @@ class ModelLifecycle:
             worker_weg,
             backend.unload_timeout_s,
             f"Stoppen von {backend.label}")
+        return True
 
     def _tts_env(self, backend: TTSBackend) -> dict:
         teile = urlsplit(backend.base)

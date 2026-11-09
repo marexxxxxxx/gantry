@@ -465,6 +465,13 @@ class TestLoad(LifecycleTestCase):
             await lifecycle.load([QWEN])
         self.assertEqual(self.control.started, [])
 
+    async def test_load_chat_bei_laufendem_aber_nicht_geladenem_tts_409(self):
+        self.qwen_tts.alive = True
+        self.qwen_tts.model_loaded = False
+        with self.assertRaises(LifecycleConflictError):
+            await self.lifecycle().load([QWEN])
+        self.assertEqual(self.control.started, [])
+
     async def test_load_qwen3_tts_oom_503(self):
         self.qwen_tts.load_status = 503
         lifecycle = self.lifecycle(spawner=FakeSpawner(
@@ -617,6 +624,48 @@ class TestUnload(LifecycleTestCase):
         self.assertTrue(self.qwen_tts.alive)
         self.assertEqual([e["profile"] for e in antwort["unloaded"]], [AUDIO8])
         self.assertEqual([e["profile"] for e in antwort["loaded"]], [TTS])
+
+    async def test_unload_qwen3_tts_stoppt_laufenden_aber_nicht_geladenen_worker(
+            self):
+        self.qwen_tts.alive = True
+        self.qwen_tts.model_loaded = False
+        spawner = FakeSpawner(on_spawn=self._qwen_stop)
+        antwort = await self.lifecycle(spawner=spawner).unload([TTS])
+        self.assertIn("/unload", self.qwen_tts.calls)
+        self.assertEqual(spawner.calls[0][0],
+                         ["bash", "/repo/runtime/qwen-tts/stop-qwen-tts.sh"])
+        self.assertEqual([e["profile"] for e in antwort["unloaded"]], [TTS])
+
+    async def test_unload_audio8_stoppt_laufenden_aber_nicht_geladenen_worker(
+            self):
+        self.audio8.alive = True
+        self.audio8.model_loaded = False
+        spawner = FakeSpawner(on_spawn=self._audio8_stop)
+        antwort = await self.lifecycle(spawner=spawner).unload([AUDIO8])
+        self.assertIn("/unload", self.audio8.calls)
+        self.assertEqual(spawner.calls[0][0],
+                         ["bash", "/repo/runtime/audio8/stop-audio8.sh"])
+        self.assertEqual([e["profile"] for e in antwort["unloaded"]], [AUDIO8])
+
+    async def test_unload_all_stoppt_beide_tts_worker(self):
+        self.qwen_tts.alive = True
+        self.qwen_tts.model_loaded = True
+        self.audio8.alive = True
+        self.audio8.model_loaded = True
+
+        def stop_beide():
+            if self.qwen_tts.alive:
+                self.qwen_tts.alive = False
+            elif self.audio8.alive:
+                self.audio8.alive = False
+
+        spawner = FakeSpawner(on_spawn=stop_beide)
+        antwort = await self.lifecycle(spawner=spawner).unload()
+        gestoppt = {call[0][1] for call in spawner.calls}
+        self.assertIn("/repo/runtime/qwen-tts/stop-qwen-tts.sh", gestoppt)
+        self.assertIn("/repo/runtime/audio8/stop-audio8.sh", gestoppt)
+        self.assertEqual({e["profile"] for e in antwort["unloaded"]},
+                         {TTS, AUDIO8})
 
 
 if __name__ == "__main__":
