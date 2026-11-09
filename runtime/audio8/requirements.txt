@@ -1,0 +1,10 @@
+torch==2.8.0
+torchaudio==2.8.0
+transformers==4.57.3
+soundfile
+safetensors
+numpy
+fastapi
+uvicorn
+httpx
+huggingface_hub

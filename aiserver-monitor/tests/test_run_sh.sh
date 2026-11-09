@@ -50,6 +50,14 @@ export CHATTERBOX_PORT=39004
 export CHATTERBOX_PIDFILE="$WORKDIR/chatterbox.pid"
 export CHATTERBOX_LOG="$WORKDIR/chatterbox.log"
 export CHATTERBOX_VENV="$WORKDIR/chatterbox-venv"
+# Qwen3-TTS bekommt ebenfalls eigene Pfade. Der Test startet den GPU-Worker
+# nicht; er prueft nur Skripte, Syntax und die Status-/Usage-Ausgabe.
+export AISERVER_MONITOR_QWEN_TTS_BASE="http://127.0.0.1:39005"
+export QWEN_TTS_PORT=39005
+export QWEN_TTS_PIDFILE="$WORKDIR/qwen-tts.pid"
+export QWEN_TTS_LOG="$WORKDIR/qwen-tts.log"
+export QWEN_TTS_VENV="$WORKDIR/qwen-tts-venv"
+export QWEN_TTS_MODEL_DIR="$WORKDIR/qwen-tts-model"
 # Auch der Embedding-Sidecar braucht ein eigenes PID-File: `run.sh stop` ruft
 # stop-embed.sh auf und darf den Produktions-Ollama auf 30002 nicht beenden.
 export AISERVER_MONITOR_EMBED_BASE="http://127.0.0.1:39002"
@@ -107,7 +115,14 @@ for skript in "$PROJEKT/../runtime/chatterbox/setup.sh" \
               "$PROJEKT/../runtime/audio/download-models.sh" \
               "$PROJEKT/../runtime/audio/start-audio.sh" \
               "$PROJEKT/../runtime/audio/stop-audio.sh" \
-              "$PROJEKT/../runtime/audio/selftest.sh"; do
+              "$PROJEKT/../runtime/audio/selftest.sh" \
+              "$PROJEKT/../runtime/qwen-tts/setup.sh" \
+              "$PROJEKT/../runtime/qwen-tts/download-models.sh" \
+              "$PROJEKT/../runtime/qwen-tts/start-qwen-tts.sh" \
+              "$PROJEKT/../runtime/qwen-tts/stop-qwen-tts.sh" \
+              "$PROJEKT/../runtime/audio8/setup.sh" \
+              "$PROJEKT/../runtime/audio8/download-models.sh" \
+              "$PROJEKT/../runtime/audio8/make-reference.sh"; do
     name=$(basename "$skript")
     if [ ! -f "$skript" ]; then
         fail "$name fehlt"
@@ -124,6 +139,8 @@ out=$("$RUN" 2>&1); rc=$?
 if [ "$rc" -eq 2 ]; then pass "usage liefert 2"; else fail "usage lieferte $rc statt 2: $out"; fi
 case "$out" in *audio-setup*) pass "usage nennt audio-setup" ;; *) fail "usage nennt audio-setup nicht: $out" ;; esac
 case "$out" in *audio-models*) pass "usage nennt audio-models" ;; *) fail "usage nennt audio-models nicht: $out" ;; esac
+case "$out" in *qwen-tts-setup*) pass "usage nennt qwen-tts-setup" ;; *) fail "usage nennt qwen-tts-setup nicht: $out" ;; esac
+case "$out" in *qwen-tts-models*) pass "usage nennt qwen-tts-models" ;; *) fail "usage nennt qwen-tts-models nicht: $out" ;; esac
 
 # --- Vorbedingung: nichts laeuft --------------------------------------------
 
@@ -256,6 +273,7 @@ if [ "$rc" -eq 0 ]; then pass "status liefert 0, wenn er laeuft"; else fail "sta
 case "$out" in *"$PID1"*) pass "status nennt die PID" ;; *) fail "status nennt keine PID: $out" ;; esac
 case "$out" in *"$TEST_PORT"*) pass "status nennt den Port" ;; *) fail "status nennt keinen Port: $out" ;; esac
 case "$out" in *"Audio-Sidecar (CPU) laeuft"*) pass "status meldet den Audio-Sidecar" ;; *) fail "status meldet den Audio-Sidecar nicht: $out" ;; esac
+case "$out" in *"Qwen3-TTS-Worker"*) pass "status meldet den Qwen3-TTS-Worker" ;; *) fail "status meldet den Qwen3-TTS-Worker nicht: $out" ;; esac
 PID_STILL=$(head -n 1 -- "$PIDFILE" 2>/dev/null || true)
 if [ "$PID_STILL" = "$PID1" ]; then pass "status hat den Prozess nicht angefasst"; else fail "status hat den Prozess ersetzt: $PID1 zu $PID_STILL"; fi
 
