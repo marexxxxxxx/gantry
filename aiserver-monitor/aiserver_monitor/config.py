@@ -24,6 +24,38 @@ class Config:
     # Port ist nur lokal gebunden; Clients sehen weiterhin nur listen_port.
     embed_base: str = "http://127.0.0.1:30002"
     embed_model: str = "qwen3-embedding:0.6b"
+    # Lifecycle (/v1/load, /v1/unload): der Embedding-Sidecar darf lokal
+    # gestartet werden; Timeouts und Poll-Takt gelten fuer alle Backends.
+    embed_start_script: str = "runtime/embed/start-embed.sh"
+    lifecycle_timeout_s: float = 900.0
+    lifecycle_unload_timeout_s: float = 60.0
+    lifecycle_poll_s: float = 0.5
+    # Qwen3-TTS laeuft nur auf der GPU, nachdem der Chat entladen wurde.
+    # Der Worker wird bei /v1/load gestartet und bei /v1/unload gestoppt.
+    qwen_tts_model: str = "Qwen3-TTS"
+    qwen_tts_base: str = "http://127.0.0.1:30005"
+    qwen_tts_model_dir: str = "/mnt/models/audio/experiments/qwen"
+    qwen_tts_start_script: str = "runtime/qwen-tts/start-qwen-tts.sh"
+    qwen_tts_stop_script: str = "runtime/qwen-tts/stop-qwen-tts.sh"
+    qwen_tts_pidfile: str = "runtime/qwen-tts/qwen-tts.pid"
+    qwen_tts_health_path: str = "/healthz"
+    qwen_tts_load_timeout_s: float = 900.0
+    qwen_tts_unload_timeout_s: float = 60.0
+    # Audio8-TTS ist das zweite GPU-TTS. Es wird wie Qwen3-TTS erst nach dem
+    # Entladen des Chat-Backends gestartet und ueber /v1/load verwaltet.
+    audio8_model: str = "Audio8-Realistic-Air"
+    audio8_base: str = "http://127.0.0.1:30006"
+    audio8_model_dir: str = "/mnt/models/audio/audio8"
+    audio8_reference_audio: str = (
+        "/mnt/models/audio/audio8/reference/de_male.wav")
+    audio8_reference_text: str = (
+        "/mnt/models/audio/audio8/reference/de_male.txt")
+    audio8_start_script: str = "runtime/audio8/start-audio8.sh"
+    audio8_stop_script: str = "runtime/audio8/stop-audio8.sh"
+    audio8_pidfile: str = "runtime/audio8/audio8.pid"
+    audio8_health_path: str = "/healthz"
+    audio8_load_timeout_s: float = 900.0
+    audio8_unload_timeout_s: float = 60.0
     # Audio (Whisper/Piper) laeuft in einem eigenen CPU-Prozess. Auch dieser
     # Port ist nur lokal gebunden; Clients sehen weiterhin listen_port.
     audio_base: str = "http://127.0.0.1:30003"
@@ -57,13 +89,19 @@ class Config:
     gptoss_start_script: str = "runtime/gptoss/start-gptoss.sh"
     gptoss_stop_script: str = "runtime/gptoss/stop-gptoss.sh"
     gptoss_pidfile: str = "runtime/gptoss/gptoss.pid"
+    # Abliterated-Backend: Qwen3-14B ohne Refusal-Verhalten, 16k Kontext.
+    abl_start_script: str = "runtime/abl/start-abl.sh"
+    abl_stop_script: str = "runtime/abl/stop-abl.sh"
+    abl_pidfile: str = "runtime/abl/abl.pid"
     # Modell-Alias: Clients (z. B. Hindsight) senden weiterhin den Qwen-Namen.
-    # Laeuft Flint oder GPT-OSS, schreibt das Gateway ihn auf das jeweilige
-    # Modell um; laeuft Qwen, bleibt er unveraendert (dort ist er der echte
-    # Modellname).
+    # Laeuft Flint, GPT-OSS oder Abliterated, schreibt das Gateway ihn auf das
+    # jeweilige Modell um; laeuft Qwen, bleibt er unveraendert (dort ist er der
+    # echte Modellname).
     model_alias: str = "escha-qwen38-27b-w2"
     flint_model: str = "hf.co/AtomicChat/Flint-GGUF:IQ4_XS"
     gptoss_model: str = "gpt-oss:20b"
+    abl_model: str = (
+        "hf.co/bartowski/huihui-ai_Qwen3-14B-abliterated-GGUF:Q4_K_M")
 
     def __post_init__(self) -> None:
         """Weist nicht-positive Intervalle ab (sie waeren Busy-Loops).
@@ -85,6 +123,38 @@ class Config:
             raise ValueError(
                 "audio_max_upload_mb muss positiv sein: "
                 f"{self.audio_max_upload_mb}")
+        if self.lifecycle_timeout_s <= 0:
+            raise ValueError(
+                "lifecycle_timeout_s muss positiv sein: "
+                f"{self.lifecycle_timeout_s}")
+        if self.lifecycle_unload_timeout_s <= 0:
+            raise ValueError(
+                "lifecycle_unload_timeout_s muss positiv sein: "
+                f"{self.lifecycle_unload_timeout_s}")
+        if self.lifecycle_poll_s <= 0:
+            raise ValueError(
+                "lifecycle_poll_s muss positiv sein: "
+                f"{self.lifecycle_poll_s}")
+        for feld in ("qwen_tts_load_timeout_s",
+                     "qwen_tts_unload_timeout_s"):
+            if getattr(self, feld) <= 0:
+                raise ValueError(
+                    f"{feld} muss positiv sein: {getattr(self, feld)}")
+        for feld in ("qwen_tts_base", "qwen_tts_model_dir",
+                     "qwen_tts_start_script", "qwen_tts_stop_script",
+                     "qwen_tts_pidfile", "qwen_tts_health_path"):
+            if not str(getattr(self, feld)).strip():
+                raise ValueError(f"{feld} darf nicht leer sein")
+        for feld in ("audio8_load_timeout_s", "audio8_unload_timeout_s"):
+            if getattr(self, feld) <= 0:
+                raise ValueError(
+                    f"{feld} muss positiv sein: {getattr(self, feld)}")
+        for feld in ("audio8_base", "audio8_model_dir",
+                     "audio8_reference_audio", "audio8_reference_text",
+                     "audio8_start_script", "audio8_stop_script",
+                     "audio8_pidfile", "audio8_health_path"):
+            if not str(getattr(self, feld)).strip():
+                raise ValueError(f"{feld} darf nicht leer sein")
 
 
 def _coerce(feld: str, typ: Any, wert: Any) -> Any:

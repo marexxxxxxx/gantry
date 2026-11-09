@@ -28,6 +28,12 @@ class TestLoadConfig(unittest.TestCase):
         self.assertEqual(cfg.audio_base, "http://127.0.0.1:30003")
         self.assertAlmostEqual(cfg.audio_timeout_s, 1800.0)
         self.assertEqual(cfg.audio_max_upload_mb, 100)
+        self.assertEqual(cfg.abl_start_script, "runtime/abl/start-abl.sh")
+        self.assertEqual(cfg.abl_stop_script, "runtime/abl/stop-abl.sh")
+        self.assertEqual(cfg.abl_pidfile, "runtime/abl/abl.pid")
+        self.assertEqual(
+            cfg.abl_model,
+            "hf.co/bartowski/huihui-ai_Qwen3-14B-abliterated-GGUF:Q4_K_M")
 
     def test_server_steuerung_defaults_und_env(self):
         cfg = load_config(env={})
@@ -141,6 +147,52 @@ class TestLoadConfig(unittest.TestCase):
             Config(heartbeat_s=0.0)
         with self.assertRaisesRegex(ValueError, "poll_interval_s"):
             Config(poll_interval_s=-1.0)
+
+    def test_lifecycle_post_init_wirft_direkt(self):
+        for feld, wert in (
+                ("lifecycle_timeout_s", 0.0),
+                ("lifecycle_unload_timeout_s", -1.0),
+                ("lifecycle_poll_s", 0.0)):
+            with self.subTest(feld=feld):
+                with self.assertRaisesRegex(ValueError, feld):
+                    Config(**{feld: wert})
+
+    def test_qwen_tts_timeouts_muessen_positiv_sein(self):
+        for feld in ("qwen_tts_load_timeout_s", "qwen_tts_unload_timeout_s"):
+            with self.subTest(feld=feld):
+                with self.assertRaisesRegex(ValueError, feld):
+                    Config(**{feld: 0})
+
+    def test_audio8_defaults(self):
+        cfg = load_config(env={})
+        self.assertEqual(cfg.audio8_model, "Audio8-Realistic-Air")
+        self.assertEqual(cfg.audio8_base, "http://127.0.0.1:30006")
+        self.assertEqual(cfg.audio8_model_dir, "/mnt/models/audio/audio8")
+        self.assertEqual(cfg.audio8_reference_audio,
+                         "/mnt/models/audio/audio8/reference/de_male.wav")
+        self.assertEqual(cfg.audio8_reference_text,
+                         "/mnt/models/audio/audio8/reference/de_male.txt")
+        self.assertEqual(cfg.audio8_start_script,
+                         "runtime/audio8/start-audio8.sh")
+        self.assertEqual(cfg.audio8_stop_script,
+                         "runtime/audio8/stop-audio8.sh")
+        self.assertEqual(cfg.audio8_pidfile, "runtime/audio8/audio8.pid")
+        self.assertEqual(cfg.audio8_health_path, "/healthz")
+        self.assertAlmostEqual(cfg.audio8_load_timeout_s, 900.0)
+        self.assertAlmostEqual(cfg.audio8_unload_timeout_s, 60.0)
+
+    def test_audio8_env_und_validierung(self):
+        cfg = load_config(env={
+            "AISERVER_MONITOR_AUDIO8_BASE": "http://127.0.0.1:39006",
+            "AISERVER_MONITOR_AUDIO8_MODEL_DIR": "/tmp/audio8",
+        })
+        self.assertEqual(cfg.audio8_base, "http://127.0.0.1:39006")
+        self.assertEqual(cfg.audio8_model_dir, "/tmp/audio8")
+        for feld in ("audio8_load_timeout_s", "audio8_unload_timeout_s"):
+            with self.subTest(feld=feld):
+                with self.assertRaisesRegex(ValueError, feld):
+                    Config(**{feld: 0})
+        self.assertEqual(Config(audio8_model="").audio8_model, "")
 
 
 if __name__ == "__main__":
