@@ -117,6 +117,7 @@ class ProfileCatalog:
             (config.gptoss_model, "gptoss", "chat"),
             (config.abl_model, "abl", "chat"),
             (config.qwen_tts_model, "qwen-tts", "tts"),
+            (config.audio8_model, "audio8", "tts"),
             (config.embed_model, "embed", "embedding"),
         ]
         self._profiles: list[ModelProfile] = []
@@ -270,6 +271,14 @@ class ModelLifecycle:
                     raise LifecycleConflictError(
                         "Chat-Backend laeuft noch; zuerst /v1/unload "
                         "ausfuehren.")
+                gewuenscht = tts_offen[0].backend
+                for schluessel, tts_backend in self._tts_backends().items():
+                    if schluessel == gewuenscht:
+                        continue
+                    if await self._tts_bereit(tts_backend):
+                        raise LifecycleConflictError(
+                            f"{tts_backend.label} laeuft noch; zuerst "
+                            "/v1/unload ausfuehren.")
             if chat:
                 for tts_backend in self._tts_backends().values():
                     if await self._tts_bereit(tts_backend):
@@ -433,6 +442,25 @@ class ModelLifecycle:
                 load_timeout_s=self.config.qwen_tts_load_timeout_s,
                 unload_timeout_s=self.config.qwen_tts_unload_timeout_s,
                 env_prefix="QWEN_TTS",
+            ),
+            "audio8": TTSBackend(
+                backend="audio8",
+                label="Audio8-TTS",
+                base=self.config.audio8_base,
+                model_dir=self.config.audio8_model_dir,
+                start_script=self.config.audio8_start_script,
+                stop_script=self.config.audio8_stop_script,
+                pidfile=self.config.audio8_pidfile,
+                health_path=self.config.audio8_health_path,
+                load_timeout_s=self.config.audio8_load_timeout_s,
+                unload_timeout_s=self.config.audio8_unload_timeout_s,
+                env_prefix="AUDIO8",
+                extra_env=(
+                    ("AUDIO8_REFERENCE_AUDIO",
+                     self.config.audio8_reference_audio),
+                    ("AUDIO8_REFERENCE_TEXT",
+                     self.config.audio8_reference_text),
+                ),
             ),
         }
 
