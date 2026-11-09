@@ -1,15 +1,28 @@
 """Tests fuer Audio8-Settings, Fehlerklassifikation und den Sidecar-Client."""
 
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
 import httpx
 
 from aiserver_audio.audio8 import Audio8Client, Audio8Voice
+from aiserver_audio.catalog import (audio8_installed, models_payload,
+                                    resolve_audio8_voice)
 from aiserver_audio.config import AudioSettings, load_settings
 from aiserver_audio.errors import AudioError, audio_error_body
 from aiserver_audio.tts import AudioChunk
+
+
+def _audio8_dateien(ziel: Path):
+    ziel.mkdir(parents=True, exist_ok=True)
+    for name in ("config.json", "model.safetensors",
+                 "generation_config.json", "codec.pth", "tokenizer.json",
+                 "preprocessor_config.json", "configuration_arktts.py",
+                 "modeling_arktts.py", "modeling_arktts_codec.py",
+                 "processing_arktts.py"):
+        (ziel / name).write_bytes(b"x")
 
 
 class TestAudio8SidecarSettings(unittest.TestCase):
@@ -122,3 +135,31 @@ class TestAudio8ErrorKlassifikation(unittest.TestCase):
                 self.assertEqual(
                     audio_error_body("x", code)["error"]["type"],
                     "server_error")
+
+
+class TestAudio8Catalog(unittest.TestCase):
+    def test_installed_prueft_konfiguriertes_verzeichnis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            models = Path(tmp)
+            self.assertFalse(audio8_installed(models / "audio8"))
+            _audio8_dateien(models / "audio8")
+            self.assertTrue(audio8_installed(models / "audio8"))
+
+    def test_models_payload_nutzt_audio8_model_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            models = Path(tmp)
+            ziel = models / "custom-audio8"
+            _audio8_dateien(ziel)
+            payload = models_payload(models, audio8_model_dir=ziel)
+        modelle = {m["id"]: m for m in payload["tts"]["models"]}
+        self.assertTrue(modelle["Audio8-Realistic-Air"]["installed"])
+        self.assertEqual(payload["tts"]["audio8"]["voices"][0]["id"],
+                         "de_male")
+
+    def test_voice_defaults_und_unbekannt(self):
+        for name in (None, "", "default", "audio8", "de_male",
+                     "de_DE-thorsten-medium"):
+            self.assertEqual(resolve_audio8_voice(name), "de_male")
+        with self.assertRaises(AudioError) as ctx:
+            resolve_audio8_voice("Unbekannt")
+        self.assertEqual(ctx.exception.status_code, 400)

@@ -38,6 +38,31 @@ class ChatterboxInfo:
         "grapheme_mtl_merged_expanded_v1.json", "Cangjie5_TC.json")
 
 
+@dataclass(frozen=True)
+class QwenTTSInfo:
+    id: str
+    aliases: tuple[str, ...]
+    size_mb: int
+    dirname: str
+    required_files: tuple[str, ...] = (
+        "config.json", "model.safetensors", "generation_config.json",
+        "speech_tokenizer/config.json",
+        "speech_tokenizer/model.safetensors")
+    speakers: tuple[str, ...] = (
+        "Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric",
+        "Ryan", "Aiden", "Ono_Anna", "Sohee")
+
+
+@dataclass(frozen=True)
+class Audio8Info:
+    id: str
+    aliases: tuple[str, ...]
+    size_mb: int
+    dirname: str
+    required_files: tuple[str, ...]
+    voices: tuple[str, ...] = ("de_male",)
+
+
 WHISPER_MODELS: tuple[WhisperInfo, ...] = (
     WhisperInfo("whisper-small", ("small", "whisper-1"),
                 "Systran/faster-whisper-small", 484, "small"),
@@ -66,6 +91,25 @@ DEFAULT_VOICE = "de_DE-thorsten-medium"
 
 CHATTERBOX_MODEL = ChatterboxInfo(
     "chatterbox", ("chatterbox-v3",), 3000, "chatterbox")
+
+QWEN_TTS_MODEL = QwenTTSInfo(
+    "Qwen3-TTS",
+    ("qwen3-tts", "qwen3-tts-1.7b", "qwen3-tts-12hz-1.7b-customvoice"),
+    4300,
+    "experiments/qwen",
+)
+
+AUDIO8_MODEL = Audio8Info(
+    "Audio8-Realistic-Air",
+    ("audio8", "audio8-realistic-air", "audio8-tts-realistic-air",
+     "audio8-tts"),
+    1600,
+    "audio8",
+    ("config.json", "model.safetensors", "generation_config.json",
+     "codec.pth", "tokenizer.json", "preprocessor_config.json",
+     "configuration_arktts.py", "modeling_arktts.py",
+     "modeling_arktts_codec.py", "processing_arktts.py"),
+)
 
 
 def _aufloesen(name: str | None, modelle, default: str, art: str):
@@ -106,6 +150,49 @@ def chatterbox_installed(models_dir: Path) -> bool:
                for name in CHATTERBOX_MODEL.required_files)
 
 
+def qwen_tts_dir(models_dir: Path) -> Path:
+    return Path(models_dir) / QWEN_TTS_MODEL.dirname
+
+
+def qwen_tts_installed(models_dir: Path) -> bool:
+    ziel = qwen_tts_dir(models_dir)
+    return all(_datei_ok(ziel / name)
+               for name in QWEN_TTS_MODEL.required_files)
+
+
+def resolve_qwen_voice(name: str | None) -> str:
+    """Loest die optionale Stimme auf; Piper-Defaults werden zu Vivian."""
+    gesucht = (name or "").strip().casefold()
+    if gesucht in ("", "default", DEFAULT_VOICE.casefold()):
+        return "Vivian"
+    for stimme in QWEN_TTS_MODEL.speakers:
+        if gesucht == stimme.casefold():
+            return stimme
+    raise AudioError(400, "invalid_request",
+                     f"Unbekannte Qwen3-TTS-Stimme: {name!r}")
+
+
+def audio8_dir(model_dir: Path) -> Path:
+    """Audio8 liegt direkt im konfigurierten Verzeichnis."""
+    return Path(model_dir)
+
+
+def audio8_installed(model_dir: Path) -> bool:
+    ziel = audio8_dir(model_dir)
+    return all(_datei_ok(ziel / name)
+               for name in AUDIO8_MODEL.required_files)
+
+
+def resolve_audio8_voice(name: str | None) -> str:
+    """Audio8 hat genau eine feste Referenzstimme."""
+    gesucht = (name or "").strip().casefold()
+    if gesucht in ("", "default", "audio8", DEFAULT_VOICE.casefold(),
+                   *AUDIO8_MODEL.voices):
+        return "de_male"
+    raise AudioError(400, "invalid_request",
+                     f"Unbekannte Audio8-Stimme: {name!r}")
+
+
 def _datei_ok(pfad: Path) -> bool:
     try:
         return pfad.is_file() and pfad.stat().st_size > 0
@@ -122,7 +209,10 @@ def voice_installed(models_dir: Path, info: PiperInfo) -> bool:
     return all(_datei_ok(pfad) for pfad in piper_files(models_dir, info))
 
 
-def models_payload(models_dir: Path) -> dict:
+def models_payload(models_dir: Path, *,
+                   audio8_model_dir: Path | None = None) -> dict:
+    audio8_ziel = (Path(audio8_model_dir) if audio8_model_dir is not None
+                   else Path(models_dir) / AUDIO8_MODEL.dirname)
     return {
         "whisper": {
             "default": DEFAULT_WHISPER,
@@ -141,6 +231,12 @@ def models_payload(models_dir: Path) -> dict:
                 {"id": "chatterbox",
                  "installed": chatterbox_installed(models_dir),
                  "size_mb": CHATTERBOX_MODEL.size_mb},
+                {"id": QWEN_TTS_MODEL.id,
+                 "installed": qwen_tts_installed(models_dir),
+                 "size_mb": QWEN_TTS_MODEL.size_mb},
+                {"id": AUDIO8_MODEL.id,
+                 "installed": audio8_installed(audio8_ziel),
+                 "size_mb": AUDIO8_MODEL.size_mb},
             ],
             "voices": [
                 {"id": info.id,
@@ -148,5 +244,17 @@ def models_payload(models_dir: Path) -> dict:
                  "size_mb": info.size_mb}
                 for info in PIPER_VOICES
             ],
+            "qwen3_tts": {
+                "voices": [
+                    {"id": stimme, "installed": True, "size_mb": 0}
+                    for stimme in QWEN_TTS_MODEL.speakers
+                ],
+            },
+            "audio8": {
+                "voices": [
+                    {"id": stimme, "installed": True, "size_mb": 0}
+                    for stimme in AUDIO8_MODEL.voices
+                ],
+            },
         },
     }

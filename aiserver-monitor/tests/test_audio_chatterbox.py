@@ -116,5 +116,7 @@ class TestChatterboxApp(unittest.TestCase):
     def test_modelle_enthalten_chatterbox(self):
         daten = models_payload(self.models_dir)
         ids = {m["id"]: m["installed"] for m in daten["tts"]["models"]}
-        self.assertEqual(ids, {"piper": True, "chatterbox": False})
+        self.assertEqual(ids, {"piper": True, "chatterbox": False,
+                               "Qwen3-TTS": False,
+                               "Audio8-Realistic-Air": False})
         self.assertTrue(chatterbox_installed(self.models_dir) is False)
