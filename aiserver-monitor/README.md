@@ -49,11 +49,11 @@ The SGLang server is never started, stopped or flipped by `run.sh`.
 `POST /v1/embeddings` goes to `embed_base` (default
 `http://127.0.0.1:30002`), an independent Ollama process with
 `qwen3-embedding:0.6b`. It runs on the CPU and uses no VRAM, so it works while
-Qwen, Flint or GPT-OSS occupies the GPU. The gateway treats it as a buffered
-passthrough: no job tracking, no keepalives, response unchanged. Known model
-names (Qwen alias, Flint, GPT-OSS, embedding model) and a missing/empty name are
-mapped to `embed_model`; unknown names pass through unchanged, so Ollama can
-answer with a clear "model not found".
+Qwen, Flint, GPT-OSS or Abliterated occupies the GPU. The gateway treats it as
+a buffered passthrough: no job tracking, no keepalives, response unchanged.
+Known model names (Qwen alias, Flint, GPT-OSS, Abliterated, embedding model)
+and a missing/empty name are mapped to `embed_model`; unknown names pass
+through unchanged, so Ollama can answer with a clear "model not found".
 
 ```bash
 curl http://127.0.0.1:30000/v1/embeddings \
@@ -67,6 +67,49 @@ The sidecar can also be controlled directly:
 bash runtime/embed/start-embed.sh
 bash runtime/embed/stop-embed.sh
 ```
+
+### Model lifecycle (load/unload)
+
+Pipeline clients can release and reload model weights between steps without
+restarting the gateway:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/load` | load the named models; additive |
+| `POST` | `/v1/unload` | unload the named models, or everything |
+| `GET`/`POST` | `/v1/status` | loadable names and currently loaded profiles |
+
+`POST /v1/load` accepts `{"model": "..."}`, `{"models": ["...", ...]}` or a
+bare JSON list. Names are used exactly as sent: they are the same strings the
+client passes as `model` to `/v1/embeddings`, `/v1/chat/completions`, etc. The
+gateway maps each name to its configured backend and never rewrites or trims
+it. An unknown name returns 404 and loads nothing.
+
+For clients that address a single model in the path, `POST /v1/load/<name>`
+and `POST /v1/unload/<name>` are equivalent aliases (`<name>` may contain
+`:` and `/`).
+
+Only one chat backend can be loaded at a time; requesting two returns 409.
+The embedding model can run alongside a chat model. Loading a chat model
+requires `server_control_enabled`, otherwise the request returns 503.
+`POST /v1/unload` without a body, with `{}` or `{"all": true}` unloads every
+loaded profile; with `model`/`models` it unloads only those. Unloading stops
+Qwen (the GPU server) and the GPU TTS workers (Qwen3-TTS and Audio8-TTS), but
+for Flint, GPT-OSS, Abliterated and embeddings it only sets Ollama
+`keep_alive: 0`; those processes stay up for the next load.
+
+```bash
+curl http://127.0.0.1:30000/v1/load \
+  -H 'Content-Type: application/json' \
+  -d '{"models": ["qwen3-embedding:0.6b"]}'
+curl http://127.0.0.1:30000/v1/status
+curl -X POST http://127.0.0.1:30000/v1/unload
+# Path-style alias used by some pipeline clients:
+curl -X POST http://127.0.0.1:30000/v1/load/Qwen3-TTS
+```
+
+`/v1/status` returns `profiles` (all loadable names) and `loaded` entries with
+`profile`, `backend` and `kind` (`chat`, `tts` or `embedding`).
 
 ### Audio (CPU)
 
@@ -85,7 +128,9 @@ Whisper models: `whisper-small` (default, 484 MB), `whisper-medium`
 (1528 MB) and `whisper-large-v3-turbo` (1618 MB). Piper voices:
 `de_DE-thorsten-medium` (`thorsten`, default), `de_DE-kerstin-low`
 (`kerstin`) and `de_DE-eva_k-x_low` (`eva`). Model aliases are accepted, e.g.
-`whisper-1`, `small`, `medium`, `turbo`, `large-v3-turbo`.
+`whisper-1`, `small`, `medium`, `turbo`, `large-v3-turbo`. Optional GPU TTS
+models are documented below: Qwen3-TTS and `Audio8-Realistic-Air` (0.6B,
+23 languages, 44.1 kHz).
 
 ```bash
 # One-time setup and model download (from the repo root)
@@ -268,7 +313,15 @@ variables.
   `retention_jobs_days`, `retention_series_days`, `nonstream_keepalive`,
   `gpu_cmd`, `abort_on_disconnect`, `server_control_enabled`, `server_unit`,
   `server_start_script`, `server_stop_script`, `server_process_pattern`,
-  `embed_base`, `embed_model`, `audio_base`, `audio_timeout_s`,
+  `embed_base`, `embed_model`, `embed_start_script`, `lifecycle_timeout_s`,
+  `lifecycle_unload_timeout_s`, `lifecycle_poll_s`, `qwen_tts_model`,
+  `qwen_tts_base`, `qwen_tts_model_dir`, `qwen_tts_start_script`,
+  `qwen_tts_stop_script`, `qwen_tts_pidfile`, `qwen_tts_health_path`,
+  `qwen_tts_load_timeout_s`, `qwen_tts_unload_timeout_s`, `audio8_model`,
+  `audio8_base`, `audio8_model_dir`, `audio8_reference_audio`,
+  `audio8_reference_text`, `audio8_start_script`, `audio8_stop_script`,
+  `audio8_pidfile`, `audio8_health_path`, `audio8_load_timeout_s`,
+  `audio8_unload_timeout_s`, `audio_base`, `audio_timeout_s`,
   `audio_max_upload_mb`.
 
 By default (`abort_on_disconnect = true`) the gateway watches the client
@@ -319,3 +372,78 @@ default. The first request loads the model (~8 s); subsequent synthesis is
 about 2.6x slower than realtime on eight CPU threads. Formats, limits and
 error codes are shared with Piper; a stopped worker returns `502` and a
 timeout `504`.
+
+#### Qwen3-TTS (optional, GPU)
+
+`model=Qwen3-TTS` (aliases `qwen3-tts`, `qwen3-tts-1.7b`,
+`qwen3-tts-12hz-1.7b-customvoice`) routes TTS text to a separate worker on
+`127.0.0.1:30005`. The 1.7B CustomVoice checkpoint runs on `cuda:0`; there is
+no CPU fallback. The chat backend must be unloaded first, so a pipeline step
+looks like this:
+
+```bash
+curl -X POST http://127.0.0.1:30000/v1/unload
+curl -X POST http://127.0.0.1:30000/v1/load \
+  -H 'Content-Type: application/json' -d '{"model": "Qwen3-TTS"}'
+curl http://127.0.0.1:30000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "Qwen3-TTS", "input": "Guten Tag.", "voice": "Vivian", "language": "German", "response_format": "wav"}' \
+  -o antwort.wav
+curl -X POST http://127.0.0.1:30000/v1/unload
+```
+
+Setup and model download (the checkpoint may already be under
+`/mnt/models/audio/experiments/qwen`):
+
+```bash
+bash run.sh qwen-tts-setup
+bash run.sh qwen-tts-models
+bash run.sh status
+```
+
+Voices: `Vivian` (default), `Serena`, `Uncle_Fu`, `Dylan`, `Eric`, `Ryan`,
+`Aiden`, `Ono_Anna`, `Sohee`. `language` defaults to `German`; `instruct` is
+optional. `speed` is accepted for compatibility but currently ignored by
+Qwen3-TTS. A missing checkpoint returns `503` with the
+`runtime/qwen-tts/download-models.sh` hint, a running chat backend `409`, an
+unreachable worker `502` and a timeout `504`. `/v1/unload` stops the worker
+process so the CUDA context is released.
+
+#### Audio8-TTS (optional, GPU)
+
+`model=Audio8-Realistic-Air` (aliases `audio8`, `audio8-realistic-air`,
+`audio8-tts-realistic-air`, `audio8-tts`) routes TTS text to a separate worker
+on `127.0.0.1:30006`. The 0.6B model covers 23 languages and uses a 44.1 kHz
+codec. Its only voice, `de_male`, is a fixed male reference voice; replace it
+with your own recording via `AUDIO8_REFERENCE_AUDIO` and
+`AUDIO8_REFERENCE_TEXT` (WAV plus exact transcript).
+
+Audio8 needs the GPU, so unload the chat backend first:
+
+```bash
+curl -X POST http://127.0.0.1:30000/v1/unload
+curl -X POST http://127.0.0.1:30000/v1/load \
+  -H 'Content-Type: application/json' -d '{"model": "Audio8-Realistic-Air"}'
+curl http://127.0.0.1:30000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "Audio8-Realistic-Air", "input": "Guten Tag.", "voice": "de_male", "language": "German", "response_format": "wav"}' \
+  -o antwort.wav
+curl -X POST http://127.0.0.1:30000/v1/unload
+```
+
+Setup, download and reference voice:
+
+```bash
+bash run.sh audio8-setup
+bash run.sh audio8-models
+bash run.sh status-audio8
+# or directly:
+bash runtime/audio8/make-reference.sh
+```
+
+`run.sh start` deliberately does not start the Audio8 worker; use
+`run.sh start-audio8`, `run.sh stop-audio8` and `run.sh status-audio8`. Raw
+`pcm` is resampled to the usual 24 kHz; `wav`, `mp3` and `opus` keep the native
+44.1 kHz. A missing model or reference returns `503`, a running chat backend
+`409`, an unreachable worker `502` and a timeout `504`. `/v1/unload` stops the
+worker process so the CUDA context is released.

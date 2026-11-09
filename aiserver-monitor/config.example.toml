@@ -14,6 +14,45 @@
 # embed_base = "http://127.0.0.1:30002"
 # embed_model = "qwen3-embedding:0.6b"
 
+# --- Modell-Lebenszyklus (/v1/load, /v1/unload, /v1/status) ---
+# /v1/load laedt Modellnamen additiv; /v1/unload gibt Gewichte frei (Qwen
+# wird gestoppt, Ollama-Sidecars behalten ihren Prozess). Der Embedding-
+# Sidecar wird bei Bedarf lokal gestartet; Timeouts und Poll-Takt gelten fuer
+# alle Backends. Pfade sind relativ zur Repo-Wurzel.
+# embed_start_script = "runtime/embed/start-embed.sh"
+# lifecycle_timeout_s = 900.0
+# lifecycle_unload_timeout_s = 60.0
+# lifecycle_poll_s = 0.5
+
+# --- Qwen3-TTS (optional, GPU; /v1/load, /v1/unload, /v1/audio/speech) ---
+# Der Worker laeuft nur auf der GPU, nachdem der Chat entladen wurde. Sein
+# Prozess wird bei /v1/unload gestoppt, damit der CUDA-Kontext frei wird.
+# qwen_tts_model = "Qwen3-TTS"
+# qwen_tts_base = "http://127.0.0.1:30005"
+# qwen_tts_model_dir = "/mnt/models/audio/experiments/qwen"
+# qwen_tts_start_script = "runtime/qwen-tts/start-qwen-tts.sh"
+# qwen_tts_stop_script = "runtime/qwen-tts/stop-qwen-tts.sh"
+# qwen_tts_pidfile = "runtime/qwen-tts/qwen-tts.pid"
+# qwen_tts_health_path = "/healthz"
+# qwen_tts_load_timeout_s = 900.0
+# qwen_tts_unload_timeout_s = 60.0
+
+# --- Audio8-TTS (optional, GPU; /v1/load, /v1/unload, /v1/audio/speech) ---
+# 0,6B-Modell mit 23 Sprachen und 44,1-kHz-Codec. Es nutzt eine feste
+# maennliche Referenzstimme (de_male) und laeuft wie Qwen3-TTS nur, nachdem
+# der Chat entladen wurde; /v1/unload stoppt den Worker-Prozess.
+# audio8_model = "Audio8-Realistic-Air"   # "" deaktiviert das Profil
+# audio8_base = "http://127.0.0.1:30006"
+# audio8_model_dir = "/mnt/models/audio/audio8"
+# audio8_reference_audio = "/mnt/models/audio/audio8/reference/de_male.wav"
+# audio8_reference_text = "/mnt/models/audio/audio8/reference/de_male.txt"
+# audio8_start_script = "runtime/audio8/start-audio8.sh"
+# audio8_stop_script = "runtime/audio8/stop-audio8.sh"
+# audio8_pidfile = "runtime/audio8/audio8.pid"
+# audio8_health_path = "/healthz"
+# audio8_load_timeout_s = 900.0
+# audio8_unload_timeout_s = 60.0
+
 # --- Audio (Whisper/Piper auf der CPU, nur lokal gebunden) ---
 # /v1/audio/* wird an diesen Sidecar geroutet. Uploads und Antworten werden
 # gestreamt; das Gateway puffert keine Audiodateien.
@@ -70,13 +109,20 @@
 # gptoss_stop_script = "runtime/gptoss/stop-gptoss.sh"
 # gptoss_pidfile = "runtime/gptoss/gptoss.pid"
 #
-# Modell-Alias: Clients duerfen weiterhin den Qwen-Namen senden. Laeuft Flint
-# oder GPT-OSS, schreibt das Gateway ihn auf das jeweilige Modell um; bei Qwen
-# bleibt er unveraendert. Fuer GPT-OSS setzt das Gateway zusaetzlich
-# temperature 0 und reasoning_effort "low", wenn der Client nichts vorgibt.
+# Abliterated-Backend: Qwen3-14B ohne Refusal-Verhalten, 40k Kontext, 1 Slot.
+# abl_start_script = "runtime/abl/start-abl.sh"
+# abl_stop_script = "runtime/abl/stop-abl.sh"
+# abl_pidfile = "runtime/abl/abl.pid"
+#
+# Modell-Alias: Clients duerfen weiterhin den Qwen-Namen senden. Laeuft Flint,
+# GPT-OSS oder Abliterated, schreibt das Gateway ihn auf das jeweilige Modell
+# um; bei Qwen bleibt er unveraendert. Fuer GPT-OSS setzt das Gateway
+# zusaetzlich temperature 0 und reasoning_effort "low", wenn der Client nichts
+# vorgibt.
 # model_alias = "escha-qwen38-27b-w2"
 # flint_model = "hf.co/AtomicChat/Flint-GGUF:IQ4_XS"
 # gptoss_model = "gpt-oss:20b"
+# abl_model = "hf.co/bartowski/huihui-ai_Qwen3-14B-abliterated-GGUF:Q4_K_M"
 
 # --- Chatterbox (optionaler CPU-TTS-Worker) ---
 # Der Audio-Sidecar spricht den Worker auf 127.0.0.1:30004 an.

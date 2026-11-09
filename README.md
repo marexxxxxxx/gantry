@@ -25,16 +25,17 @@ MODEL=./Qwen3.8-27B-Escha-W2 OTP=1 bash runtime/sglang/serve.sh
 
 Details, GPU profiles and troubleshooting: [`runtime/sglang/INSTALL.md`](runtime/sglang/INSTALL.md).
 
-**Switch the backend (Qwen ↔ Flint ↔ GPT-OSS):**
+**Switch the backend (Qwen ↔ Flint ↔ GPT-OSS ↔ Abliterated):**
 
 ```bash
 bash server.sh start flint   # Flint (Ollama, 2 parallel slots × 32k) on 30001
 bash server.sh switch gptoss # GPT-OSS 20B (Ollama, 64k, 1 slot) on 30001
+bash server.sh switch abl    # Qwen3-14B Abliterated (Ollama, 40k, 1 slot) on 30001
 bash server.sh switch qwen   # back to Qwen/SGLang
 bash server.sh status        # shows all backends
 ```
 
-Both backends listen on the same upstream port `127.0.0.1:30001`, so the
+All backends listen on the same upstream port `127.0.0.1:30001`, so the
 gateway on `:30000` and all clients keep working unchanged. The switch stops
 the running backend, waits for the port to be released and starts the other
 one. Flint runs as a separate `ollama serve` process
@@ -43,16 +44,22 @@ system Ollama's models on `:11434` when it starts, freeing the GPU. Configure it
 with `FLINT_CTX` (default 32768), `FLINT_PARALLEL` (default 2) and
 `FLINT_KEEP_ALIVE` (default -1). GPT-OSS works the same way
 (`runtime/gptoss/start-gptoss.sh`) with `GPTOSS_CTX` (default 65536),
-`GPTOSS_PARALLEL` (default 1) and `GPTOSS_KEEP_ALIVE` (default -1). The same
-switch is in the dashboard's **Server** tab.
+`GPTOSS_PARALLEL` (default 1) and `GPTOSS_KEEP_ALIVE` (default -1).
+Abliterated is Qwen3-14B with the refusal direction removed (Q4_K_M, ~9 GB)
+and runs via `runtime/abl/start-abl.sh` with `ABL_CTX` (default 40960),
+`ABL_PARALLEL` (default 1), `ABL_KEEP_ALIVE` (default -1) and
+`ABL_KV_CACHE_TYPE` (default q8_0 so 40k fits in 16 GB VRAM); download it once
+with `bash runtime/abl/download-model.sh`. The same switch is in the
+dashboard's **Server** tab.
 
-Clients can keep their model name: while Flint or GPT-OSS runs, the gateway
-maps the Qwen alias, the Flint model name and the GPT-OSS model name
-(`model_alias`, `flint_model`, `gptoss_model`) to the active backend's model,
-so the dashboard switch is authoritative. For GPT-OSS it also sets
-`temperature: 0` and `reasoning_effort: "low"` unless the client specifies
-them. Both Ollama backends show live values in the dashboard (requests, tok/s,
-context, VRAM) even without SGLang `/metrics`.
+Clients can keep their model name: while Flint, GPT-OSS or Abliterated runs,
+the gateway maps the Qwen alias, the Flint model name, the GPT-OSS model name
+and the Abliterated model name (`model_alias`, `flint_model`, `gptoss_model`,
+`abl_model`) to the active backend's model, so the dashboard switch is
+authoritative. For GPT-OSS it also sets `temperature: 0` and
+`reasoning_effort: "low"` unless the client specifies them. All Ollama
+backends show live values in the dashboard (requests, tok/s, context, VRAM)
+even without SGLang `/metrics`.
 
 **Embeddings on the CPU:**
 
@@ -117,7 +124,8 @@ voices. Direct control: `runtime/audio/start-audio.sh`,
 `runtime/audio/stop-audio.sh`, `runtime/audio/selftest.sh`. Tuning:
 `AUDIO_MODELS_DIR`, `AUDIO_THREADS`, `AUDIO_PRELOAD`, `AUDIO_MODEL_CACHE`,
 `AUDIO_MAX_QUEUE`, `AUDIO_STT_TIMEOUT`, `AUDIO_TTS_TIMEOUT`,
-`AUDIO_MAX_UPLOAD_MB`, `AUDIO_HOST`, `AUDIO_PORT`.
+`AUDIO_MAX_UPLOAD_MB`, `AUDIO_HOST`, `AUDIO_PORT`. For GPU TTS,
+`Audio8-Realistic-Air` (0.6B, 23 languages, 44.1 kHz) is documented below.
 
 ## Table of contents
 
@@ -196,3 +204,43 @@ Model aliases are `chatterbox` and `chatterbox-v3`; the only voice is
 On eight CPU threads Chatterbox is roughly 2.6x slower than realtime and the
 first request loads the model in about 8 seconds. A stopped worker returns
 `502`, a timeout `504`.
+
+### Audio8 Realistic Air (optional, GPU)
+
+[`Edge0/Audio8-TTS-Realistic-Air`](https://huggingface.co/Edge0/Audio8-TTS-Realistic-Air)
+is an additional TTS model: 0.6B parameters, 23 languages and a 44.1 kHz
+codec. It runs in its own GPU worker on `127.0.0.1:30006`. The default voice
+`de_male` is a fixed, natural-sounding male reference voice; replace it with
+your own recording by pointing `AUDIO8_REFERENCE_AUDIO` and
+`AUDIO8_REFERENCE_TEXT` at a WAV file and its exact transcript.
+
+Audio8 needs the GPU, so unload the chat backend first (it occupies about
+15 GB of VRAM). A pipeline step looks like this:
+
+```bash
+curl -X POST http://127.0.0.1:30000/v1/unload
+curl -X POST http://127.0.0.1:30000/v1/load \
+  -H 'Content-Type: application/json' -d '{"model": "Audio8-Realistic-Air"}'
+curl http://127.0.0.1:30000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "Audio8-Realistic-Air", "input": "Guten Tag.", "voice": "de_male", "language": "German", "response_format": "wav"}' \
+  -o antwort.wav
+curl -X POST http://127.0.0.1:30000/v1/unload
+```
+
+Setup, model download and reference voice:
+
+```bash
+bash runtime/audio8/setup.sh
+bash runtime/audio8/download-models.sh
+bash runtime/audio8/make-reference.sh   # creates the default de_male voice
+```
+
+Or through `run.sh`: `bash aiserver-monitor/run.sh audio8-setup`,
+`audio8-models`, `start-audio8`, `stop-audio8` and `status-audio8`. The normal
+`start` command deliberately does not start the Audio8 worker. Model aliases
+are `audio8`, `audio8-realistic-air`, `audio8-tts-realistic-air` and
+`audio8-tts`. Raw `pcm` output is resampled to the usual 24 kHz; `wav`, `mp3`
+and `opus` keep the native 44.1 kHz. A missing model or reference returns
+`503`, a running chat backend `409`, an unreachable worker `502` and a timeout
+`504`. `/v1/unload` stops the worker so the CUDA context is released.

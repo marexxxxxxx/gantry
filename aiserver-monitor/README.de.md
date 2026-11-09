@@ -50,12 +50,13 @@ oder umgestellt.
 `POST /v1/embeddings` geht an `embed_base` (Default
 `http://127.0.0.1:30002`), einen eigenstaendigen Ollama-Prozess mit
 `qwen3-embedding:0.6b`. Er laeuft auf der CPU und belegt keinen VRAM,
-funktioniert also, waehrend Qwen, Flint oder GPT-OSS die GPU nutzt. Das Gateway
-behandelt ihn als gepufferten Passthrough: kein Job-Tracking, keine
-Keepalives, Antwort unveraendert. Bekannte Modellnamen (Qwen-Alias, Flint,
-GPT-OSS, Embedding-Modell) und ein fehlender/leerer Name werden auf
-`embed_model` abgebildet; unbekannte Namen laufen unveraendert durch, damit
-Ollama mit einem klaren „model not found“ antworten kann.
+funktioniert also, waehrend Qwen, Flint, GPT-OSS oder Abliterated die GPU
+nutzt. Das Gateway behandelt ihn als gepufferten Passthrough: kein
+Job-Tracking, keine Keepalives, Antwort unveraendert. Bekannte Modellnamen
+(Qwen-Alias, Flint, GPT-OSS, Abliterated, Embedding-Modell) und ein
+fehlender/leerer Name werden auf `embed_model` abgebildet; unbekannte Namen
+laufen unveraendert durch, damit Ollama mit einem klaren „model not found“
+antworten kann.
 
 ```bash
 curl http://127.0.0.1:30000/v1/embeddings \
@@ -69,6 +70,52 @@ Der Sidecar laesst sich auch direkt steuern:
 bash runtime/embed/start-embed.sh
 bash runtime/embed/stop-embed.sh
 ```
+
+### Modell-Lebenszyklus (Laden/Entladen)
+
+Pipeline-Clients können zwischen Schritten Modellgewichte freigeben und neu
+laden, ohne das Gateway neu zu starten:
+
+| Methode | Pfad | Zweck |
+|---|---|---|
+| `POST` | `/v1/load` | genannte Modelle laden; additiv |
+| `POST` | `/v1/unload` | genannte Modelle oder alles entladen |
+| `GET`/`POST` | `/v1/status` | ladbare Namen und aktuell geladene Profile |
+
+`POST /v1/load` akzeptiert `{"model": "..."}`, `{"models": ["...", ...]}` oder
+eine reine JSON-Liste. Die Namen werden exakt so verwendet, wie sie gesendet
+werden: Es sind dieselben Strings, die der Client als `model` an
+`/v1/embeddings`, `/v1/chat/completions` usw. schickt. Das Gateway ordnet jeden
+Namen seinem konfigurierten Backend zu und schreibt oder trimmt ihn nie um.
+Ein unbekannter Name liefert 404 und lädt nichts.
+
+Für Clients, die ein einzelnes Modell im Pfad adressieren, sind
+`POST /v1/load/<name>` und `POST /v1/unload/<name>` gleichwertige Aliase
+(`<name>` darf `:` und `/` enthalten).
+
+Gleichzeitig kann nur ein Chat-Backend geladen sein; zwei Chat-Modelle im
+selben Request ergeben 409. Das Embedding-Modell darf parallel zu einem
+Chat-Modell laufen. Das Laden eines Chat-Modells setzt
+`server_control_enabled` voraus, sonst antwortet der Endpunkt mit 503.
+`POST /v1/unload` ohne Body, mit `{}` oder `{"all": true}` entlädt alle
+geladenen Profile; mit `model`/`models` nur die genannten. Beim Entladen werden
+Qwen (der GPU-Server) und die GPU-TTS-Worker (Qwen3-TTS und Audio8-TTS)
+gestoppt; bei Flint, GPT-OSS, Abliterated und Embeddings wird nur Ollama
+`keep_alive: 0` gesetzt, die Prozesse bleiben für den nächsten Ladevorgang am
+Leben.
+
+```bash
+curl http://127.0.0.1:30000/v1/load \
+  -H 'Content-Type: application/json' \
+  -d '{"models": ["qwen3-embedding:0.6b"]}'
+curl http://127.0.0.1:30000/v1/status
+curl -X POST http://127.0.0.1:30000/v1/unload
+# Pfad-Alias, den manche Pipeline-Clients verwenden:
+curl -X POST http://127.0.0.1:30000/v1/load/Qwen3-TTS
+```
+
+`/v1/status` liefert `profiles` (alle ladbaren Namen) und `loaded`-Einträge mit
+`profile`, `backend` und `kind` (`chat`, `tts` oder `embedding`).
 
 ### Audio (CPU)
 
@@ -87,7 +134,9 @@ Whisper-Modelle: `whisper-small` (Default, 484 MB), `whisper-medium`
 (1528 MB) und `whisper-large-v3-turbo` (1618 MB). Piper-Stimmen:
 `de_DE-thorsten-medium` (`thorsten`, Default), `de_DE-kerstin-low`
 (`kerstin`) und `de_DE-eva_k-x_low` (`eva`). Modell-Aliase werden akzeptiert,
-z. B. `whisper-1`, `small`, `medium`, `turbo`, `large-v3-turbo`.
+z. B. `whisper-1`, `small`, `medium`, `turbo`, `large-v3-turbo`. Optionale
+GPU-TTS-Modelle sind weiter unten dokumentiert: Qwen3-TTS und
+`Audio8-Realistic-Air` (0,6B, 23 Sprachen, 44,1 kHz).
 
 ```bash
 # Einmalig einrichten und Modelle laden (ab Repo-Wurzel)
@@ -272,7 +321,15 @@ Umgebungsvariablen.
   `retention_jobs_days`, `retention_series_days`, `nonstream_keepalive`,
   `gpu_cmd`, `abort_on_disconnect`, `server_control_enabled`, `server_unit`,
   `server_start_script`, `server_stop_script`, `server_process_pattern`,
-  `embed_base`, `embed_model`, `audio_base`, `audio_timeout_s`,
+  `embed_base`, `embed_model`, `embed_start_script`, `lifecycle_timeout_s`,
+  `lifecycle_unload_timeout_s`, `lifecycle_poll_s`, `qwen_tts_model`,
+  `qwen_tts_base`, `qwen_tts_model_dir`, `qwen_tts_start_script`,
+  `qwen_tts_stop_script`, `qwen_tts_pidfile`, `qwen_tts_health_path`,
+  `qwen_tts_load_timeout_s`, `qwen_tts_unload_timeout_s`, `audio8_model`,
+  `audio8_base`, `audio8_model_dir`, `audio8_reference_audio`,
+  `audio8_reference_text`, `audio8_start_script`, `audio8_stop_script`,
+  `audio8_pidfile`, `audio8_health_path`, `audio8_load_timeout_s`,
+  `audio8_unload_timeout_s`, `audio_base`, `audio_timeout_s`,
   `audio_max_upload_mb`.
 
 Standardmäßig (`abort_on_disconnect = true`) überwacht das Gateway die
@@ -325,3 +382,80 @@ der Standard. Die erste Anfrage lädt das Modell (~8 s); danach ist die
 Synthese auf acht CPU-Threads etwa 2,6x langsamer als Echtzeit. Formate,
 Limits und Fehlercodes gelten wie bei Piper; ein gestoppter Worker liefert
 `502`, ein Timeout `504`.
+
+#### Qwen3-TTS (optional, GPU)
+
+`model=Qwen3-TTS` (Aliase `qwen3-tts`, `qwen3-tts-1.7b`,
+`qwen3-tts-12hz-1.7b-customvoice`) leitet TTS-Text an einen eigenen Worker
+auf `127.0.0.1:30005`. Das 1.7B-CustomVoice-Checkpoint läuft auf `cuda:0`;
+einen CPU-Fallback gibt es nicht. Das Chat-Backend muss zuerst entladen
+werden, ein Pipeline-Schritt sieht so aus:
+
+```bash
+curl -X POST http://127.0.0.1:30000/v1/unload
+curl -X POST http://127.0.0.1:30000/v1/load \
+  -H 'Content-Type: application/json' -d '{"model": "Qwen3-TTS"}'
+curl http://127.0.0.1:30000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "Qwen3-TTS", "input": "Guten Tag.", "voice": "Vivian", "language": "German", "response_format": "wav"}' \
+  -o antwort.wav
+curl -X POST http://127.0.0.1:30000/v1/unload
+```
+
+Setup und Modelldownload (das Checkpoint kann bereits unter
+`/mnt/models/audio/experiments/qwen` liegen):
+
+```bash
+bash run.sh qwen-tts-setup
+bash run.sh qwen-tts-models
+bash run.sh status
+```
+
+Stimmen: `Vivian` (Default), `Serena`, `Uncle_Fu`, `Dylan`, `Eric`, `Ryan`,
+`Aiden`, `Ono_Anna`, `Sohee`. `language` ist standardmäßig `German`;
+`instruct` ist optional. `speed` wird aus Kompatibilitätsgründen akzeptiert,
+von Qwen3-TTS aber derzeit ignoriert. Ein fehlendes Checkpoint liefert `503`
+mit dem Hinweis auf `runtime/qwen-tts/download-models.sh`, ein laufendes
+Chat-Backend `409`, einen nicht erreichbaren Worker `502` und ein Timeout
+`504`. `/v1/unload` stoppt den Worker-Prozess, damit der CUDA-Kontext frei
+wird.
+
+#### Audio8-TTS (optional, GPU)
+
+`model=Audio8-Realistic-Air` (Aliase `audio8`, `audio8-realistic-air`,
+`audio8-tts-realistic-air`, `audio8-tts`) leitet TTS-Text an einen eigenen
+Worker auf `127.0.0.1:30006`. Das 0,6B-Modell deckt 23 Sprachen ab und nutzt
+einen 44,1-kHz-Codec. Die einzige Stimme `de_male` ist eine feste männliche
+Referenzstimme; für eine eigene Aufnahme `AUDIO8_REFERENCE_AUDIO` und
+`AUDIO8_REFERENCE_TEXT` auf eine WAV-Datei und ihr exaktes Transkript setzen.
+
+Audio8 braucht die GPU, deshalb zuerst das Chat-Backend entladen:
+
+```bash
+curl -X POST http://127.0.0.1:30000/v1/unload
+curl -X POST http://127.0.0.1:30000/v1/load \
+  -H 'Content-Type: application/json' -d '{"model": "Audio8-Realistic-Air"}'
+curl http://127.0.0.1:30000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "Audio8-Realistic-Air", "input": "Guten Tag.", "voice": "de_male", "language": "German", "response_format": "wav"}' \
+  -o antwort.wav
+curl -X POST http://127.0.0.1:30000/v1/unload
+```
+
+Setup, Download und Referenzstimme:
+
+```bash
+bash run.sh audio8-setup
+bash run.sh audio8-models
+bash run.sh status-audio8
+# oder direkt:
+bash runtime/audio8/make-reference.sh
+```
+
+`run.sh start` startet den Audio8-Worker absichtlich nicht; dafür gibt es
+`run.sh start-audio8`, `run.sh stop-audio8` und `run.sh status-audio8`. Rohes
+`pcm` wird wie üblich auf 24 kHz resampelt; `wav`, `mp3` und `opus` behalten
+die nativen 44,1 kHz. Ein fehlendes Modell oder eine fehlende Referenz liefert
+`503`, ein laufendes Chat-Backend `409`, einen nicht erreichbaren Worker `502`
+und ein Timeout `504`. `/v1/unload` stoppt den Worker-Prozess, damit der
+CUDA-Kontext frei wird.
