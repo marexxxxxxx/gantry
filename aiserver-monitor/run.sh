@@ -62,13 +62,15 @@ HEALTH="http://127.0.0.1:${PORT}/healthz"
 EMBED_BASE="${AISERVER_MONITOR_EMBED_BASE:-http://127.0.0.1:30002}"
 AUDIO_BASE="${AISERVER_MONITOR_AUDIO_BASE:-http://127.0.0.1:30003}"
 CHATTERBOX_BASE="${AISERVER_MONITOR_CHATTERBOX_BASE:-http://127.0.0.1:30004}"
+QWEN_TTS_BASE="${AISERVER_MONITOR_QWEN_TTS_BASE:-http://127.0.0.1:30005}"
+AUDIO8_BASE="${AISERVER_MONITOR_AUDIO8_BASE:-http://127.0.0.1:30006}"
 # 20 s sind die Grenze aus dem Muster. Ueberschreibbar, damit ein Test nicht
 # 20 s auf das Beenden wartet.
 STOP_GRACE="${STOP_GRACE:-20}"
 START_WAIT="${START_WAIT:-20}"
 
 usage() {
-    echo "usage: $0 {start|stop|status|restart|audio-setup|audio-models|chatterbox-setup|chatterbox-models [args...]}"
+    echo "usage: $0 {start|stop|status|restart|audio-setup|audio-models|chatterbox-setup|chatterbox-models|qwen-tts-setup|qwen-tts-models|audio8-setup|audio8-models [args...]}"
     echo "  start     Gateway im Hintergrund starten und auf /healthz warten"
     echo "  stop      Gateway beenden (TERM, ${STOP_GRACE}s, dann KILL)"
     echo "  status    Zustand lesen, Exit 1 wenn das Gateway nicht laeuft"
@@ -77,9 +79,15 @@ usage() {
     echo "  audio-models  Whisper/Piper-Modelle verwalten (--all, --check, ...)"
     echo "  chatterbox-setup   Chatterbox-venv und -Abhaengigkeiten installieren"
     echo "  chatterbox-models  Chatterbox-Modelldateien herunterladen"
+    echo "  qwen-tts-setup     Qwen3-TTS-venv mit CUDA-Torch installieren"
+    echo "  qwen-tts-models    Qwen3-TTS-Modelldateien pruefen/herunterladen"
+    echo "  audio8-setup       Audio8-venv mit CUDA-Torch installieren"
+    echo "  audio8-models      Audio8-Modell und Referenzstimme pruefen/herunterladen"
     echo "Umgebung: AISERVER_MONITOR_LISTEN_PORT=$PORT PIDFILE=$PIDFILE"
     echo "          AUDIO_BASE=$AUDIO_BASE"
     echo "          CHATTERBOX_BASE=$CHATTERBOX_BASE"
+    echo "          QWEN_TTS_BASE=$QWEN_TTS_BASE"
+    echo "          AUDIO8_BASE=$AUDIO8_BASE"
     exit 2
 }
 
@@ -254,6 +262,66 @@ chatterbox_models() {
     bash "$RUNTIME/chatterbox/download-models.sh" "$@"
 }
 
+start_qwen_tts() {
+    local script="$RUNTIME/qwen-tts/start-qwen-tts.sh"
+    [ -f "$script" ] || return 0
+    if ! bash "$script"; then
+        echo "[aiserver-monitor] WARNUNG: Qwen3-TTS-Worker startet nicht; model=Qwen3-TTS bleibt ohne Upstream." >&2
+    fi
+}
+
+stop_qwen_tts() {
+    local script="$RUNTIME/qwen-tts/stop-qwen-tts.sh"
+    [ -f "$script" ] || return 0
+    bash "$script" || true
+}
+
+status_qwen_tts() {
+    if ! curl -sf -m 2 -o /dev/null "${QWEN_TTS_BASE%/}/healthz" 2>/dev/null; then
+        echo "[aiserver-monitor] Qwen3-TTS-Worker laeuft nicht; model=Qwen3-TTS hat keinen Upstream"
+        return 0
+    fi
+    echo "[aiserver-monitor] Qwen3-TTS-Worker (GPU) laeuft auf $QWEN_TTS_BASE"
+}
+
+qwen_tts_setup() {
+    bash "$RUNTIME/qwen-tts/setup.sh"
+}
+
+qwen_tts_models() {
+    bash "$RUNTIME/qwen-tts/download-models.sh" "$@"
+}
+
+start_audio8() {
+    local script="$RUNTIME/audio8/start-audio8.sh"
+    [ -f "$script" ] || return 0
+    if ! bash "$script"; then
+        echo "[aiserver-monitor] WARNUNG: Audio8-TTS-Worker startet nicht; model=Audio8-Realistic-Air bleibt ohne Upstream." >&2
+    fi
+}
+
+stop_audio8() {
+    local script="$RUNTIME/audio8/stop-audio8.sh"
+    [ -f "$script" ] || return 0
+    bash "$script" || true
+}
+
+status_audio8() {
+    if ! curl -sf -m 2 -o /dev/null "${AUDIO8_BASE%/}/healthz" 2>/dev/null; then
+        echo "[aiserver-monitor] Audio8-TTS-Worker (GPU) laeuft nicht; model=Audio8-Realistic-Air hat keinen Upstream"
+        return 0
+    fi
+    echo "[aiserver-monitor] Audio8-TTS-Worker (GPU) laeuft auf $AUDIO8_BASE"
+}
+
+audio8_setup() {
+    bash "$RUNTIME/audio8/setup.sh"
+}
+
+audio8_models() {
+    bash "$RUNTIME/audio8/download-models.sh" "$@"
+}
+
 start() {
     start_embed
     start_audio
@@ -319,6 +387,8 @@ stop() {
         rm -f "$PIDFILE"
         stop_audio
         stop_chatterbox
+        stop_qwen_tts
+        stop_audio8
         stop_embed
         return 0
     fi
@@ -363,6 +433,8 @@ stop() {
     fi
     stop_audio
     stop_chatterbox
+    stop_qwen_tts
+    stop_audio8
     stop_embed
     echo "[aiserver-monitor] gestoppt"
 }
@@ -386,6 +458,8 @@ status() {
     fi
     status_audio
     status_chatterbox
+    status_qwen_tts
+    status_audio8
 }
 
 audio_setup() {
@@ -405,5 +479,12 @@ case "${1:-}" in
     audio-models) shift; audio_models "$@" ;;
     chatterbox-setup) chatterbox_setup ;;
     chatterbox-models) shift; chatterbox_models "$@" ;;
+    qwen-tts-setup) qwen_tts_setup ;;
+    qwen-tts-models) shift; qwen_tts_models "$@" ;;
+    audio8-setup)  audio8_setup ;;
+    audio8-models) shift; audio8_models "$@" ;;
+    start-audio8) start_audio8 ;;
+    stop-audio8)  stop_audio8 ;;
+    status-audio8) status_audio8 ;;
     *)            usage ;;
 esac

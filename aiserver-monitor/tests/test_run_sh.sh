@@ -58,6 +58,16 @@ export QWEN_TTS_PIDFILE="$WORKDIR/qwen-tts.pid"
 export QWEN_TTS_LOG="$WORKDIR/qwen-tts.log"
 export QWEN_TTS_VENV="$WORKDIR/qwen-tts-venv"
 export QWEN_TTS_MODEL_DIR="$WORKDIR/qwen-tts-model"
+# Audio8 bekommt eigene Pfade. Der Test startet den GPU-Worker nicht; er
+# prueft nur Skripte, Syntax und die Status-/Usage-Ausgabe.
+export AISERVER_MONITOR_AUDIO8_BASE="http://127.0.0.1:39006"
+export AUDIO8_PORT=39006
+export AUDIO8_PIDFILE="$WORKDIR/audio8.pid"
+export AUDIO8_LOG="$WORKDIR/audio8.log"
+export AUDIO8_VENV="$WORKDIR/audio8-venv"
+export AUDIO8_MODEL_DIR="$WORKDIR/audio8-model"
+export AUDIO8_REFERENCE_AUDIO="$WORKDIR/ref.wav"
+export AUDIO8_REFERENCE_TEXT="$WORKDIR/ref.txt"
 # Auch der Embedding-Sidecar braucht ein eigenes PID-File: `run.sh stop` ruft
 # stop-embed.sh auf und darf den Produktions-Ollama auf 30002 nicht beenden.
 export AISERVER_MONITOR_EMBED_BASE="http://127.0.0.1:39002"
@@ -143,6 +153,8 @@ case "$out" in *audio-setup*) pass "usage nennt audio-setup" ;; *) fail "usage n
 case "$out" in *audio-models*) pass "usage nennt audio-models" ;; *) fail "usage nennt audio-models nicht: $out" ;; esac
 case "$out" in *qwen-tts-setup*) pass "usage nennt qwen-tts-setup" ;; *) fail "usage nennt qwen-tts-setup nicht: $out" ;; esac
 case "$out" in *qwen-tts-models*) pass "usage nennt qwen-tts-models" ;; *) fail "usage nennt qwen-tts-models nicht: $out" ;; esac
+case "$out" in *audio8-setup*) pass "usage nennt audio8-setup" ;; *) fail "usage nennt audio8-setup nicht: $out" ;; esac
+case "$out" in *audio8-models*) pass "usage nennt audio8-models" ;; *) fail "usage nennt audio8-models nicht: $out" ;; esac
 
 # --- Vorbedingung: nichts laeuft --------------------------------------------
 
@@ -232,6 +244,11 @@ if curl -sf -o /dev/null "http://127.0.0.1:39003/healthz"; then
 else
     fail "Audio-Sidecar healthz auf 39003 nicht erreichbar"
 fi
+if curl -sf -m 2 -o /dev/null "http://127.0.0.1:39006/healthz" 2>/dev/null; then
+    fail "Audio8-Worker wurde von start unerwartet gestartet"
+else
+    pass "start startet den Audio8-Worker nicht"
+fi
 AUDIO_PID=$(head -n 1 -- "$AUDIO_PIDFILE" 2>/dev/null || true)
 if [ -n "$AUDIO_PID" ] && kill -0 "$AUDIO_PID" 2>/dev/null; then
     pass "Audio-Sidecar-Prozess laeuft (PID $AUDIO_PID)"
@@ -276,6 +293,7 @@ case "$out" in *"$PID1"*) pass "status nennt die PID" ;; *) fail "status nennt k
 case "$out" in *"$TEST_PORT"*) pass "status nennt den Port" ;; *) fail "status nennt keinen Port: $out" ;; esac
 case "$out" in *"Audio-Sidecar (CPU) laeuft"*) pass "status meldet den Audio-Sidecar" ;; *) fail "status meldet den Audio-Sidecar nicht: $out" ;; esac
 case "$out" in *"Qwen3-TTS-Worker"*) pass "status meldet den Qwen3-TTS-Worker" ;; *) fail "status meldet den Qwen3-TTS-Worker nicht: $out" ;; esac
+case "$out" in *"Audio8-TTS-Worker"*) pass "status meldet den Audio8-TTS-Worker" ;; *) fail "status meldet den Audio8-TTS-Worker nicht: $out" ;; esac
 PID_STILL=$(head -n 1 -- "$PIDFILE" 2>/dev/null || true)
 if [ "$PID_STILL" = "$PID1" ]; then pass "status hat den Prozess nicht angefasst"; else fail "status hat den Prozess ersetzt: $PID1 zu $PID_STILL"; fi
 
