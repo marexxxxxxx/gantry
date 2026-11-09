@@ -1,11 +1,14 @@
 """Lade- und Lebenszykluslogik des Audio8-TTS-Workers."""
 
 import gc
+import logging
 import threading
 from pathlib import Path
 
 from .config import Audio8Settings
 from .errors import Audio8TTSError
+
+logger = logging.getLogger(__name__)
 
 _DOWNLOAD_HINWEIS = "runtime/audio8/download-models.sh"
 
@@ -135,3 +138,63 @@ class Audio8Engine:
             return
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def _generieren(self, inputs: dict, max_new_tokens: int, generator):
+        return self._model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=self._settings.temperature,
+            top_p=self._settings.top_p,
+            top_k=self._settings.top_k,
+            do_sample=True,
+            generator=generator,
+            return_dict_in_generate=True,
+        )
+
+    def synthesize(self, text: str, *, language: str = "German"
+                   ) -> tuple[bytes, int]:
+        """Synthetisiert einen Satz mit der festen Referenzstimme."""
+        import numpy as np
+        import torch
+
+        logger.info("audio8 synth language=%s chars=%d", language, len(text))
+        with self._lock:
+            try:
+                self._laden()
+                inputs = self._processor(
+                    text=[text],
+                    reference_audio=[self._reference_audio],
+                    reference_text=[self._reference_text],
+                    return_tensors="pt",
+                )
+                inputs = {
+                    name: value.to(self._settings.device)
+                    for name, value in inputs.items()
+                }
+                generator = torch.Generator(
+                    device=self._settings.device).manual_seed(
+                        self._settings.seed)
+                output = self._generieren(
+                    inputs, self._settings.max_new_tokens, generator)
+                if (not bool(output.finished[0])
+                        and self._settings.retry_max_new_tokens
+                        > self._settings.max_new_tokens):
+                    output = self._generieren(
+                        inputs, self._settings.retry_max_new_tokens,
+                        generator)
+                if not bool(output.finished[0]):
+                    logger.warning(
+                        "audio8 synthese ohne EOS; liefere vorhandenes Audio")
+                waveforms, lengths = self._model.decode_audio(output.codes)
+                waveform = waveforms[0, :int(lengths[0])]
+                pcm = (waveform.float().cpu().numpy().clip(-1.0, 1.0)
+                       * 32767).astype(np.int16).tobytes()
+                return pcm, int(self._model.config.codec_sample_rate)
+            except Audio8TTSError:
+                raise
+            except Exception as exc:
+                if _ist_oom(exc):
+                    raise Audio8TTSError(
+                        503, "vram_exhausted",
+                        "Audio8-TTS: nicht genug VRAM") from None
+                raise

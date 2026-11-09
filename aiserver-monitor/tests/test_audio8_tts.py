@@ -146,3 +146,100 @@ class TestAudio8EngineLaden(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "model_unavailable")
         self.assertIn("runtime/audio8/download-models.sh",
                       ctx.exception.message)
+
+
+import numpy as np
+import torch
+
+
+class FakeTensor:
+    def to(self, _device):
+        return self
+
+
+class FakeProcessor:
+    def __init__(self):
+        self.kwargs = None
+
+    def __call__(self, **kwargs):
+        self.kwargs = kwargs
+        return {"input_ids": FakeTensor()}
+
+
+class FakeOutput:
+    def __init__(self, *, finished=True):
+        self.finished = [finished]
+        self.code_lengths = [4]
+        self.codes = object()
+
+
+class FakeSynthModel(FakeCodecModel):
+    def __init__(self, *, finished=(True,)):
+        super().__init__()
+        self.finished = list(finished)
+        self.generate_calls = []
+        self.config = type("Config", (), {"codec_sample_rate": 44100})()
+
+    def generate(self, **kwargs):
+        self.generate_calls.append(kwargs)
+        return FakeOutput(finished=self.finished.pop(0))
+
+    def decode_audio(self, _codes):
+        return torch.tensor([[0.0, 0.5, -0.5]]), [3]
+
+
+class TestAudio8EngineSynthese(unittest.TestCase):
+    def _engine(self, tmp, model):
+        audio, text = _referenz(tmp)
+        settings = Audio8Settings(
+            model_dir=tmp, reference_audio=audio, reference_text=text,
+            device="cpu")
+        processor = FakeProcessor()
+        engine = Audio8Engine(
+            settings, processor_loader=lambda _s: processor,
+            model_loader=lambda _s: model,
+            audio_probe=lambda _p: None)
+        return engine, processor
+
+    def test_synthese_nutzt_referenz_und_liefert_44100_pcm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = FakeSynthModel()
+            engine, processor = self._engine(Path(tmp), model)
+            pcm, sr = engine.synthesize("Guten Tag.", language="German")
+        self.assertEqual(sr, 44100)
+        self.assertEqual(np.frombuffer(pcm, dtype=np.int16).tolist(),
+                         [0, 16383, -16383])
+        self.assertEqual(processor.kwargs["text"], ["Guten Tag."])
+        self.assertEqual(processor.kwargs["reference_text"], ["Guten Tag."])
+        self.assertEqual(processor.kwargs["return_tensors"], "pt")
+        self.assertEqual(model.generate_calls[0]["max_new_tokens"], 1024)
+        self.assertTrue(model.generate_calls[0]["do_sample"])
+
+    def test_unvollstaendig_wird_einmal_mit_2000_wiederholt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = FakeSynthModel(finished=(False, True))
+            engine, _ = self._engine(Path(tmp), model)
+            pcm, sr = engine.synthesize("Guten Tag.")
+        self.assertEqual((sr, len(pcm)), (44100, 6))
+        self.assertEqual(
+            [c["max_new_tokens"] for c in model.generate_calls],
+            [1024, 2000])
+
+    def test_dauerhaft_unvollstaendig_liefert_vorhandenes_audio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = FakeSynthModel(finished=(False, False))
+            engine, _ = self._engine(Path(tmp), model)
+            pcm, sr = engine.synthesize("Guten Tag.")
+        self.assertEqual((sr, len(pcm)), (44100, 6))
+        self.assertEqual(len(model.generate_calls), 2)
+
+    def test_oom_bei_synthese_ist_503(self):
+        class OomModel(FakeSynthModel):
+            def generate(self, **_kwargs):
+                raise RuntimeError("CUDA out of memory")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, _ = self._engine(Path(tmp), OomModel())
+            with self.assertRaises(Audio8TTSError) as ctx:
+                engine.synthesize("Guten Tag.")
+        self.assertEqual(ctx.exception.code, "vram_exhausted")
