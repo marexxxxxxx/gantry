@@ -6,7 +6,9 @@ import unittest
 from pathlib import Path
 
 import httpx
+from fastapi.testclient import TestClient
 
+from aiserver_audio.app import create_audio_app
 from aiserver_audio.audio8 import Audio8Client, Audio8Voice
 from aiserver_audio.catalog import (audio8_installed, models_payload,
                                     resolve_audio8_voice)
@@ -163,3 +165,121 @@ class TestAudio8Catalog(unittest.TestCase):
         with self.assertRaises(AudioError) as ctx:
             resolve_audio8_voice("Unbekannt")
         self.assertEqual(ctx.exception.status_code, 400)
+
+
+class FakeAudio8:
+    def __init__(self, rate=44100):
+        self.rate = rate
+        self.aufrufe = []
+
+    def synthesize(self, text, *, info, speed):
+        self.aufrufe.append((text, info.voice, info.language, speed))
+        yield AudioChunk(b"\x01\x00" * 32, self.rate)
+
+
+class FakeProzess:
+    class _Stdin:
+        def write(self, _daten):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+    class _Stdout:
+        def __init__(self):
+            self._done = False
+
+        async def read(self, _n):
+            if self._done:
+                return b""
+            self._done = True
+            return b"resampled"
+
+    def __init__(self):
+        self.stdin = self._Stdin()
+        self.stdout = self._Stdout()
+        self.returncode = None
+
+    async def wait(self):
+        self.returncode = 0
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
+class TestAudio8AppDispatch(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.models = Path(self._tmp.name)
+        self.audio8_dir = self.models / "audio8-custom"
+        _audio8_dateien(self.audio8_dir)
+        self.settings = AudioSettings(
+            models_dir=self.models, preload="",
+            audio8_model_dir=self.audio8_dir,
+            audio8_base="http://127.0.0.1:39906")
+        self.audio8 = FakeAudio8()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _app(self, *, encoder_factory=object()):
+        return create_audio_app(
+            self.settings, stt_engine=object(), tts_engine=object(),
+            qwen_tts_engine=object(), chatterbox_engine=object(),
+            audio8_engine=self.audio8, duration_probe=lambda _: 1.0,
+            encoder_factory=encoder_factory)
+
+    def test_speech_routet_zu_audio8_und_mappt_default_voice(self):
+        with TestClient(self._app()) as c:
+            r = c.post("/v1/audio/speech", json={
+                "input": "Guten Tag.", "model": "Audio8-Realistic-Air",
+                "response_format": "wav"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content[:4], b"RIFF")
+        self.assertEqual(self.audio8.aufrufe,
+                         [("Guten Tag.", "de_male", "German", 1.0)])
+
+    def test_konfiguriertes_audio8_model_dir_wird_geprueft(self):
+        with TestClient(self._app()) as c:
+            r = c.post("/v1/audio/speech", json={
+                "input": "Guten Tag.", "model": "audio8",
+                "voice": "de_male", "response_format": "wav"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_nicht_installiert_ist_503_mit_hinweis(self):
+        self.settings = AudioSettings(
+            models_dir=self.models, preload="",
+            audio8_model_dir=self.models / "fehlt")
+        with TestClient(self._app()) as c:
+            r = c.post("/v1/audio/speech", json={
+                "input": "Guten Tag.", "model": "audio8"})
+        self.assertEqual(r.status_code, 503)
+        self.assertIn("runtime/audio8/download-models.sh",
+                      r.json()["error"]["message"])
+
+    def test_unbekannte_stimme_ist_400(self):
+        with TestClient(self._app()) as c:
+            r = c.post("/v1/audio/speech", json={
+                "input": "Guten Tag.", "model": "audio8",
+                "voice": "Unbekannt"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_rohes_pcm_wird_auf_24k_resampelt(self):
+        calls = []
+
+        async def encoder(fmt, rate):
+            calls.append((fmt, rate))
+            return FakeProzess()
+
+        with TestClient(self._app(encoder_factory=encoder)) as c:
+            r = c.post("/v1/audio/speech", json={
+                "input": "Guten Tag.", "model": "audio8",
+                "response_format": "pcm"})
+        self.assertEqual(r.content, b"resampled")
+        self.assertEqual(calls, [("pcm", 44100)])

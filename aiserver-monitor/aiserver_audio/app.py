@@ -15,14 +15,18 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .catalog import (CHATTERBOX_MODEL, chatterbox_installed,
-                      models_payload, resolve_voice, resolve_whisper,
+from .audio8 import Audio8Client, Audio8Voice
+from .catalog import (AUDIO8_MODEL, CHATTERBOX_MODEL, QWEN_TTS_MODEL,
+                      audio8_installed, chatterbox_installed, models_payload,
+                      qwen_tts_installed, resolve_audio8_voice,
+                      resolve_qwen_voice, resolve_voice, resolve_whisper,
                       voice_installed, whisper_installed)
 from .chatterbox import ChatterboxClient
 from .config import AudioSettings, load_settings
 from .errors import AudioError, audio_error_body
 from .ffmpeg import probe_duration
 from .queue import Admission, QueueFull
+from .qwen_tts import QwenTTSClient, QwenVoice
 from .stt import (FasterWhisperEngine, Transcription,
                   normalize_language)
 from .tts import (PiperEngine, content_type, split_sentences,
@@ -42,6 +46,10 @@ _MAX_AUDIO_S = 3600
 _BLOCKGROESSE = 64 * 1024
 _TTS_MODELS = frozenset({"piper", "tts-1", "tts-1-hd"})
 _CHATTERBOX_MODELS = frozenset({"chatterbox", "chatterbox-v3"})
+_QWEN_TTS_MODELS = frozenset({"qwen3-tts", "qwen3-tts-1.7b",
+                              "qwen3-tts-12hz-1.7b-customvoice"})
+_AUDIO8_MODELS = frozenset({"audio8", "audio8-realistic-air",
+                            "audio8-tts-realistic-air", "audio8-tts"})
 _TTS_FORMATE = frozenset({"pcm", "wav", "mp3", "opus"})
 
 
@@ -53,6 +61,8 @@ class SpeechRequest(BaseModel):
     voice: str = "de_DE-thorsten-medium"
     response_format: str = "wav"
     speed: float = Field(1.0, ge=0.5, le=2.0)
+    language: str = "German"
+    instruct: str | None = None
 
 
 def _zeitstempel(sekunden: float, trenner: str) -> str:
@@ -183,7 +193,8 @@ async def stream_speech(tts, text: str, *, info, fmt: str, speed: float,
 
 def create_audio_app(settings: AudioSettings | None = None, *,
                      stt_engine=None, tts_engine=None,
-                     chatterbox_engine=None,
+                     chatterbox_engine=None, qwen_tts_engine=None,
+                     audio8_engine=None,
                      duration_probe=probe_duration,
                      encoder_factory=start_encoder) -> FastAPI:
     """Baut die Audio-App; Engines und Zeitmessung sind austauschbar."""
@@ -192,6 +203,10 @@ def create_audio_app(settings: AudioSettings | None = None, *,
     tts = tts_engine if tts_engine is not None else PiperEngine(settings)
     chatterbox = (chatterbox_engine if chatterbox_engine is not None
                   else ChatterboxClient(settings))
+    qwen_tts = (qwen_tts_engine if qwen_tts_engine is not None
+                else QwenTTSClient(settings))
+    audio8 = (audio8_engine if audio8_engine is not None
+              else Audio8Client(settings))
     admission = Admission(1, settings.max_queue)
     tts_admission = Admission(2, settings.max_queue)
 
@@ -211,6 +226,8 @@ def create_audio_app(settings: AudioSettings | None = None, *,
     app.state.stt = stt
     app.state.tts = tts
     app.state.chatterbox = chatterbox
+    app.state.qwen_tts = qwen_tts
+    app.state.audio8 = audio8
     app.state.stt_admission = admission
     app.state.tts_admission = tts_admission
 
@@ -256,7 +273,8 @@ def create_audio_app(settings: AudioSettings | None = None, *,
 
     @app.get("/v1/audio/models")
     async def modelle():
-        return models_payload(settings.models_dir)
+        return models_payload(settings.models_dir,
+                              audio8_model_dir=settings.audio8_model_dir)
 
     @app.post("/v1/audio/transcriptions")
     async def transkription(
@@ -352,7 +370,35 @@ def create_audio_app(settings: AudioSettings | None = None, *,
     @app.post("/v1/audio/speech")
     async def sprache(anfrage: SpeechRequest):
         modell = anfrage.model.strip().casefold()
-        if modell in _CHATTERBOX_MODELS:
+        timeout_s = settings.tts_timeout_s
+        if modell in _QWEN_TTS_MODELS:
+            if not qwen_tts_installed(settings.models_dir):
+                raise AudioError(
+                    503, "model_not_installed",
+                    "Qwen3-TTS ist nicht installiert. Bitte "
+                    "runtime/qwen-tts/download-models.sh ausfuehren.")
+            info = QwenVoice(
+                QWEN_TTS_MODEL.id,
+                resolve_qwen_voice(anfrage.voice),
+                anfrage.language.strip() or "German",
+                anfrage.instruct,
+            )
+            engine = app.state.qwen_tts
+            timeout_s = settings.qwen_tts_timeout_s
+        elif modell in _AUDIO8_MODELS:
+            if not audio8_installed(settings.audio8_model_dir):
+                raise AudioError(
+                    503, "model_not_installed",
+                    "Audio8-TTS ist nicht installiert. Bitte "
+                    "runtime/audio8/download-models.sh ausfuehren.")
+            info = Audio8Voice(
+                AUDIO8_MODEL.id,
+                resolve_audio8_voice(anfrage.voice),
+                anfrage.language.strip() or "German",
+            )
+            engine = app.state.audio8
+            timeout_s = settings.audio8_timeout_s
+        elif modell in _CHATTERBOX_MODELS:
             if anfrage.voice.strip().casefold() not in ("default",
                                                         "chatterbox"):
                 raise AudioError(
@@ -398,7 +444,7 @@ def create_audio_app(settings: AudioSettings | None = None, *,
         agen = stream_speech(
             engine, text, info=info,
             fmt=anfrage.response_format, speed=anfrage.speed,
-            timeout_s=settings.tts_timeout_s,
+            timeout_s=timeout_s,
             encoder_factory=encoder_factory, on_late=spaeter)
         try:
             erster = await agen.__anext__()
