@@ -275,7 +275,7 @@ class ModelLifecycle:
                 for schluessel, tts_backend in self._tts_backends().items():
                     if schluessel == gewuenscht:
                         continue
-                    if await self._tts_bereit(tts_backend):
+                    if await self._tts_health(tts_backend) is not None:
                         raise LifecycleConflictError(
                             f"{tts_backend.label} laeuft noch; zuerst "
                             "/v1/unload ausfuehren.")

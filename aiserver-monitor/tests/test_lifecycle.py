@@ -508,9 +508,27 @@ class TestLoad(LifecycleTestCase):
             await lifecycle.load([AUDIO8])
         self.assertEqual(spawner.calls, [])
 
+    async def test_load_audio8_bei_laufendem_aber_nicht_geladenem_qwen3_tts_409(self):
+        self.qwen_tts.alive = True
+        self.qwen_tts.model_loaded = False
+        spawner = FakeSpawner(on_spawn=self._audio8_start)
+        lifecycle = self.lifecycle(spawner=spawner)
+        with self.assertRaises(LifecycleConflictError):
+            await lifecycle.load([AUDIO8])
+        self.assertEqual(spawner.calls, [])
+
     async def test_load_qwen3_tts_bei_laufendem_audio8_409(self):
         self.audio8.alive = True
         self.audio8.model_loaded = True
+        spawner = FakeSpawner(on_spawn=self._qwen_start)
+        lifecycle = self.lifecycle(spawner=spawner)
+        with self.assertRaises(LifecycleConflictError):
+            await lifecycle.load([TTS])
+        self.assertEqual(spawner.calls, [])
+
+    async def test_load_qwen3_tts_bei_laufendem_aber_nicht_geladenem_audio8_409(self):
+        self.audio8.alive = True
+        self.audio8.model_loaded = False
         spawner = FakeSpawner(on_spawn=self._qwen_start)
         lifecycle = self.lifecycle(spawner=spawner)
         with self.assertRaises(LifecycleConflictError):

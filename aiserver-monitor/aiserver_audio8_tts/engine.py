@@ -101,8 +101,13 @@ class Audio8Engine:
         if self._model is None:
             modell = self._model_loader(self._settings)
             lade_codec = getattr(modell, "load_codec", None)
-            if callable(lade_codec):
-                lade_codec()
+            if not callable(lade_codec):
+                raise Audio8TTSError(
+                    503, "model_unavailable",
+                    "Audio8-TTS: Modell bietet load_codec() nicht. Bitte "
+                    "Modellstand pruefen und runtime/audio8/download-models.sh "
+                    "erneut ausfuehren.")
+            lade_codec()
             self._model = modell
             self._reference_audio = audio
             self._reference_text = text

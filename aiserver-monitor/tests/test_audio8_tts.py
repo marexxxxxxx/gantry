@@ -100,6 +100,15 @@ class TestAudio8EngineLaden(unittest.TestCase):
             self.assertTrue(engine.model_loaded)
             self.assertEqual(model.codec_loaded, 1)
 
+    def test_modell_ohne_load_codec_ist_503_model_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self._engine(Path(tmp), model_loader=lambda _s: object())
+            with self.assertRaises(Audio8TTSError) as ctx:
+                engine.load()
+            self.assertEqual(ctx.exception.status_code, 503)
+            self.assertEqual(ctx.exception.code, "model_unavailable")
+            self.assertFalse(engine.model_loaded)
+
     def test_fehlende_referenz_ist_503_reference_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             audio, text = _referenz(Path(tmp))
