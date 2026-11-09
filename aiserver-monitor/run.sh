@@ -70,7 +70,7 @@ STOP_GRACE="${STOP_GRACE:-20}"
 START_WAIT="${START_WAIT:-20}"
 
 usage() {
-    echo "usage: $0 {start|stop|status|restart|audio-setup|audio-models|chatterbox-setup|chatterbox-models|qwen-tts-setup|qwen-tts-models|audio8-setup|audio8-models [args...]}"
+    echo "usage: $0 {start|stop|status|restart|start-audio8|stop-audio8|status-audio8|audio-setup|audio-models|chatterbox-setup|chatterbox-models|qwen-tts-setup|qwen-tts-models|audio8-setup|audio8-models [args...]}"
     echo "  start     Gateway im Hintergrund starten und auf /healthz warten"
     echo "  stop      Gateway beenden (TERM, ${STOP_GRACE}s, dann KILL)"
     echo "  status    Zustand lesen, Exit 1 wenn das Gateway nicht laeuft"
@@ -83,6 +83,9 @@ usage() {
     echo "  qwen-tts-models    Qwen3-TTS-Modelldateien pruefen/herunterladen"
     echo "  audio8-setup       Audio8-venv mit CUDA-Torch installieren"
     echo "  audio8-models      Audio8-Modell und Referenzstimme pruefen/herunterladen"
+    echo "  start-audio8       Audio8-TTS-Worker starten (Modell wird nicht vorgeladen)"
+    echo "  stop-audio8        Audio8-TTS-Worker stoppen"
+    echo "  status-audio8      Zustand des Audio8-TTS-Workers anzeigen"
     echo "Umgebung: AISERVER_MONITOR_LISTEN_PORT=$PORT PIDFILE=$PIDFILE"
     echo "          AUDIO_BASE=$AUDIO_BASE"
     echo "          CHATTERBOX_BASE=$CHATTERBOX_BASE"

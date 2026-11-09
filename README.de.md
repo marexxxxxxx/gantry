@@ -230,8 +230,13 @@ curl http://127.0.0.1:30000/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{"model": "Audio8-Realistic-Air", "input": "Guten Tag.", "voice": "de_male", "language": "German", "response_format": "wav"}' \
   -o antwort.wav
-curl -X POST http://127.0.0.1:30000/v1/unload
+curl -X POST http://127.0.0.1:30000/v1/unload \
+  -H 'Content-Type: application/json' -d '{"model": "Audio8-Realistic-Air"}'
 ```
+
+Smoke-Test: Die WAV-Datei darf nicht leer sein, `ffprobe antwort.wav` muss
+44.100 Hz melden, und nach dem letzten Unload darf Port 30006 nicht mehr
+antworten.
 
 Setup, Modelldownload und Referenzstimme:
 

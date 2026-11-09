@@ -428,8 +428,12 @@ curl http://127.0.0.1:30000/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{"model": "Audio8-Realistic-Air", "input": "Guten Tag.", "voice": "de_male", "language": "German", "response_format": "wav"}' \
   -o antwort.wav
-curl -X POST http://127.0.0.1:30000/v1/unload
+curl -X POST http://127.0.0.1:30000/v1/unload \
+  -H 'Content-Type: application/json' -d '{"model": "Audio8-Realistic-Air"}'
 ```
+
+Smoke test: the WAV must not be empty, `ffprobe antwort.wav` must report
+44,100 Hz, and after the final unload port 30006 must no longer answer.
 
 Setup, download and reference voice:
 

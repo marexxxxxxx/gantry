@@ -155,6 +155,9 @@ case "$out" in *qwen-tts-setup*) pass "usage nennt qwen-tts-setup" ;; *) fail "u
 case "$out" in *qwen-tts-models*) pass "usage nennt qwen-tts-models" ;; *) fail "usage nennt qwen-tts-models nicht: $out" ;; esac
 case "$out" in *audio8-setup*) pass "usage nennt audio8-setup" ;; *) fail "usage nennt audio8-setup nicht: $out" ;; esac
 case "$out" in *audio8-models*) pass "usage nennt audio8-models" ;; *) fail "usage nennt audio8-models nicht: $out" ;; esac
+case "$out" in *start-audio8*) pass "usage nennt start-audio8" ;; *) fail "usage nennt start-audio8 nicht: $out" ;; esac
+case "$out" in *stop-audio8*) pass "usage nennt stop-audio8" ;; *) fail "usage nennt stop-audio8 nicht: $out" ;; esac
+case "$out" in *status-audio8*) pass "usage nennt status-audio8" ;; *) fail "usage nennt status-audio8 nicht: $out" ;; esac
 
 # --- Vorbedingung: nichts laeuft --------------------------------------------
 
