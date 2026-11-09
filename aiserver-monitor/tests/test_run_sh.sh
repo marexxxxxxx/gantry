@@ -122,7 +122,9 @@ for skript in "$PROJEKT/../runtime/chatterbox/setup.sh" \
               "$PROJEKT/../runtime/qwen-tts/stop-qwen-tts.sh" \
               "$PROJEKT/../runtime/audio8/setup.sh" \
               "$PROJEKT/../runtime/audio8/download-models.sh" \
-              "$PROJEKT/../runtime/audio8/make-reference.sh"; do
+              "$PROJEKT/../runtime/audio8/make-reference.sh" \
+              "$PROJEKT/../runtime/audio8/start-audio8.sh" \
+              "$PROJEKT/../runtime/audio8/stop-audio8.sh"; do
     name=$(basename "$skript")
     if [ ! -f "$skript" ]; then
         fail "$name fehlt"
