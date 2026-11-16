@@ -321,14 +321,38 @@ async def _modell_anpassen(deps: "Deps", koerper: dict, *,
     elif ziel == deps.config.abl_model and "reasoning_effort" in koerper:
         koerper.pop("reasoning_effort")
         geaendert = True
-    if (chat and ziel == deps.config.edge0_model
-            and deps.config.edge0_thinking == "off"
-            and "thinking" not in koerper):
+    if chat and ziel == deps.config.edge0_model:
         # Edge0 denkt sonst bis zu 48k Tokens, bevor das erste sichtbare
-        # Token kommt; max_tokens begrenzt nur die Antwort. Ein explizites
-        # thinking-Feld des Clients gewinnt.
-        koerper["thinking"] = False
-        geaendert = True
+        # Token kommt; max_tokens begrenzt nur die Antwort. Wirksam sind auf
+        # der OpenAI-Route nur ``reasoning_effort``, ``reasoning.effort``,
+        # ``chat_template_kwargs`` und ``reasoning_budget_tokens`` - ein
+        # blosses ``thinking`` ignoriert die Engine auf diesem Pfad.
+        kam = {feld: koerper.get(feld) for feld in (
+            "reasoning_effort", "reasoning", "thinking",
+            "chat_template_kwargs", "reasoning_budget_tokens")}
+        # Hermes schickt von sich aus reasoning_effort=medium. Fuer Edge0
+        # entscheidet deshalb die Gateway-Konfiguration, nicht der Client;
+        # ein explizites "thinking": true im Body ist das Opt-in pro Request.
+        opt_in = koerper.get("thinking") is True
+        if not opt_in and deps.config.edge0_thinking != "on":
+            if deps.config.edge0_thinking == "low":
+                koerper["reasoning_effort"] = "low"
+                koerper["reasoning_budget_tokens"] = (
+                    deps.config.edge0_thinking_budget_tokens)
+                ctk = koerper.get("chat_template_kwargs")
+                if isinstance(ctk, dict) and "reasoning_effort" in ctk:
+                    ctk = dict(ctk)
+                    ctk.pop("reasoning_effort")
+                    koerper["chat_template_kwargs"] = ctk
+            else:
+                koerper["reasoning_effort"] = "none"
+            geaendert = True
+        logger.info(
+            "Edge0-Anfrage: client=%r modus=%s gesendet=(effort=%r, "
+            "budget=%r, thinking=%r)", kam, deps.config.edge0_thinking,
+            koerper.get("reasoning_effort"),
+            koerper.get("reasoning_budget_tokens"),
+            koerper.get("thinking"))
     return geaendert
 
 

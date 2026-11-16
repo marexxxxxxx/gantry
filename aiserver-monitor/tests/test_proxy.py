@@ -2249,9 +2249,74 @@ class TestBackendModellAlias(ProxyTestBasis):
 
         gesendet = fake.anfragen[0]
         self.assertEqual(gesendet["model"], "edge0-120b")
-        self.assertIs(gesendet["thinking"], False)
+        # Die OpenAI-Route der Engine liest nur reasoning_effort; ein
+        # top-level "thinking": false waere wirkungslos.
+        self.assertEqual(gesendet["reasoning_effort"], "none")
+        self.assertNotIn("thinking", gesendet)
 
-    async def test_edge0_laesst_client_thinking_stehen(self):
+    async def test_edge0_thinking_low_setzt_hartes_budget(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("edge0-120b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.edge0_model = "edge0-120b"
+        deps.config.edge0_thinking = "low"
+        deps.config.edge0_thinking_budget_tokens = 1024
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "edge0-120b",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "max_tokens": 4,
+            }), deps)
+        await _body(antwort)
+
+        gesendet = fake.anfragen[0]
+        self.assertEqual(gesendet["reasoning_effort"], "low")
+        self.assertEqual(gesendet["reasoning_budget_tokens"], 1024)
+
+    async def test_edge0_ueberschreibt_client_reasoning_effort(self):
+        # Hermes schickt von sich aus reasoning_effort=medium; im Modus "off"
+        # muss das Gateway das ueberstimmen, sonst denkt Edge0 weiter 48k.
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("edge0-120b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.edge0_model = "edge0-120b"
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "edge0-120b",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "reasoning_effort": "medium",
+                "max_tokens": 4,
+            }), deps)
+        await _body(antwort)
+
+        self.assertEqual(fake.anfragen[0]["reasoning_effort"], "none")
+
+    async def test_edge0_ctk_enable_thinking_ist_kein_opt_in(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("edge0-120b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.edge0_model = "edge0-120b"
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "edge0-120b",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "chat_template_kwargs": {"enable_thinking": True},
+                "max_tokens": 4,
+            }), deps)
+        await _body(antwort)
+
+        gesendet = fake.anfragen[0]
+        self.assertEqual(gesendet["reasoning_effort"], "none")
+        self.assertEqual(gesendet["chat_template_kwargs"],
+                         {"enable_thinking": True})
+
+    async def test_edge0_thinking_true_ist_opt_in(self):
         fake = fakes.FakeSglang()
         probe = _FakeProbe("edge0-120b")
         deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
@@ -2263,11 +2328,35 @@ class TestBackendModellAlias(ProxyTestBasis):
                 "model": "edge0-120b",
                 "messages": [{"role": "user", "content": "Hallo"}],
                 "thinking": True,
+                "reasoning_effort": "medium",
                 "max_tokens": 4,
             }), deps)
         await _body(antwort)
 
-        self.assertIs(fake.anfragen[0]["thinking"], True)
+        gesendet = fake.anfragen[0]
+        self.assertEqual(gesendet["reasoning_effort"], "medium")
+        self.assertNotIn("reasoning_budget_tokens", gesendet)
+
+    async def test_edge0_thinking_low_ueberschreibt_client(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("edge0-120b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.edge0_model = "edge0-120b"
+        deps.config.edge0_thinking = "low"
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "edge0-120b",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "reasoning_effort": "high",
+                "max_tokens": 4,
+            }), deps)
+        await _body(antwort)
+
+        gesendet = fake.anfragen[0]
+        self.assertEqual(gesendet["reasoning_effort"], "low")
+        self.assertEqual(gesendet["reasoning_budget_tokens"], 1024)
 
     async def test_edge0_thinking_on_laesst_modell_default(self):
         fake = fakes.FakeSglang()
@@ -2285,7 +2374,10 @@ class TestBackendModellAlias(ProxyTestBasis):
             }), deps)
         await _body(antwort)
 
-        self.assertNotIn("thinking", fake.anfragen[0])
+        gesendet = fake.anfragen[0]
+        self.assertNotIn("reasoning_effort", gesendet)
+        self.assertNotIn("reasoning_budget_tokens", gesendet)
+        self.assertNotIn("thinking", gesendet)
 
     async def test_edge0_thinking_nicht_bei_completions(self):
         fake = fakes.FakeSglang()
@@ -2302,7 +2394,9 @@ class TestBackendModellAlias(ProxyTestBasis):
             }), deps)
         await _body(antwort)
 
-        self.assertNotIn("thinking", fake.anfragen[0])
+        gesendet = fake.anfragen[0]
+        self.assertNotIn("reasoning_effort", gesendet)
+        self.assertNotIn("thinking", gesendet)
 
     async def test_flint_modell_wird_auf_aktives_gptoss_umgebogen(self):
         # Hindsight schickt je nach Lauf den Flint-Namen. Der Schalter im

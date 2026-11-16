@@ -131,6 +131,12 @@
 # edge0_stop_script = "runtime/edge0/stop-edge0.sh"
 # edge0_pidfile = "runtime/edge0/edge0.pid"
 # edge0_health_path = "/health"
+# Edge0 denkt von sich aus bis zu 48k Tokens und blockiert dabei den einzigen
+# Slot (5-20 min pro Antwort). "off" setzt reasoning_effort="none" solange der
+# Client kein thinking:true schickt; "low" setzt "low" plus ein Budget von
+# edge0_thinking_budget_tokens; "on" laesst den Client-/Modell-Default stehen.
+# edge0_thinking = "off"
+# edge0_thinking_budget_tokens = 1024
 
 # --- Chatterbox (optionaler CPU-TTS-Worker) ---
 # Der Audio-Sidecar spricht den Worker auf 127.0.0.1:30004 an.
