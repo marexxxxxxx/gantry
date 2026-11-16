@@ -142,7 +142,7 @@ voices. Direct control: `runtime/audio/start-audio.sh`,
 |---|---|
 | [`runtime/sglang/`](runtime/sglang/) | **The actual runtime**: escha wheel + sglang fork, `serve.sh` launcher, payload builders (`overthinking_penalty.py`, `thinking_budget.py`), benchmark wrapper, server-default patch, all documentation |
 | [`Qwen3.8-27B-Escha-W2/`](Qwen3.8-27B-Escha-W2/) | Downloaded model weights (separate HF repo, not part of this codebase) |
-| [`docs/`](docs/) | Technical deep dives: FP8 KV-cache quantization |
+| [`docs/`](docs/) | Technical deep dives: [AI server architecture](docs/architecture.md), FP8 KV-cache quantization |
 | [`slotmon/`](slotmon/) | **GPU slot monitor**: reads the server log passively and shows which job holds the slot (`monitor.sh start` → `http://0.0.0.0:8090`) |
 | `ctxmon.sh` | Live server monitor: tok/s, current context usage, context peak |
 | `server.sh` | Start/stop/status of the model server (`bash server.sh start\|stop\|status`); the dashboard keeps running |
@@ -154,6 +154,7 @@ the top.
 
 | Topic | English | Deutsch |
 |---|---|---|
+| **AI server architecture** (processes, ports, backends, GPU ownership) | [docs/architecture.md](docs/architecture.md) | [docs/architektur.md](docs/architektur.md) |
 | Runtime overview & how it works | [runtime/sglang/README.md](runtime/sglang/README.md) | [runtime/sglang/README.de.md](runtime/sglang/README.de.md) |
 | Installation, GPU profiles, troubleshooting | [runtime/sglang/INSTALL.md](runtime/sglang/INSTALL.md) | [runtime/sglang/INSTALL.de.md](runtime/sglang/INSTALL.de.md) |
 | Penalty usage guide (both activation paths, recipes, benchmarks) | [runtime/sglang/USAGE-penalty.md](runtime/sglang/USAGE-penalty.md) | [runtime/sglang/USAGE-penalty.de.md](runtime/sglang/USAGE-penalty.de.md) |

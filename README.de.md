@@ -145,7 +145,7 @@ AT/CH-Piper-Stimmen. Direkte Steuerung: `runtime/audio/start-audio.sh`,
 |---|---|
 | [`runtime/sglang/`](runtime/sglang/) | **Die eigentliche Laufzeitumgebung**: escha-Wheel + SGLang-Fork, `serve.sh`-Launcher, Payload-Builder (`overthinking_penalty.py`, `thinking_budget.py`), Benchmark-Wrapper, Server-Default-Patch, sämtliche Dokumentation |
 | [`Qwen3.8-27B-Escha-W2/`](Qwen3.8-27B-Escha-W2/) | Heruntergeladene Modellgewichte (separates HF-Repo, nicht Teil dieser Codebasis) |
-| [`docs/`](docs/) | Technische Vertiefungen: FP8-KV-Cache-Quantisierung |
+| [`docs/`](docs/) | Technische Vertiefungen: [Architektur des AI-Servers](docs/architektur.md), FP8-KV-Cache-Quantisierung |
 | [`slotmon/`](slotmon/) | **GPU-Slot-Monitor**: liest das Server-Log passiv mit und zeigt, welcher Auftrag den Slot hält (`monitor.sh start` → `http://0.0.0.0:8090`) |
 | `ctxmon.sh` | Live-Monitor für den Server: tok/s, aktuelle Kontextbelegung, Kontext-Peak |
 | `server.sh` | Modellserver starten/stoppen/Status (`bash server.sh start\|stop\|status`); das Dashboard läuft weiter |
@@ -157,6 +157,7 @@ Flaggen-Umschalter.
 
 | Thema | Deutsch | English |
 |---|---|---|
+| **Architektur des AI-Servers** (Prozesse, Ports, Backends, GPU-Besitz) | [docs/architektur.md](docs/architektur.md) | [docs/architecture.md](docs/architecture.md) |
 | Runtime-Überblick & Funktionsweise | [runtime/sglang/README.de.md](runtime/sglang/README.de.md) | [runtime/sglang/README.md](runtime/sglang/README.md) |
 | Installation, GPU-Profile, Troubleshooting | [runtime/sglang/INSTALL.de.md](runtime/sglang/INSTALL.de.md) | [runtime/sglang/INSTALL.md](runtime/sglang/INSTALL.md) |
 | Penalty-Bedienungsanleitung (beide Aktivierungswege, Rezepte, Benchmarks) | [runtime/sglang/USAGE-penalty.de.md](runtime/sglang/USAGE-penalty.de.md) | [runtime/sglang/USAGE-penalty.md](runtime/sglang/USAGE-penalty.md) |
