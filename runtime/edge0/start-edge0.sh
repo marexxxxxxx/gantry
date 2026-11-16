@@ -29,8 +29,16 @@ ALIAS="${EDGE0_ALIAS:-edge0-120b}"
 # Groessere Prefill-Chunks (Template erlaubt via --prefill auto nur 8192).
 # Gemessen: 12k-Prompt 424 -> 537 tok/s Prefill, 64k bringt nichts mehr.
 export STRATA_PREFILL_AUTO_MAX="${STRATA_PREFILL_AUTO_MAX:-32768}"
-# Tuning fuer 16 GiB VRAM + 8-Kern-CPU (gemessen: ~60-70 tok/s Decode,
-# ~1.900 tok/s Prefill, Prefix-Cache greift bei stabilem Prompt-Anfang).
+# Tuning fuer 16 GiB VRAM + 8-Kern-CPU. Gemessen mit int8-KV:
+#   Prefill 570-1370 tok/s (je nach Kontext und Page-Cache),
+#   Decode 25-35 tok/s bei freiem Text, 40-80 bei gut vorhersagbarem Text.
+# Prefix-Cache greift bei stabilem Prompt-Anfang (TTFT ~0,2 s).
+#
+# Der Host-RAM-Expertencache ist der kritische Wert: 16 GiB passt neben IDE
+# und Agenten nicht mehr in die 60 GB und die Engine wird vom Kernel per
+# OOM-Killer beendet (exit -6). 8 GiB halten Edge0 auch unter Last stabil;
+# per EDGE0_RESIDENT_GIB anpassbar, wenn die Maschine sonst leer ist.
+RESIDENT_GIB="${EDGE0_RESIDENT_GIB:-8}"
 STRATA_ARGS=(
   --vram-reserve-mib 400
   --kv-resident 20480
@@ -38,7 +46,7 @@ STRATA_ARGS=(
   --kv-grow
   --pool-workers 7
   --pcie-mode dma
-  --resident-budget-gib 16
+  --resident-budget-gib "$RESIDENT_GIB"
 )
 # Zusaetzliche Engine-Argumente fuer Messlaeufe, z. B.
 #   EDGE0_STRATA_EXTRA="--prefill auto:32768 --spec 6" bash server.sh start edge0
