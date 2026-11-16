@@ -101,7 +101,7 @@ class FakeClock:
 def _control(*, runner=None, health=None, spawner=None, clock=None,
              unit=UNIT, start_timeout_s=600.0, stop_timeout_s=60.0,
              start_grace_s=10.0, flint_pidfile=None, gptoss_pidfile=None,
-             sleeper=None):
+             abl_pidfile=None, sleeper=None):
     runner = FakeRunner() if runner is None else runner
     health = FakeHealth() if health is None else health
     spawner = FakeSpawner() if spawner is None else spawner
@@ -120,6 +120,9 @@ def _control(*, runner=None, health=None, spawner=None, clock=None,
         gptoss_start_script="runtime/gptoss/start-gptoss.sh",
         gptoss_stop_script="runtime/gptoss/stop-gptoss.sh",
         gptoss_pidfile=gptoss_pidfile or "runtime/gptoss/gptoss.pid",
+        abl_start_script="runtime/abl/start-abl.sh",
+        abl_stop_script="runtime/abl/stop-abl.sh",
+        abl_pidfile=abl_pidfile or "runtime/abl/abl.pid",
         runner=runner,
         spawner=spawner,
         health_reader=health,
@@ -320,7 +323,7 @@ class TestStartStop(unittest.IsolatedAsyncioTestCase):
 
 
 class TestBackends(unittest.IsolatedAsyncioTestCase):
-    """Qwen (SGLang), Flint und GPT-OSS (Ollama) teilen sich einen Port."""
+    """Qwen (SGLang), Flint, GPT-OSS und Abliterated (Ollama) teilen einen Port."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="serverctl-flint-")
@@ -338,12 +341,15 @@ class TestBackends(unittest.IsolatedAsyncioTestCase):
         snap = await control.snapshot()
         self.assertIsNone(snap["backend"])
         self.assertEqual([b["name"] for b in snap["backends"]],
-                         ["qwen", "flint", "gptoss"])
+                         ["qwen", "flint", "gptoss", "abl", "edge0"])
         self.assertEqual([b["label"] for b in snap["backends"]],
                          ["Qwen (SGLang)", "Flint (Ollama)",
-                          "GPT-OSS 20B (Ollama)"])
+                          "GPT-OSS 20B (Ollama)",
+                          "Qwen3-14B Abliterated (Ollama)",
+                          "Edge0 120B (NVFP4)"])
         self.assertEqual([b["state"] for b in snap["backends"]],
-                         ["stopped", "stopped", "stopped"])
+                         ["stopped", "stopped", "stopped", "stopped",
+                          "stopped"])
 
     async def test_laufender_flint_wird_erkannt(self):
         self._flint_an()
@@ -456,6 +462,26 @@ class TestBackends(unittest.IsolatedAsyncioTestCase):
         snap = await control.snapshot()
         self.assertEqual(snap["state"], "running")
         self.assertEqual(snap["backend"], "gptoss")
+
+    async def test_start_abl_nutzt_eigenes_skript(self):
+        abl = Path(self.tmp.name) / "abl.pid"
+        runner = FakeRunner(unit_installiert=True, unit_aktiv=False,
+                            prozess_laeuft=False)
+        health = FakeHealthProPfad(**{"/api/version": False})
+        control, _, _, spawner, _ = _control(
+            runner=runner, health=health, abl_pidfile=abl)
+        snap = await control.start("abl")
+        self.assertEqual(snap["state"], "starting")
+        self.assertEqual(snap["backend"], "abl")
+        self.assertEqual(
+            spawner.aufrufe,
+            [["bash", str(REPO / "runtime/abl/start-abl.sh")]])
+
+        abl.write_text(str(os.getpid()))
+        health.ok["/api/version"] = True
+        snap = await control.snapshot()
+        self.assertEqual(snap["state"], "running")
+        self.assertEqual(snap["backend"], "abl")
 
     async def test_wechsel_flint_zu_gptoss(self):
         gptoss = Path(self.tmp.name) / "gptoss.pid"

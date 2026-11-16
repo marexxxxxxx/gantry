@@ -22,8 +22,26 @@ const HOEHE = 220;
 const ACHSE_FARBE = "#9aa3af";
 const GITTER_FARBE = "#262d38";
 
-/** Linienfarben fuer bis zu zwei Serien (Dark Theme). */
-const SERIEN_FARBEN = ["#4fc1ff", "#e5c07b"];
+/** Linienfarben fuer bis zu vier Serien (Dark Theme). */
+const SERIEN_FARBEN = ["#4fc1ff", "#e5c07b", "#3fb950", "#f85149"];
+
+/** Breite der y-Achse; genug Platz fuer kompakte Millionen-/Milliardenwerte. */
+const Y_ACHSE_BREITE = 74;
+
+const achsenFormat = new Intl.NumberFormat("de-DE", {
+  maximumFractionDigits: 1,
+});
+
+/**
+ * Kompakte y-Achsen-Beschriftung: grosse Token-Summen werden zu "1,8 Mio.",
+ * damit sie nicht aus der Achsenbreite herauslaufen.
+ */
+function achsenWert(wert: number): string {
+  const betrag = Math.abs(wert);
+  if (betrag >= 1e9) return `${achsenFormat.format(wert / 1e9)} Mrd.`;
+  if (betrag >= 1e6) return `${achsenFormat.format(wert / 1e6)} Mio.`;
+  return achsenFormat.format(wert);
+}
 
 /**
  * Bringt die Punktreihen auf eine gemeinsame x-Achse (``uPlot.AlignedData``).
@@ -71,7 +89,13 @@ export default function TimeChart({ title, unit, series }: TimeChartProps) {
       ],
       axes: [
         { stroke: ACHSE_FARBE, grid: { stroke: GITTER_FARBE } },
-        { stroke: ACHSE_FARBE, grid: { stroke: GITTER_FARBE } },
+        {
+          stroke: ACHSE_FARBE,
+          grid: { stroke: GITTER_FARBE },
+          size: Y_ACHSE_BREITE,
+          values: (_u, splits) =>
+            splits.map((wert) => (wert == null ? "" : achsenWert(wert))),
+        },
       ],
     };
     const diagramm = new uPlot(optionen, ausrichten(series), element);

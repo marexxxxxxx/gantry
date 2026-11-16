@@ -34,6 +34,15 @@ from .events import EventHub, format_sse, sse_stream
 from .hindsight import HindsightBlocker
 from .history import History
 from .jobs import ACTIVE_STATUSES, JobRegistry, JobStatus, job_to_dict
+from .lifecycle import (
+    LifecycleConflictError,
+    LifecycleDisabledError,
+    LifecycleError,
+    LifecycleTimeoutError,
+    LifecycleUnavailableError,
+    ModelLifecycle,
+    UnknownProfileError,
+)
 from .metrics_parse import GpuSample
 from .priority import PriorityManager
 from .proxy import BackendProbe, Deps, handle_v1
@@ -142,11 +151,38 @@ class _CfClientMiddleware:
         await self.app(scope, receive, send)
 
 
+def _namen_aus_daten(daten: object) -> list[str] | None:
+    """Modellnamen aus ``{"model"}``, ``{"models"}`` oder einer Liste.
+
+    Namen bleiben exakt erhalten (kein Trimmen, kein Umschreiben); eine
+    leere oder falsch typisierte Angabe liefert ``None``.
+    """
+    if isinstance(daten, list):
+        if not daten or not all(isinstance(n, str) and n for n in daten):
+            return None
+        return list(daten)
+    if not isinstance(daten, dict):
+        return None
+    model = daten.get("model")
+    if model is not None:
+        if not isinstance(model, str) or not model:
+            return None
+        return [model]
+    models = daten.get("models")
+    if models is not None:
+        if (not isinstance(models, list) or not models
+                or not all(isinstance(n, str) and n for n in models)):
+            return None
+        return list(models)
+    return None
+
+
 def create_app(config: Config, *,
                transport: httpx.AsyncBaseTransport | None = None,
                steuer_transport: httpx.AsyncBaseTransport | None = None,
                gpu_reader: Callable[[], Awaitable[GpuSample]] | None = None,
                server_control: ServerControl | None = None,
+               model_lifecycle: ModelLifecycle | None = None,
                enable_background: bool = True) -> FastAPI:
     """Baut die Gateway-App aus Config, optionalem Transport und GPU-Reader.
 
@@ -181,6 +217,15 @@ def create_app(config: Config, *,
         timeout=httpx.Timeout(_STEUER_TIMEOUT_S))
     if server_control is None:
         server_control = ServerControl.from_config(config, client=steuer_client)
+    # Der Lifecycle spricht mit ServerControl und den Ollama-Sidecars; ein
+    # eigener Client haelt ihn unabhaengig von langen Proxy-Streams.
+    lifecycle_client = httpx.AsyncClient(transport=transport)
+    if model_lifecycle is None:
+        model_lifecycle = ModelLifecycle(
+            config, server_control, client=lifecycle_client,
+            poll_s=config.lifecycle_poll_s,
+            load_timeout_s=config.lifecycle_timeout_s,
+            unload_timeout_s=config.lifecycle_unload_timeout_s)
     priority = PriorityManager(history)
     hindsight = HindsightBlocker(history)
     deps = Deps(
@@ -223,6 +268,7 @@ def create_app(config: Config, *,
             await client.aclose()
             await collector_client.aclose()
             await steuer_client.aclose()
+            await lifecycle_client.aclose()
             history.close()
 
     app = FastAPI(title="aiserver-monitor", lifespan=lifespan)
@@ -232,6 +278,7 @@ def create_app(config: Config, *,
     app.state.collector_client = collector_client
     app.state.steuer_client = steuer_client
     app.state.server_control = server_control
+    app.state.lifecycle = model_lifecycle
 
     async def _abbrechen(*, rid: str | None, abort_all: bool) -> bool:
         """``abort_request`` ueber den Steuer-Client: Netzfehler -> False.
@@ -448,7 +495,12 @@ def create_app(config: Config, *,
             from_ms: int | None = Query(None, alias="from"),
             to_ms: int | None = Query(None, alias="to"),
             bucket: int = Query(DEFAULT_BUCKET_S)):
-        """Statistik; ``from``/``to`` sind Millisekunden, ``bucket`` Sekunden."""
+        """Statistik; ``from``/``to`` sind Millisekunden, ``bucket`` Sekunden.
+
+        Liefert ``overview`` (Zaehler, Tokens, TTFT-/Dauer-Perzentile,
+        Dekodierrate), gemergte Sample-/Job-``buckets`` sowie Aufschluesselung
+        nach ``models``, ``sources`` und den haeufigsten ``errors``.
+        """
         if bucket <= 0:
             return JSONResponse(
                 status_code=400,
@@ -465,6 +517,99 @@ def create_app(config: Config, *,
         if to_ms - from_ms > MAX_FENSTER_MS:
             from_ms = to_ms - MAX_FENSTER_MS
         return history.query_stats(from_ms / 1000.0, to_ms / 1000.0, bucket)
+
+    def _lifecycle_fehler(exc: LifecycleError) -> JSONResponse:
+        """Mappt Lifecycle-Fehler auf HTTP-Status und Fehlerkoerper."""
+        if isinstance(exc, UnknownProfileError):
+            return JSONResponse(
+                status_code=404,
+                content={"error": str(exc), "profiles": exc.profiles})
+        if isinstance(exc, LifecycleConflictError):
+            return JSONResponse(status_code=409,
+                                content={"error": str(exc)})
+        if isinstance(exc, LifecycleDisabledError):
+            return JSONResponse(status_code=503,
+                                content={"error": str(exc)})
+        if isinstance(exc, LifecycleTimeoutError):
+            return JSONResponse(status_code=504,
+                                content={"error": str(exc)})
+        if isinstance(exc, LifecycleUnavailableError):
+            return JSONResponse(status_code=503,
+                                content={"error": str(exc)})
+        return JSONResponse(status_code=502, content={"error": str(exc)})
+
+    @app.get("/v1/status")
+    async def v1_status() -> Response:
+        return JSONResponse(content=await model_lifecycle.status())
+
+    @app.post("/v1/status")
+    async def v1_status_post() -> Response:
+        return JSONResponse(content=await model_lifecycle.status())
+
+    @app.post("/v1/load")
+    async def v1_load(request: Request) -> Response:
+        """Laedt die genannten Modellnamen; unbekannt -> 404, nichts laden."""
+        if not await request.body():
+            return JSONResponse(
+                status_code=400,
+                content={"error": "JSON-Body mit model/models erwartet"})
+        try:
+            daten = await request.json()
+        except ValueError:
+            daten = None
+        namen = _namen_aus_daten(daten)
+        if namen is None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "model, models oder eine Liste mit "
+                                  "Modellnamen erwartet"})
+        try:
+            antwort = await model_lifecycle.load(namen)
+        except LifecycleError as exc:
+            return _lifecycle_fehler(exc)
+        return JSONResponse(content=antwort)
+
+    @app.post("/v1/load/{name:path}")
+    async def v1_load_pfad(name: str) -> Response:
+        """Pfad-Variante fuer Aufrufer wie POST /v1/load/Qwen3-TTS."""
+        try:
+            antwort = await model_lifecycle.load([name])
+        except LifecycleError as exc:
+            return _lifecycle_fehler(exc)
+        return JSONResponse(content=antwort)
+
+    @app.post("/v1/unload")
+    async def v1_unload(request: Request) -> Response:
+        """Entlaedt alles (ohne Body/all) oder die genannten Profile."""
+        namen = None
+        if await request.body():
+            try:
+                daten = await request.json()
+            except ValueError:
+                daten = None
+            alles = (isinstance(daten, dict)
+                     and (daten.get("all") is True or not daten))
+            if not alles:
+                namen = _namen_aus_daten(daten)
+                if namen is None:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": "all, model, models oder eine "
+                                          "Liste mit Modellnamen erwartet"})
+        try:
+            antwort = await model_lifecycle.unload(namen)
+        except LifecycleError as exc:
+            return _lifecycle_fehler(exc)
+        return JSONResponse(content=antwort)
+
+    @app.post("/v1/unload/{name:path}")
+    async def v1_unload_pfad(name: str) -> Response:
+        """Pfad-Variante fuer gezieltes Entladen eines Modells."""
+        try:
+            antwort = await model_lifecycle.unload([name])
+        except LifecycleError as exc:
+            return _lifecycle_fehler(exc)
+        return JSONResponse(content=antwort)
 
     @app.api_route("/v1/{pfad:path}", methods=["GET", "POST"])
     async def v1_passthrough(pfad: str, request: Request) -> Response:

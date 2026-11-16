@@ -13,8 +13,9 @@ Acht Szenarien laufen nacheinander in einem Browserfenster:
   3. Warteschlange: zwei parallele Queue-Jobs, beide erst wartend, dann
      laufend/fertig; die Queue-Kennzahl "wartend" ist ein Wert > 0.
   4. Notaus: cancel-all armt, confirm-cancel-all bestaetigt, Auto-Reset.
-  5. Statistik-Tab: KPIs und vier Charts sichtbar, kein Leerzustand,
-     Zeitfenster-Chip 7 Tage wird gedrueckt.
+  5. Statistik-Tab: KPIs, Auffaelligkeiten, sechs Charts und Breakdown-
+     Tabellen sichtbar, kein Leerzustand, Zeitfenster-Chip 7 Tage wird
+     gedrueckt.
   6. Reconnect: Gateway stoppen/starten, conn-status und Job-Tabelle kommen
      zurueck (neuer Job wird wieder live verfolgt).
   7. Prioritaet: Default-Marker und Schalter, Ausschalten, Marker ergaenzen,
@@ -187,6 +188,21 @@ def szenario_1_live(page: Page) -> None:
             f"queue-stats zeigt keine Werte: laufend={laufend!r},"
             f" wartend={wartend!r}")
 
+    # Lagebild ueber der Queue: Saettigungs-Badge und Kennwerte sind auch
+    # ohne abgeschlossene 15-Minuten-Historie sichtbar.
+    expect(page.get_by_test_id("live-insights")).to_be_visible(
+        timeout=DEADLINE_MS)
+    expect(page.get_by_test_id("live-saturation")).to_be_visible(
+        timeout=DEADLINE_MS)
+    expect(page.get_by_test_id("live-queue-head")).to_be_visible(
+        timeout=DEADLINE_MS)
+    expect(page.get_by_test_id("live-error-rate")).to_be_visible(
+        timeout=DEADLINE_MS)
+    expect(page.get_by_test_id("live-throughput")).to_be_visible(
+        timeout=DEADLINE_MS)
+    expect(page.get_by_test_id("live-gpu")).to_be_visible(
+        timeout=DEADLINE_MS)
+
     # Modal per Zeilenklick oeffnen: sichtbar, Denken eingeklappt, Antwort
     # waechst waehrend des Streams.
     zeile = job_zeile(page, "e2e-langsam")
@@ -262,11 +278,29 @@ def szenario_4_notaus(page: Page) -> None:
 
 
 def szenario_5_statistik(page: Page) -> None:
-    """Statistik-Tab: KPIs, vier Charts, Zeitfenster-Chip."""
+    """Statistik-Tab: KPIs, Auffaelligkeiten, Charts und Breakdowns."""
     page.get_by_test_id("tab-stats").click()
     expect(page.get_by_test_id("kpi-count")).to_be_visible(timeout=DEADLINE_MS)
 
-    for testid in ("chart-queue", "chart-throughput", "chart-tokens", "chart-gpu"):
+    for testid in (
+        "kpi-success", "kpi-error", "kpi-ttft", "kpi-duration", "kpi-tokens",
+        "kpi-throughput", "kpi-gpu", "kpi-queue",
+    ):
+        expect(page.get_by_test_id(testid)).to_be_visible(timeout=DEADLINE_MS)
+
+    expect(page.get_by_test_id("stat-insights")).to_be_visible(
+        timeout=DEADLINE_MS)
+    expect(page.get_by_test_id("stat-models")).to_be_visible(
+        timeout=DEADLINE_MS)
+    expect(page.get_by_test_id("stat-sources")).to_be_visible(
+        timeout=DEADLINE_MS)
+    expect(page.get_by_test_id("stat-errors")).to_be_visible(
+        timeout=DEADLINE_MS)
+
+    for testid in (
+        "chart-queue", "chart-jobs", "chart-latency", "chart-throughput",
+        "chart-tokens", "chart-gpu",
+    ):
         expect(page.get_by_test_id(testid)).to_be_visible(timeout=DEADLINE_MS)
 
     if page.get_by_test_id("stat-leer").count() > 0:

@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { Job, Sample } from "./api";
 import CurrentJobPanel from "./CurrentJobPanel";
 import JobTable from "./JobTable";
+import LiveInsights from "./LiveInsights";
 
 export interface LiveViewProps {
   jobs: Job[];
@@ -154,6 +155,8 @@ export default function LiveView({
 
   return (
     <div className="live-ansicht">
+      <LiveInsights jobs={jobs} sample={sample} jetztMs={jetztMs} />
+
       <CurrentJobPanel jobs={jobs} jetztMs={jetztMs} />
 
       <section

@@ -133,7 +133,7 @@ class Deps:
 
 
 class BackendProbe:
-    """Erkennt, welches Ollama-Backend (Flint/GPT-OSS) gerade laeuft.
+    """Erkennt, welches Ollama-Backend (Flint/GPT-OSS/Abliterated) laeuft.
 
     SGLang hat ``/api/ps`` nicht (404). Ollama listet dort das geladene
     Modell; die Startskripte laden ihr Modell mit ``keep_alive=-1`` vor,
@@ -163,7 +163,9 @@ class BackendProbe:
             return None
         for pfad, modell in (
                 (self._config.flint_pidfile, self._config.flint_model),
-                (self._config.gptoss_pidfile, self._config.gptoss_model)):
+                (self._config.gptoss_pidfile, self._config.gptoss_model),
+                (self._config.abl_pidfile, self._config.abl_model),
+                (self._config.edge0_pidfile, self._config.edge0_model)):
             try:
                 pid = int((self._repo_root / pfad).read_text().strip())
                 os.kill(pid, 0)
@@ -190,7 +192,8 @@ class BackendProbe:
                         if isinstance(eintrag, dict)
                     }
                     for bekannt in (self._config.flint_model,
-                                    self._config.gptoss_model):
+                                    self._config.gptoss_model,
+                                    self._config.abl_model):
                         if bekannt in geladen:
                             modell = bekannt
                             break
@@ -212,11 +215,46 @@ def _ist_embedding_pfad(pfad: str) -> bool:
     return pfad.endswith("/embeddings")
 
 
+def _modelle_mit_alias(antwort: Response, deps: "Deps") -> Response:
+    """Ergaenzt die Upstream-Modellliste um die stabilen Gateway-Namen.
+
+    Clients (z. B. Hermes) fragen den Alias ``escha-qwen38-27b-w2`` an,
+    waehrend der aktive Upstream nur seinen eigenen Namen meldet
+    (``edge0-120b``). Im Request wird der Name ohnehin auf das aktive
+    Modell umgeschrieben; damit die Clients ihn auch in ``/v1/models``
+    finden, steht er hier in der Liste.
+    """
+    if antwort.status_code != 200:
+        return antwort
+    if "json" not in (antwort.headers.get("content-type") or ""):
+        return antwort
+    try:
+        daten = json.loads(antwort.body)
+    except (TypeError, ValueError):
+        return antwort
+    if not isinstance(daten, dict) or not isinstance(daten.get("data"), list):
+        return antwort
+    vorhanden = {eintrag.get("id") for eintrag in daten["data"]
+                 if isinstance(eintrag, dict)}
+    ergaenzt = False
+    for name in (deps.config.edge0_model, deps.config.model_alias):
+        if not name or name in vorhanden:
+            continue
+        daten["data"].append({"id": name, "object": "model",
+                              "owned_by": "aiserver-monitor"})
+        vorhanden.add(name)
+        ergaenzt = True
+    if not ergaenzt:
+        return antwort
+    return JSONResponse(daten)
+
+
 def _embedding_modell_anpassen(deps: "Deps", koerper: dict) -> bool:
     """Bildet bekannte Modellnamen auf ``embed_model`` ab.
 
     Es gibt genau ein Embedding-Modell. Clients duerfen deshalb den
-    Chat-Alias, den Flint-/GPT-OSS-Namen oder gar keinen Namen schicken.
+    Chat-Alias, den Flint-/GPT-OSS-/Abliterated-Namen oder gar keinen Namen
+    schicken.
     Unbekannte Namen bleiben unveraendert: das Sidecar antwortet dann mit
     einem klaren "model not found", statt still ein anderes Modell zu
     benutzen. Rueckgabe: True, wenn der Body geaendert wurde.
@@ -225,6 +263,8 @@ def _embedding_modell_anpassen(deps: "Deps", koerper: dict) -> bool:
         name for name in (deps.config.model_alias,
                           deps.config.flint_model,
                           deps.config.gptoss_model,
+                          deps.config.abl_model,
+                          deps.config.edge0_model,
                           deps.config.embed_model)
         if name
     }
@@ -241,22 +281,27 @@ async def _modell_anpassen(deps: "Deps", koerper: dict, *,
                            chat: bool = False) -> bool:
     """Bildet bekannte Modellnamen auf das aktive Backend ab.
 
-    Angenommen werden Alias, Flint- und GPT-OSS-Modell: Der Schalter im
-    Dashboard ist autoritativ, weil ohnehin nur ein Ollama-Modell ins VRAM
-    passt. Clients duerfen also weiterhin ihren gewohnten Namen schicken
-    (Hindsight schickt je nach Lauf Alias, Flint- oder GPT-OSS-Namen).
+    Angenommen werden Alias, Flint-, GPT-OSS- und Abliterated-Modell: Der
+    Schalter im Dashboard ist autoritativ, weil ohnehin nur ein Ollama-Modell
+    ins VRAM passt. Clients duerfen also weiterhin ihren gewohnten Namen
+    schicken (Hindsight schickt je nach Lauf Alias, Flint-, GPT-OSS- oder
+    Abliterated-Namen).
     Unbekannte Modelle gehen unveraendert weiter; laeuft Qwen, bleibt alles
     unveraendert. Fuer GPT-OSS setzt das Gateway ausserdem die
     Hindsight-Defaults ``temperature: 0`` und ``reasoning_effort: "low"`` -
-    nur wenn der Client sie nicht selbst mitschickt. Rueckgabe: True, wenn
-    der Body geaendert wurde.
+    nur wenn der Client sie nicht selbst mitschickt. Fuer Abliterated wird
+    ``reasoning_effort`` entfernt, weil Ollama es bei diesem Modell mit
+    "does not support thinking" ablehnt. Rueckgabe: True, wenn der Body
+    geaendert wurde.
     """
     if deps.backend is None:
         return False
     bekannt = {
         name for name in (deps.config.model_alias,
                           deps.config.flint_model,
-                          deps.config.gptoss_model)
+                          deps.config.gptoss_model,
+                          deps.config.abl_model,
+                          deps.config.edge0_model)
         if name
     }
     if koerper.get("model") not in bekannt:
@@ -273,6 +318,9 @@ async def _modell_anpassen(deps: "Deps", koerper: dict, *,
         if chat and "reasoning_effort" not in koerper:
             koerper["reasoning_effort"] = "low"
             geaendert = True
+    elif ziel == deps.config.abl_model and "reasoning_effort" in koerper:
+        koerper.pop("reasoning_effort")
+        geaendert = True
     return geaendert
 
 
@@ -1217,9 +1265,13 @@ async def handle_v1(request: Request, deps: Deps) -> Response:
         return await _passthrough(request, deps, roh,
                                   base=deps.config.embed_base)
     if koerper is None:
-        return await _passthrough(request, deps, roh)
+        antwort = await _passthrough(request, deps, roh)
+        if (request.method == "GET"
+                and request.url.path.rstrip("/").endswith("/v1/models")):
+            return _modelle_mit_alias(antwort, deps)
+        return antwort
     if _ist_completion_pfad(request.url.path):
-        # Ollama kennt den Qwen-Alias nicht; bei aktivem Flint/GPT-OSS
+        # Ollama kennt den Qwen-Alias nicht; bei aktivem Flint/GPT-OSS/Abliterated
         # umschreiben, bevor Prioritaet/Hindsight/rid den Body sehen.
         geaendert = await _modell_anpassen(
             deps, koerper,

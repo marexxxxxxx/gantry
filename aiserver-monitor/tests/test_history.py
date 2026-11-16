@@ -248,15 +248,18 @@ class TestCleanup(HistoryTestCase):
 class TestQueryStats(HistoryTestCase):
     def setUp(self):
         super().setUp()
-        # Drei Jobs im Fenster [1000, 1100] ...
+        # Drei Jobs im Fenster [1000, 1100] mit zwei Modellen/Quellen ...
         self.history.record_job(self.job(
             "j1", "done", 1_000_000, ttft_ms=2000.0, duration_ms=9000.0,
-            prompt_tokens=11, completion_tokens=7))
+            prompt_tokens=11, completion_tokens=7,
+            source="10.0.0.1", model="m"))
         self.history.record_job(self.job(
             "j2", "done", 1_010_000, ttft_ms=4000.0, duration_ms=20000.0,
-            prompt_tokens=3, completion_tokens=5))
+            prompt_tokens=3, completion_tokens=5,
+            source="10.0.0.2", model="n"))
         self.history.record_job(self.job(
-            "j3", "aborted", 1_020_000, duration_ms=1000.0))
+            "j3", "aborted", 1_020_000, duration_ms=1000.0,
+            source="10.0.0.1", model="m"))
         # ... und ein Fehler-Job ausserhalb (ohne Token-Messwerte).
         self.history.record_job(self.job(
             "j4", "error", 2_000_000, duration_ms=1000.0, error="upstream weg"))
@@ -266,10 +269,55 @@ class TestQueryStats(HistoryTestCase):
         self.assertEqual(stats["overview"], {
             "count": 3, "done": 2, "aborted": 1, "error": 0,
             "tokens_in": 14, "tokens_out": 12,
-            "ttft": {"p50": 2.0, "p95": 4.0},
+            "ttft": {"p50": 2.0, "p95": 4.0, "p99": 4.0},
             "duration": {"p50": 9.0, "p95": 20.0},
+            # Dekodierrate: j1 7 Tokens / 7 s, j2 5 Tokens / 16 s.
+            "tok_per_s": {"avg": 0.65625, "max": 1.0},
         })
-        self.assertEqual(stats["buckets"], [])
+        # Jobs erzeugen eigene Buckets, auch ohne Sample im Fenster.
+        self.assertEqual([bucket["ts"] for bucket in stats["buckets"]],
+                         [960, 1020])
+        self.assertEqual(stats["buckets"][0]["jobs"], 2)
+
+    def test_breakdowns_nach_modell_und_quelle(self):
+        stats = self.history.query_stats(1000.0, 1100.0, 60)
+        self.assertEqual(stats["models"], [
+            {"model": "m", "jobs": 2, "done": 1, "error": 0,
+             "tokens_in": 11, "tokens_out": 7,
+             "avg_ttft": 2.0, "avg_tok_per_s": 1.0},
+            {"model": "n", "jobs": 1, "done": 1, "error": 0,
+             "tokens_in": 3, "tokens_out": 5,
+             "avg_ttft": 4.0, "avg_tok_per_s": 0.3125},
+        ])
+        self.assertEqual(stats["sources"], [
+            {"source": "10.0.0.1", "jobs": 2, "done": 1, "error": 0,
+             "tokens_in": 11, "tokens_out": 7,
+             "avg_ttft": 2.0, "avg_tok_per_s": 1.0},
+            {"source": "10.0.0.2", "jobs": 1, "done": 1, "error": 0,
+             "tokens_in": 3, "tokens_out": 5,
+             "avg_ttft": 4.0, "avg_tok_per_s": 0.3125},
+        ])
+        self.assertEqual(stats["errors"], [])
+
+    def test_fehlerursachen_werden_normalisiert_und_gezaehlt(self):
+        basis = 3_000_000
+        self.history.record_job(self.job(
+            "e1", "error", basis,
+            error="RemoteProtocolError: peer closed connection"))
+        self.history.record_job(self.job(
+            "e2", "error", basis + 1000,
+            error="RemoteProtocolError: Server disconnected"))
+        self.history.record_job(self.job(
+            "e3", "error", basis + 2000,
+            error="ConnectError: All connection attempts failed"))
+        self.history.record_job(self.job(
+            "e4", "error", basis + 3000, error="upstream weg"))
+        stats = self.history.query_stats(3000.0, 3100.0, 60)
+        self.assertEqual(stats["errors"], [
+            {"kind": "RemoteProtocolError", "count": 2},
+            {"kind": "ConnectError", "count": 1},
+            {"kind": "upstream weg", "count": 1},
+        ])
 
     def test_grenzen_inklusiv_und_fehler_job_zaehlt(self):
         stats = self.history.query_stats(1000.0, 2000.0, 60)
@@ -284,17 +332,24 @@ class TestQueryStats(HistoryTestCase):
         self.assertIsNone(nur_j4["overview"]["tokens_out"])
         self.assertIsNone(nur_j4["overview"]["ttft"]["p50"])
         self.assertIsNone(nur_j4["overview"]["ttft"]["p95"])
+        self.assertIsNone(nur_j4["overview"]["ttft"]["p99"])
         self.assertEqual(nur_j4["overview"]["duration"], {"p50": 1.0, "p95": 1.0})
+        self.assertEqual(nur_j4["overview"]["tok_per_s"],
+                         {"avg": None, "max": None})
 
     def test_leeres_fenster(self):
         stats = self.history.query_stats(2100.0, 2200.0, 60)
         self.assertEqual(stats["overview"], {
             "count": 0, "done": 0, "aborted": 0, "error": 0,
             "tokens_in": None, "tokens_out": None,
-            "ttft": {"p50": None, "p95": None},
+            "ttft": {"p50": None, "p95": None, "p99": None},
             "duration": {"p50": None, "p95": None},
+            "tok_per_s": {"avg": None, "max": None},
         })
         self.assertEqual(stats["buckets"], [])
+        self.assertEqual(stats["models"], [])
+        self.assertEqual(stats["sources"], [])
+        self.assertEqual(stats["errors"], [])
 
     def test_buckets_mitteln_je_fenster(self):
         self.history.record_sample(self.sample(
@@ -308,10 +363,50 @@ class TestQueryStats(HistoryTestCase):
         self.assertEqual(stats["buckets"], [
             {"ts": 60, "available": 1.0, "running": 2.0, "waiting": 4.0,
              "throughput": 10.0, "token_usage": None, "gpu_util": 50.0,
-             "vram_used_mb": 1000.0, "vram_total_mb": 16000.0},
+             "vram_used_mb": 1000.0, "vram_total_mb": 16000.0,
+             "jobs": 0, "done": 0, "error": 0, "aborted": 0,
+             "tokens_in": 0, "tokens_out": 0, "tok_per_s": None,
+             "ttft_p50": None, "duration_p50": None},
             {"ts": 120, "available": 0.5, "running": 4.0, "waiting": None,
              "throughput": 20.0, "token_usage": 100.0, "gpu_util": 70.0,
-             "vram_used_mb": 1200.0, "vram_total_mb": None},
+             "vram_used_mb": 1200.0, "vram_total_mb": None,
+             "jobs": 0, "done": 0, "error": 0, "aborted": 0,
+             "tokens_in": 0, "tokens_out": 0, "tok_per_s": None,
+             "ttft_p50": None, "duration_p50": None},
+        ])
+
+    def test_buckets_enthalten_job_aggregate_und_gemergte_sample_luecken(self):
+        self.history.record_sample(self.sample(100.0, running=1))
+        self.history.record_job(self.job(
+            "b1", "done", 110_000, ttft_ms=1000.0, duration_ms=5000.0,
+            prompt_tokens=10, completion_tokens=20))
+        self.history.record_job(self.job(
+            "b2", "done", 120_000, ttft_ms=2000.0, duration_ms=6000.0,
+            prompt_tokens=2, completion_tokens=4))
+        self.history.record_job(self.job(
+            "b3", "error", 310_000, error="ConnectError: weg"))
+        stats = self.history.query_stats(100.0, 400.0, 60)
+        self.assertEqual(stats["buckets"], [
+            {"ts": 60, "available": 1.0, "running": 1.0, "waiting": None,
+             "throughput": None, "token_usage": None, "gpu_util": None,
+             "vram_used_mb": None, "vram_total_mb": None,
+             "jobs": 1, "done": 1, "error": 0, "aborted": 0,
+             "tokens_in": 10, "tokens_out": 20, "tok_per_s": 5.0,
+             "ttft_p50": 1.0, "duration_p50": 5.0},
+            # Zweiter Job: 120 s liegt im naechsten Fenster (120..179).
+            {"ts": 120, "available": 0.0, "running": None, "waiting": None,
+             "throughput": None, "token_usage": None, "gpu_util": None,
+             "vram_used_mb": None, "vram_total_mb": None,
+             "jobs": 1, "done": 1, "error": 0, "aborted": 0,
+             "tokens_in": 2, "tokens_out": 4, "tok_per_s": 1.0,
+             "ttft_p50": 2.0, "duration_p50": 6.0},
+            # Nur Job, kein Sample: Sample-Felder bleiben ungemessen.
+            {"ts": 300, "available": 0.0, "running": None, "waiting": None,
+             "throughput": None, "token_usage": None, "gpu_util": None,
+             "vram_used_mb": None, "vram_total_mb": None,
+             "jobs": 1, "done": 0, "error": 1, "aborted": 0,
+             "tokens_in": None, "tokens_out": None, "tok_per_s": None,
+             "ttft_p50": None, "duration_p50": None},
         ])
 
     def test_bucket_muss_positiv_sein(self):
@@ -345,11 +440,14 @@ class TestLastSample(HistoryTestCase):
         self.assertEqual(letzte["token_usage"], None)
         self.assertIs(letzte["available"], True)
 
-    def test_keys_deckungsgleich_mit_bucket_eintraegen(self):
+    def test_bucket_enthaelt_die_sample_keys_als_teilmenge(self):
         self.history.record_sample(self.sample(100.0, running=2))
         letzte = self.history.last_sample()
         bucket = self.history.query_stats(0.0, 200.0, 60)["buckets"][0]
-        self.assertEqual(set(letzte), set(bucket))
+        self.assertLessEqual(set(letzte), set(bucket))
+        self.assertEqual(set(bucket) - set(letzte), {
+            "jobs", "done", "error", "aborted", "tokens_in", "tokens_out",
+            "tok_per_s", "ttft_p50", "duration_p50"})
 
     def test_buckets_nur_im_fenster(self):
         self.history.record_sample(self.sample(99.0, running=1))

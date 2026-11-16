@@ -44,6 +44,10 @@ _UNLOAD_TIMEOUT_S = 30.0
 #: Hosts, fuer die der Embedding-Sidecar lokal gestartet werden darf.
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
+#: Backends, deren Prozess die Gewichte selbst haelt: sie werden ueber ihr
+#: Start-/Stop-Skript verwaltet und nie per Ollama geladen oder entladen.
+_PROZESS_BACKENDS = ("qwen", "edge0")
+
 
 class LifecycleError(RuntimeError):
     """Basisfehler des Lebenszyklus (Antwort 502)."""
@@ -116,6 +120,7 @@ class ProfileCatalog:
             (config.flint_model, "flint", "chat"),
             (config.gptoss_model, "gptoss", "chat"),
             (config.abl_model, "abl", "chat"),
+            (config.edge0_model, "edge0", "chat"),
             (config.qwen_tts_model, "qwen-tts", "tts"),
             (config.audio8_model, "audio8", "tts"),
             (config.embed_model, "embed", "embedding"),
@@ -236,7 +241,8 @@ class ModelLifecycle:
             if profil.kind == "chat":
                 if state != "running" or backend != profil.backend:
                     continue
-                if profil.backend == "qwen" or profil.name in chat_modelle:
+                if (profil.backend in _PROZESS_BACKENDS
+                        or profil.name in chat_modelle):
                     geladen.append(_profil_dict(profil))
             elif profil.kind == "tts":
                 tts_backend = tts_backends.get(profil.backend)
@@ -328,7 +334,6 @@ class ModelLifecycle:
 
         async with self._lock:
             vorher = await self.status()
-            vorher_namen = {eintrag["profile"] for eintrag in vorher["loaded"]}
             entladen: list[dict] = []
             for treffer in profile:
                 if treffer.kind == "tts":
@@ -337,10 +342,9 @@ class ModelLifecycle:
                             and await self._unload_tts(tts_backend)):
                         entladen.append(_profil_dict(treffer))
                     continue
-                if treffer.name not in vorher_namen:
-                    continue
                 if treffer.kind == "chat":
-                    await self._unload_chat(treffer)
+                    if await self._unload_chat(treffer):
+                        entladen.append(_profil_dict(treffer))
                 else:
                     await self._unload_embed()
 
@@ -363,11 +367,20 @@ class ModelLifecycle:
         snap = await self.server_control.snapshot()
         if (snap.get("state") == "running"
                 and snap.get("backend") == profil.backend):
-            if profil.backend == "qwen":
+            if profil.backend in _PROZESS_BACKENDS:
                 return
             if profil.name in await self._ollama_modelle(
                     self.config.upstream_base):
                 return
+
+        # qwen und edge0 halten ihre Gewichte im eigenen Prozess und teilen
+        # sich die GPU: das laufende muss weichen, bevor das andere startet.
+        laufend = snap.get("backend")
+        if (profil.backend in _PROZESS_BACKENDS
+                and snap.get("state") in ("running", "starting")
+                and laufend in _PROZESS_BACKENDS
+                and laufend != profil.backend):
+            await self._stop_backend(str(laufend))
 
         try:
             await self._start_backend(profil.backend)
@@ -383,14 +396,14 @@ class ModelLifecycle:
             if (snap.get("state") != "running"
                     or snap.get("backend") != profil.backend):
                 return False
-            if profil.backend == "qwen":
+            if profil.backend in _PROZESS_BACKENDS:
                 return True
             return await self._version_ok(self.config.upstream_base)
 
         await self._wait(backend_bereit, self.load_timeout_s,
                          f"Start von {profil.backend}")
 
-        if profil.backend == "qwen":
+        if profil.backend in _PROZESS_BACKENDS:
             return
 
         modelle = await self._ollama_modelle(self.config.upstream_base)
@@ -582,27 +595,28 @@ class ModelLifecycle:
         health = await self._tts_health(backend)
         return bool(health and health.get("model_loaded") is True)
 
-    async def _unload_chat(self, profil: ModelProfile) -> None:
+    async def _unload_chat(self, profil: ModelProfile) -> bool:
         snap = await self.server_control.snapshot()
         if (snap.get("state") not in ("running", "starting")
                 or snap.get("backend") != profil.backend):
-            return
+            return False
 
-        if profil.backend == "qwen":
-            await self._stop_backend("qwen")
+        if profil.backend in _PROZESS_BACKENDS:
+            backend = profil.backend
+            await self._stop_backend(backend)
 
             async def gestoppt() -> bool:
                 aktuell = await self.server_control.snapshot()
                 return (aktuell.get("state") == "stopped"
-                        and aktuell.get("backend") != "qwen")
+                        and aktuell.get("backend") != backend)
 
             await self._wait(gestoppt, self.unload_timeout_s,
-                             "Stoppen von qwen")
-            return
+                             f"Stoppen von {backend}")
+            return True
 
         if profil.name not in await self._ollama_modelle(
                 self.config.upstream_base):
-            return
+            return False
         try:
             antwort = await self.client.post(
                 f"{self.config.upstream_base}/api/generate",
@@ -612,7 +626,7 @@ class ModelLifecycle:
             antwort.raise_for_status()
         except httpx.HTTPError:
             # Sidecar nicht erreichbar: dann ist auch nichts geladen.
-            return
+            return False
 
         async def weg() -> bool:
             return profil.name not in await self._ollama_modelle(
@@ -620,6 +634,7 @@ class ModelLifecycle:
 
         await self._wait(weg, self.unload_timeout_s,
                          f"Entladen von {profil.name}")
+        return True
 
     async def _unload_embed(self) -> None:
         if self.config.embed_model not in await self._ollama_modelle(

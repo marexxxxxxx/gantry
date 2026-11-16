@@ -244,8 +244,8 @@ class TestProfileCatalog(unittest.TestCase):
         katalog = ProfileCatalog(Config(db_path="x.db"))
         self.assertEqual(katalog.names, [QWEN, FLINT, "gpt-oss:20b",
                                          "hf.co/bartowski/huihui-ai_Qwen3-14B-"
-                                         "abliterated-GGUF:Q4_K_M", TTS, AUDIO8,
-                                         EMBED])
+                                         "abliterated-GGUF:Q4_K_M", "edge0-120b",
+                                         TTS, AUDIO8, EMBED])
 
     def test_doppelte_namen_werden_zuerst_gewonnen(self):
         katalog = ProfileCatalog(Config(
@@ -253,14 +253,15 @@ class TestProfileCatalog(unittest.TestCase):
         ))
         self.assertEqual(katalog.names, [QWEN, "gpt-oss:20b",
                                          "hf.co/bartowski/huihui-ai_Qwen3-14B-"
-                                         "abliterated-GGUF:Q4_K_M", TTS, AUDIO8,
-                                         EMBED])
+                                         "abliterated-GGUF:Q4_K_M", "edge0-120b",
+                                         TTS, AUDIO8, EMBED])
         self.assertEqual(katalog.get(QWEN).backend, "qwen")
 
     def test_leere_namen_werden_uebersprungen(self):
         katalog = ProfileCatalog(Config(
             db_path="x.db", model_alias="", flint_model="", gptoss_model="",
-            abl_model="", qwen_tts_model="", audio8_model="", embed_model="",
+            abl_model="", edge0_model="", qwen_tts_model="", audio8_model="",
+            embed_model="",
         ))
         self.assertEqual(katalog.names, [])
 
@@ -557,6 +558,14 @@ class TestUnload(LifecycleTestCase):
         self.assertEqual([p["profile"] for p in antwort["unloaded"]], [QWEN])
         self.assertEqual(antwort["loaded"], [])
         self.assertEqual(antwort["requested"], "all")
+
+    async def test_all_entlaedt_qwen_auch_im_zustand_starting(self):
+        self.control.state = "starting"
+        self.control.backend = "qwen"
+        antwort = await self.lifecycle().unload()
+        self.assertEqual(self.control.stopped, ["qwen"])
+        self.assertEqual(antwort["loaded"], [])
+        self.assertEqual([p["profile"] for p in antwort["unloaded"]], [QWEN])
 
     async def test_all_entlaedt_ollama_modell_ohne_prozess_zu_stoppen(self):
         self.control.state = "running"

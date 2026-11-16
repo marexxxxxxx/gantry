@@ -93,10 +93,18 @@ class Config:
     abl_start_script: str = "runtime/abl/start-abl.sh"
     abl_stop_script: str = "runtime/abl/stop-abl.sh"
     abl_pidfile: str = "runtime/abl/abl.pid"
-    # Modell-Alias: Clients (z. B. Hindsight) senden weiterhin den Qwen-Namen.
-    # Laeuft Flint, GPT-OSS oder Abliterated, schreibt das Gateway ihn auf das
-    # jeweilige Modell um; laeuft Qwen, bleibt er unveraendert (dort ist er der
-    # echte Modellname).
+    # Edge0-Backend: eigener Prozess (edge0-infer + edge0-strata), kein Ollama.
+    # Braucht die ganze GPU; der Health-Pfad ist /health wie bei SGLang.
+    edge0_start_script: str = "runtime/edge0/start-edge0.sh"
+    edge0_stop_script: str = "runtime/edge0/stop-edge0.sh"
+    edge0_pidfile: str = "runtime/edge0/edge0.pid"
+    edge0_health_path: str = "/health"
+    # Modellname, den Edge0 meldet (--alias in start-edge0.sh).
+    edge0_model: str = "edge0-120b"
+    # Modell-Alias: Clients (z. B. Hindsight und Hermes) senden weiterhin den
+    # Qwen-Namen. Laeuft Flint, GPT-OSS, Abliterated oder Edge0, schreibt das
+    # Gateway ihn auf das jeweilige Modell um; laeuft Qwen, bleibt er
+    # unveraendert (dort ist er der echte Modellname).
     model_alias: str = "escha-qwen38-27b-w2"
     flint_model: str = "hf.co/AtomicChat/Flint-GGUF:IQ4_XS"
     gptoss_model: str = "gpt-oss:20b"

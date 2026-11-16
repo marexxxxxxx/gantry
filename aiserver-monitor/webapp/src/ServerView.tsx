@@ -18,7 +18,7 @@ const ZUSTAND_TEXT: Record<ServerState, string> = {
 const ZUSTAND_DETAIL: Record<ServerState, string> = {
   running: "Der Modellserver ist erreichbar (Health ok).",
   starting:
-    "Gewichte werden geladen oder Health antwortet noch nicht — Qwen braucht 2–4 Minuten, Flint und GPT-OSS wenige Sekunden.",
+    "Gewichte werden geladen oder Health antwortet noch nicht — Qwen braucht 2–4 Minuten, Flint, GPT-OSS und Abliterated wenige Sekunden.",
   stopping: "Der Server fährt herunter; laufende Jobs werden beendet.",
   stopped: "Der Modellserver ist aus. Das Dashboard läuft weiter.",
 };
@@ -28,6 +28,8 @@ const BACKEND_TEXT: Record<ServerBackend, string> = {
   qwen: "Qwen (SGLang)",
   flint: "Flint (Ollama)",
   gptoss: "GPT-OSS 20B (Ollama)",
+  abl: "Qwen3-14B Abliterated (Ollama)",
+  edge0: "Edge0 120B (NVFP4)",
 };
 
 /** Bestaetigung faellt ohne Klick nach dieser Zeit zurueck. */
@@ -43,7 +45,7 @@ function fehlerText(fehler: unknown): string {
 
 /**
  * Server-Ansicht: Status des Modellservers und Wahl zwischen Qwen (SGLang),
- * Flint (Ollama) und GPT-OSS 20B (Ollama).
+ * Flint, GPT-OSS 20B und Qwen3-14B Abliterated (alle Ollama).
  *
  * Alle Backends lauschen auf demselben Upstream-Port; ein Wechsel stoppt
  * deshalb das laufende Backend und startet das gewaehlte. Clients und das
@@ -140,10 +142,11 @@ export default function ServerView() {
       <h2>Server</h2>
       <p className="prioritaet-hinweis">
         Schaltet den Modellserver ein, aus oder wechselt zwischen Qwen
-        (SGLang), Flint und GPT-OSS 20B (beide Ollama). Alle laufen auf
-        demselben Upstream-Port, das Gateway und alle Clients bleiben
-        unverändert erreichbar. GPT-OSS läuft mit 64k Kontext und den
-        Hindsight-Defaults temperature 0 / reasoning_effort low.
+        (SGLang), Flint, GPT-OSS 20B und Qwen3-14B Abliterated (alle
+        Ollama). Alle laufen auf demselben Upstream-Port, das Gateway und
+        alle Clients bleiben unverändert erreichbar. GPT-OSS läuft mit 64k
+        Kontext und den Hindsight-Defaults temperature 0 /
+        reasoning_effort low; Abliterated läuft mit 16k Kontext.
       </p>
 
       {ladefehler !== null && (
@@ -302,6 +305,8 @@ export default function ServerView() {
           <h3>Ohne Dashboard</h3>
           <p className="prioritaet-hinweis">
             Derselbe Weg im Terminal: <code>bash server.sh switch gptoss</code>,
+            <code>bash server.sh switch abl</code>,
+            <code>bash server.sh switch edge0</code>,
             <code>bash server.sh switch flint</code>,
             <code>bash server.sh start qwen</code>,
             <code>bash server.sh stop</code> oder

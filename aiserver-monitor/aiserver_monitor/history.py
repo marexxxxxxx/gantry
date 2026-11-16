@@ -19,6 +19,12 @@ from pathlib import Path
 RETENTION_JOBS_DAYS = 30
 RETENTION_SERIES_DAYS = 7
 
+#: So viele Fehlerursachen liefert ``query_stats`` hoechstens (Top nach Anzahl).
+FEHLER_TOP = 10
+
+#: Laengste angezeigte Fehlerursache in Zeichen.
+FEHLER_MAX_LAENGE = 80
+
 _SCHEMA_JOBS = """\
 CREATE TABLE IF NOT EXISTS jobs(
   rid TEXT PRIMARY KEY, source TEXT, model TEXT, prompt_start TEXT,
@@ -49,6 +55,21 @@ def percentile(values: list[float], p: int) -> float | None:
     rang = math.ceil(p / 100.0 * len(sortiert))
     index = min(max(rang - 1, 0), len(sortiert) - 1)
     return float(sortiert[index])
+
+
+def fehler_ursache(text: str) -> str:
+    """Kurze, gruppierbare Fehlerursache aus einem Job-Fehlertext.
+
+    Der Teil vor dem ersten Doppelpunkt ist die Ursachenklasse
+    (z. B. ``RemoteProtocolError``); ohne Doppelpunkt bleibt der ganze Text.
+    Getrimmt und auf :data:`FEHLER_MAX_LAENGE` Zeichen gekuerzt; ein leerer
+    Text ergibt ``"Unbekannt"``.
+    """
+    roh = text.strip()
+    if not roh:
+        return "Unbekannt"
+    klasse = roh.split(":", 1)[0].strip()
+    return (klasse or roh)[:FEHLER_MAX_LAENGE]
 
 
 class History:
@@ -156,43 +177,143 @@ class History:
         """Statistik ueber ein Zeitfenster (Epoche-Sekunden, beide Grenzen inklusiv).
 
         ``overview`` zaehlt Jobs nach ``created_at`` (done/aborted/error,
-        Token-Summen, TTFT-/Dauer-Perzentile in Sekunden; nichts gemessen ->
-        None). ``buckets`` mittelt die Samples je ``bucket_s``-Fenster
-        (Start = floor(ts / bucket_s) * bucket_s); je Spalte werden nur
-        gefuellte Werte gemittelt, Spalten ohne Wert bleiben None;
-        ``available`` ist der Anteil verfuegbarer Samples. ``bucket_s`` muss
-        positiv sein (sonst ValueError statt stiller NULL-Buckets).
+        Token-Summen, TTFT-/Dauer-Perzentile in Sekunden, Dekodierrate aus
+        fertigen Jobs; nichts gemessen -> None). ``buckets`` mittelt die
+        Samples je ``bucket_s``-Fenster (Start = floor(ts / bucket_s) *
+        bucket_s) und ergaenzt Job-Aggregate desselben Fensters; je Spalte
+        werden nur gefuellte Werte gemittelt, Spalten ohne Wert bleiben None;
+        ``available`` ist der Anteil verfuegbarer Samples. ``models``,
+        ``sources`` und ``errors`` schluesseln die Jobs im Fenster auf.
+        Job-Fenster ohne Sample und Sample-Fenster ohne Job werden beide
+        geliefert (fehlende Seite: 0 bzw. None). ``bucket_s`` muss positiv
+        sein (sonst ValueError statt stiller NULL-Buckets).
         """
         if bucket_s <= 0:
             raise ValueError(f"bucket_s muss positiv sein: {bucket_s}")
-        zeile = self._conn.execute(
-            "SELECT COUNT(*),"
-            " COALESCE(SUM(status = 'done'), 0),"
-            " COALESCE(SUM(status = 'aborted'), 0),"
-            " COALESCE(SUM(status = 'error'), 0),"
-            " SUM(prompt_tokens), SUM(completion_tokens)"
+
+        zeilen = self._conn.execute(
+            "SELECT source, model, status, created_at, first_token_at,"
+            " finished_at, prompt_tokens, completion_tokens, error"
             " FROM jobs WHERE created_at >= ? AND created_at <= ?",
-            (from_ts, to_ts)).fetchone()
-        count, done, aborted, error, tokens_in, tokens_out = zeile
+            (from_ts, to_ts)).fetchall()
 
-        ttft = [row[0] for row in self._conn.execute(
-            "SELECT first_token_at - created_at FROM jobs"
-            " WHERE created_at >= ? AND created_at <= ?"
-            " AND first_token_at IS NOT NULL", (from_ts, to_ts))]
-        duration = [row[0] for row in self._conn.execute(
-            "SELECT finished_at - created_at FROM jobs"
-            " WHERE created_at >= ? AND created_at <= ?"
-            " AND finished_at IS NOT NULL", (from_ts, to_ts))]
+        status_anzahl = {"done": 0, "aborted": 0, "error": 0}
+        tokens_in_summe = tokens_out_summe = 0
+        tokens_in_gemessen = tokens_out_gemessen = False
+        ttft_werte: list[float] = []
+        dauer_werte: list[float] = []
+        raten: list[float] = []
+        model_gruppen: dict[str, dict] = {}
+        quellen_gruppen: dict[str, dict] = {}
+        fehler_anzahl: dict[str, int] = {}
+        bucket_gruppen: dict[int, dict] = {}
 
-        buckets = [{
-            "ts": row[0],
-            "available": row[1],
-            "running": row[2],
-            "waiting": row[3],
-            "throughput": row[4],
-            "token_usage": row[5],
-            "gpu_util": row[6],
-            "vram_used_mb": row[7],
+        def gruppe(tabelle: dict[str, dict], key: str) -> dict:
+            """Aggregat-Eintrag je Modell/Quelle; Listen fuer Mittelwerte."""
+            return tabelle.setdefault(key, {
+                "jobs": 0, "done": 0, "error": 0,
+                "tokens_in": 0, "tokens_in_gemessen": False,
+                "tokens_out": 0, "tokens_out_gemessen": False,
+                "ttft": [], "raten": [],
+            })
+
+        for (source, model, status, created_at, first_token_at,
+             finished_at, prompt_tokens, completion_tokens, error) in zeilen:
+            ttft = (None if first_token_at is None
+                    else first_token_at - created_at)
+            dauer = (None if finished_at is None
+                     else finished_at - created_at)
+            rate = None
+            if (status == "done" and completion_tokens is not None
+                    and first_token_at is not None
+                    and finished_at is not None
+                    and finished_at > first_token_at):
+                rate = completion_tokens / (finished_at - first_token_at)
+
+            if status in status_anzahl:
+                status_anzahl[status] += 1
+            if prompt_tokens is not None:
+                tokens_in_summe += prompt_tokens
+                tokens_in_gemessen = True
+            if completion_tokens is not None:
+                tokens_out_summe += completion_tokens
+                tokens_out_gemessen = True
+            if ttft is not None:
+                ttft_werte.append(ttft)
+            if dauer is not None:
+                dauer_werte.append(dauer)
+            if rate is not None:
+                raten.append(rate)
+            if status == "error" and error:
+                ursache = fehler_ursache(error)
+                fehler_anzahl[ursache] = fehler_anzahl.get(ursache, 0) + 1
+
+            for tabelle, key in ((model_gruppen, model or ""),
+                                 (quellen_gruppen, source or "")):
+                eintrag = gruppe(tabelle, key)
+                eintrag["jobs"] += 1
+                if status in ("done", "error"):
+                    eintrag[status] += 1
+                if prompt_tokens is not None:
+                    eintrag["tokens_in"] += prompt_tokens
+                    eintrag["tokens_in_gemessen"] = True
+                if completion_tokens is not None:
+                    eintrag["tokens_out"] += completion_tokens
+                    eintrag["tokens_out_gemessen"] = True
+                if ttft is not None:
+                    eintrag["ttft"].append(ttft)
+                if rate is not None:
+                    eintrag["raten"].append(rate)
+
+            fenster = int(created_at // bucket_s) * bucket_s
+            bucket = bucket_gruppen.setdefault(fenster, {
+                "jobs": 0, "done": 0, "aborted": 0, "error": 0,
+                "tokens_in": 0, "tokens_in_gemessen": False,
+                "tokens_out": 0, "tokens_out_gemessen": False,
+                "raten": [], "ttft": [], "dauer": [],
+            })
+            bucket["jobs"] += 1
+            if status in ("done", "aborted", "error"):
+                bucket[status] += 1
+            if prompt_tokens is not None:
+                bucket["tokens_in"] += prompt_tokens
+                bucket["tokens_in_gemessen"] = True
+            if completion_tokens is not None:
+                bucket["tokens_out"] += completion_tokens
+                bucket["tokens_out_gemessen"] = True
+            if ttft is not None:
+                bucket["ttft"].append(ttft)
+            if dauer is not None:
+                bucket["dauer"].append(dauer)
+            if rate is not None:
+                bucket["raten"].append(rate)
+
+        def aufschluesselung(tabelle: dict[str, dict], name: str) -> list[dict]:
+            """Finale Modell-/Quellenliste, meistbeschaeftigt zuerst."""
+            ergebnis = []
+            for key, eintrag in tabelle.items():
+                ergebnis.append({
+                    name: key,
+                    "jobs": eintrag["jobs"],
+                    "done": eintrag["done"],
+                    "error": eintrag["error"],
+                    "tokens_in": (eintrag["tokens_in"]
+                                  if eintrag["tokens_in_gemessen"] else None),
+                    "tokens_out": (eintrag["tokens_out"]
+                                   if eintrag["tokens_out_gemessen"] else None),
+                    "avg_ttft": (sum(eintrag["ttft"]) / len(eintrag["ttft"])
+                                 if eintrag["ttft"] else None),
+                    "avg_tok_per_s": (sum(eintrag["raten"])
+                                      / len(eintrag["raten"])
+                                      if eintrag["raten"] else None),
+                })
+            ergebnis.sort(key=lambda eintrag: (-eintrag["jobs"], eintrag[name]))
+            return ergebnis
+
+        sample_buckets = {row[0]: {
+            "ts": row[0], "available": row[1], "running": row[2],
+            "waiting": row[3], "throughput": row[4], "token_usage": row[5],
+            "gpu_util": row[6], "vram_used_mb": row[7],
             "vram_total_mb": row[8],
         } for row in self._conn.execute(
             "SELECT CAST(ts / ? AS INTEGER) * ? AS fenster,"
@@ -201,19 +322,68 @@ class History:
             " AVG(vram_total_mb)"
             " FROM samples WHERE ts >= ? AND ts <= ?"
             " GROUP BY fenster ORDER BY fenster",
-            (bucket_s, bucket_s, from_ts, to_ts))]
+            (bucket_s, bucket_s, from_ts, to_ts))}
+
+        buckets = []
+        for ts in sorted(set(sample_buckets) | set(bucket_gruppen)):
+            bucket = sample_buckets.get(ts)
+            if bucket is None:
+                bucket = {
+                    "ts": ts, "available": 0.0, "running": None,
+                    "waiting": None, "throughput": None, "token_usage": None,
+                    "gpu_util": None, "vram_used_mb": None,
+                    "vram_total_mb": None,
+                }
+            roh = bucket_gruppen.get(ts)
+            if roh is None:
+                bucket.update({
+                    "jobs": 0, "done": 0, "error": 0, "aborted": 0,
+                    "tokens_in": 0, "tokens_out": 0, "tok_per_s": None,
+                    "ttft_p50": None, "duration_p50": None,
+                })
+            else:
+                bucket.update({
+                    "jobs": roh["jobs"], "done": roh["done"],
+                    "error": roh["error"], "aborted": roh["aborted"],
+                    "tokens_in": (roh["tokens_in"]
+                                  if roh["tokens_in_gemessen"] else None),
+                    "tokens_out": (roh["tokens_out"]
+                                   if roh["tokens_out_gemessen"] else None),
+                    "tok_per_s": (sum(roh["raten"]) / len(roh["raten"])
+                                  if roh["raten"] else None),
+                    "ttft_p50": percentile(roh["ttft"], 50),
+                    "duration_p50": percentile(roh["dauer"], 50),
+                })
+            buckets.append(bucket)
 
         return {
             "overview": {
-                "count": count, "done": done, "aborted": aborted,
-                "error": error, "tokens_in": tokens_in,
-                "tokens_out": tokens_out,
-                "ttft": {"p50": percentile(ttft, 50),
-                         "p95": percentile(ttft, 95)},
-                "duration": {"p50": percentile(duration, 50),
-                             "p95": percentile(duration, 95)},
+                "count": len(zeilen),
+                "done": status_anzahl["done"],
+                "aborted": status_anzahl["aborted"],
+                "error": status_anzahl["error"],
+                "tokens_in": tokens_in_summe if tokens_in_gemessen else None,
+                "tokens_out": (tokens_out_summe
+                               if tokens_out_gemessen else None),
+                "ttft": {"p50": percentile(ttft_werte, 50),
+                         "p95": percentile(ttft_werte, 95),
+                         "p99": percentile(ttft_werte, 99)},
+                "duration": {"p50": percentile(dauer_werte, 50),
+                             "p95": percentile(dauer_werte, 95)},
+                "tok_per_s": {
+                    "avg": sum(raten) / len(raten) if raten else None,
+                    "max": max(raten) if raten else None,
+                },
             },
             "buckets": buckets,
+            "models": aufschluesselung(model_gruppen, "model"),
+            "sources": aufschluesselung(quellen_gruppen, "source"),
+            "errors": [
+                {"kind": kind, "count": anzahl}
+                for kind, anzahl in sorted(
+                    fehler_anzahl.items(), key=lambda eintrag: (-eintrag[1],
+                                                               eintrag[0]))[:FEHLER_TOP]
+            ],
         }
 
     def last_sample(self) -> dict | None:

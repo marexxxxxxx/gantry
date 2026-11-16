@@ -49,7 +49,13 @@ export interface Sample {
   max_tokens?: number | null;
 }
 
-/** Ein gemitteltes Bucket aus ``GET /monitor/stats``; ``ts`` = Bucket-Start (Sekunden). */
+/** Ein gemitteltes Bucket aus ``GET /monitor/stats``; ``ts`` = Bucket-Start (Sekunden).
+ *
+ * Sample-Felder (``available`` ... ``vram_total_mb``) sind ``null`` bzw. 0,
+ * wenn im Fenster kein Sample lag. Die Job-Felder zaehlen Jobs nach
+ * ``created_at``: ``jobs``/``done``/``error``/``aborted``, Token-Summen und
+ * die aus fertigen Jobs abgeleitete Dekodierrate ``tok_per_s``.
+ */
 export interface StatsBucket {
   ts: number;
   available: number;
@@ -60,6 +66,15 @@ export interface StatsBucket {
   gpu_util: number | null;
   vram_used_mb: number | null;
   vram_total_mb: number | null;
+  jobs: number;
+  done: number;
+  error: number;
+  aborted: number;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  tok_per_s: number | null;
+  ttft_p50: number | null;
+  duration_p50: number | null;
 }
 
 /** Kopfzahlen aus ``GET /monitor/stats`` (jobs nach created_at im Fenster). */
@@ -71,15 +86,48 @@ export interface StatsOverview {
   tokens_in: number | null;
   tokens_out: number | null;
   // Quantile in SEKUNDEN (Server liefert Epoch-Sekunden-Differenzen).
-  ttft: { p50: number | null; p95: number | null };
+  ttft: { p50: number | null; p95: number | null; p99: number | null };
   // Quantile in SEKUNDEN (Anzeige rechnet auf ms bzw. min um).
   duration: { p50: number | null; p95: number | null };
+  // Dekodierrate fertiger Jobs (Tokens/s); aus Jobs abgeleitet, nicht aus
+  // Prometheus - funktioniert daher auch fuer Backends ohne Metriken.
+  tok_per_s: { avg: number | null; max: number | null };
+}
+
+/** Gemeinsame Kennzahlen einer Modell-/Quellen-Gruppe. */
+export interface StatsAggregate {
+  jobs: number;
+  done: number;
+  error: number;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  avg_ttft: number | null;
+  avg_tok_per_s: number | null;
+}
+
+/** Aufschluesselung nach Modell im Zeitfenster. */
+export interface StatsModel extends StatsAggregate {
+  model: string;
+}
+
+/** Aufschluesselung nach Client-Quelle im Zeitfenster. */
+export interface StatsSource extends StatsAggregate {
+  source: string;
+}
+
+/** Gruppierte Fehlerursache (Text vor dem ersten Doppelpunkt). */
+export interface StatsError {
+  kind: string;
+  count: number;
 }
 
 /** Antwort von ``GET /monitor/stats`` (from/to in Millisekunden, bucket in Sekunden). */
 export interface StatsWindow {
   overview: StatsOverview;
   buckets: StatsBucket[];
+  models: StatsModel[];
+  sources: StatsSource[];
+  errors: StatsError[];
 }
 
 /** Persistente Prioritaets-Einstellungen (GET/PUT /monitor/priority). */
@@ -106,7 +154,7 @@ export type VerbindungsStatus = "verbinde" | "verbunden" | "getrennt";
 export type ServerState = "running" | "starting" | "stopping" | "stopped";
 
 /** Backend hinter dem festen Upstream-Port (30001). */
-export type ServerBackend = "qwen" | "flint" | "gptoss";
+export type ServerBackend = "qwen" | "flint" | "gptoss" | "abl" | "edge0";
 
 /** Zustand eines Backends (GET /monitor/server). */
 export interface BackendStatus {

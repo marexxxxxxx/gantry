@@ -1,14 +1,15 @@
-"""Start/Stop/Status der Modell-Backends (Qwen/SGLang und Flint/Ollama).
+"""Start/Stop/Status der Modell-Backends (Qwen/SGLang und Ollama).
 
 Eine Quelle fuer Dashboard und ``server.sh``: Das Gateway ruft dieselbe
-:class:`ServerControl` auf wie die CLI. Beide Backends lauschen auf demselben
+:class:`ServerControl` auf wie die CLI. Alle Backends lauschen auf demselben
 Upstream-Port; ein Wechsel stoppt das laufende Backend, wartet auf die
 Portfreigabe und startet das andere.
 
 Qwen laeuft ueber die systemd-User-Unit ``escha-server.service`` (falls
 installiert, sonst ueber ``runtime/sglang/start-penalty.sh`` /
-``stop-server.sh``). Flint laeuft als eigener ``ollama serve``-Prozess
-(``runtime/flint/start-flint.sh`` / ``stop-flint.sh``, PID-File + ``/api/version``).
+``stop-server.sh``). Flint, GPT-OSS und Abliterated laufen als eigener
+``ollama serve``-Prozess (``runtime/<backend>/start-*.sh`` /
+``stop-*.sh``, PID-File + ``/api/version``).
 
 ``--no-block`` kehrt zurueck, bevor systemd fertig ist. Der Zustand wird
 deshalb aus Unit-/Prozesszustand plus Health-Pfad abgeleitet; die UI pollt
@@ -53,7 +54,7 @@ _RUN_TIMEOUT_S = 10.0
 _HEALTH_TIMEOUT_S = 2.0
 
 #: Reihenfolge und Namen der Backends, die sich den Upstream-Port teilen.
-BACKEND_NAMES = ("qwen", "flint", "gptoss")
+BACKEND_NAMES = ("qwen", "flint", "gptoss", "abl", "edge0")
 
 #: Backend, das ohne explizite Wahl gestartet wird.
 DEFAULT_BACKEND = "qwen"
@@ -68,14 +69,26 @@ DEFAULT_GPTOSS_START_SCRIPT = "runtime/gptoss/start-gptoss.sh"
 DEFAULT_GPTOSS_STOP_SCRIPT = "runtime/gptoss/stop-gptoss.sh"
 DEFAULT_GPTOSS_PIDFILE = "runtime/gptoss/gptoss.pid"
 
+DEFAULT_ABL_START_SCRIPT = "runtime/abl/start-abl.sh"
+DEFAULT_ABL_STOP_SCRIPT = "runtime/abl/stop-abl.sh"
+DEFAULT_ABL_PIDFILE = "runtime/abl/abl.pid"
+
+#: Edge0 laeuft nicht ueber Ollama, sondern als eigener edge0-infer-Prozess
+#: (edge0-strata-Engine) mit eigenem PID-File und SGLang-aehnlichem /health.
+DEFAULT_EDGE0_START_SCRIPT = "runtime/edge0/start-edge0.sh"
+DEFAULT_EDGE0_STOP_SCRIPT = "runtime/edge0/stop-edge0.sh"
+DEFAULT_EDGE0_PIDFILE = "runtime/edge0/edge0.pid"
+DEFAULT_EDGE0_HEALTH_PATH = "/health"
+
 
 @dataclass(frozen=True)
 class Backend:
     """Ein Modellserver hinter demselben Upstream-Port.
 
     Genau eines der Backends laeuft: SGLang (Qwen) ueber die systemd-Unit,
-    Flint und GPT-OSS ueber einen eigenen Ollama-Prozess mit PID-File.
-    ``health_path`` unterscheidet sich, weil Ollama kein ``/health`` kennt.
+    Flint, GPT-OSS und Abliterated ueber einen eigenen Ollama-Prozess mit
+    PID-File. ``health_path`` unterscheidet sich, weil Ollama kein ``/health``
+    kennt.
     """
 
     name: str
@@ -142,6 +155,13 @@ class ServerControl:
             gptoss_start_script: str = DEFAULT_GPTOSS_START_SCRIPT,
             gptoss_stop_script: str = DEFAULT_GPTOSS_STOP_SCRIPT,
             gptoss_pidfile: str = DEFAULT_GPTOSS_PIDFILE,
+            abl_start_script: str = DEFAULT_ABL_START_SCRIPT,
+            abl_stop_script: str = DEFAULT_ABL_STOP_SCRIPT,
+            abl_pidfile: str = DEFAULT_ABL_PIDFILE,
+            edge0_start_script: str = DEFAULT_EDGE0_START_SCRIPT,
+            edge0_stop_script: str = DEFAULT_EDGE0_STOP_SCRIPT,
+            edge0_pidfile: str = DEFAULT_EDGE0_PIDFILE,
+            edge0_health_path: str = DEFAULT_EDGE0_HEALTH_PATH,
             runner: Callable[[Sequence[str]], Awaitable[tuple[int, str, str]]]
             | None = None,
             spawner: Callable[[Sequence[str]], None] | None = None,
@@ -181,6 +201,22 @@ class ServerControl:
                 start_script=gptoss_start_script,
                 stop_script=gptoss_stop_script,
                 pidfile=gptoss_pidfile,
+            ),
+            "abl": Backend(
+                name="abl",
+                label="Qwen3-14B Abliterated (Ollama)",
+                health_path=flint_health_path,
+                start_script=abl_start_script,
+                stop_script=abl_stop_script,
+                pidfile=abl_pidfile,
+            ),
+            "edge0": Backend(
+                name="edge0",
+                label="Edge0 120B (NVFP4)",
+                health_path=edge0_health_path,
+                start_script=edge0_start_script,
+                stop_script=edge0_stop_script,
+                pidfile=edge0_pidfile,
             ),
         }
         #: Kompatibilitaet: ``unit`` ist die Unit des Qwen-Backends.
@@ -222,6 +258,13 @@ class ServerControl:
             gptoss_start_script=config.gptoss_start_script,
             gptoss_stop_script=config.gptoss_stop_script,
             gptoss_pidfile=config.gptoss_pidfile,
+            abl_start_script=config.abl_start_script,
+            abl_stop_script=config.abl_stop_script,
+            abl_pidfile=config.abl_pidfile,
+            edge0_start_script=config.edge0_start_script,
+            edge0_stop_script=config.edge0_stop_script,
+            edge0_pidfile=config.edge0_pidfile,
+            edge0_health_path=config.edge0_health_path,
             client=client,
         )
 
@@ -595,7 +638,8 @@ def _status_text(snap: dict) -> str:
         text = (f"{label} laeuft ({snap['upstream']}, Health ok).")
     elif zustand == "starting":
         text = (f"{label} startet noch (Health noch nicht ok) - Qwen "
-                "braucht 2-4 Minuten, Flint und GPT-OSS wenige Sekunden.")
+                "braucht 2-4 Minuten, Flint, GPT-OSS und Abliterated wenige "
+                "Sekunden.")
     elif zustand == "stopping":
         text = f"{label} stoppt ..."
     else:
@@ -664,9 +708,9 @@ async def _mit_client(action: str, *, timeout_s: float,
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="server.sh",
-        description="Modellserver (Qwen/SGLang, Flint/Ollama oder GPT-OSS/Ollama) "
-                    "starten, stoppen, wechseln oder Status zeigen "
-                    "(Dashboard bleibt davon unberuehrt).")
+        description="Modellserver (Qwen/SGLang oder Ollama: Flint, GPT-OSS, "
+                    "Abliterated) starten, stoppen, wechseln oder Status "
+                    "zeigen (Dashboard bleibt davon unberuehrt).")
     parser.add_argument(
         "action",
         choices=("start", "stop", "status", "restart", "switch"))

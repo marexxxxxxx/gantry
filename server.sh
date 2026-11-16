@@ -4,10 +4,13 @@
 #   bash server.sh start            # Qwen starten, wartet bis /health ok
 #   bash server.sh start flint      # Flint (Ollama, 2 Slots) starten
 #   bash server.sh start gptoss     # GPT-OSS 20B (Ollama, 64k) starten
+#   bash server.sh start abl        # Qwen3-14B Abliterated (Ollama, 40k) starten
 #   bash server.sh switch gptoss    # von Qwen/Flint auf GPT-OSS wechseln
+#   bash server.sh switch abl       # auf Qwen3-14B Abliterated wechseln
+#   bash server.sh switch edge0     # auf Edge0 120B (NVFP4) wechseln
 #   bash server.sh stop             # stoppen, GPU freigeben
 #   bash server.sh status           # alle Backends und Health anzeigen
-#   bash server.sh restart [flint|gptoss]  # stop, dann start
+#   bash server.sh restart [flint|gptoss|abl]  # stop, dann start
 #
 # Benutzt dieselbe Logik wie der Dashboard-Tab "Server": ist die
 # systemd-User-Unit escha-server.service installiert, laufen start/stop ueber

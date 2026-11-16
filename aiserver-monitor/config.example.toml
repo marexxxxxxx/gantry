@@ -123,6 +123,14 @@
 # flint_model = "hf.co/AtomicChat/Flint-GGUF:IQ4_XS"
 # gptoss_model = "gpt-oss:20b"
 # abl_model = "hf.co/bartowski/huihui-ai_Qwen3-14B-abliterated-GGUF:Q4_K_M"
+# Edge0 120B laeuft als eigenes Backend (eigener Prozess, kein Ollama). Der
+# Alias oben bleibt der stabile Name fuer Clients; das Gateway schreibt ihn
+# auf das aktive Modell um, auch auf edge0_model.
+# edge0_model = "edge0-120b"
+# edge0_start_script = "runtime/edge0/start-edge0.sh"
+# edge0_stop_script = "runtime/edge0/stop-edge0.sh"
+# edge0_pidfile = "runtime/edge0/edge0.pid"
+# edge0_health_path = "/health"
 
 # --- Chatterbox (optionaler CPU-TTS-Worker) ---
 # Der Audio-Sidecar spricht den Worker auf 127.0.0.1:30004 an.

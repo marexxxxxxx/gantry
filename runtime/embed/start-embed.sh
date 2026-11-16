@@ -36,6 +36,21 @@ antwortet() {
   curl -s --max-time 2 "http://$HOST/api/version" >/dev/null 2>&1
 }
 
+warte_auf_modelle() {
+  # /mnt/models ist ein eigenes Dateisystem. Der User-Dienst kann beim Boot
+  # vor dem System-Mount starten; dann waere der Ollama-Modelstore leer.
+  local mountpoint="${EMBED_MODELS_MOUNT:-/mnt/models}"
+  local i ziel
+  grep -qs "[[:space:]]${mountpoint}[[:space:]]" /etc/fstab || return 0
+  for i in $(seq 1 120); do
+    ziel="$(findmnt -rn -o TARGET -T "$MODELS" 2>/dev/null || true)"
+    [ -n "$ziel" ] && [ "$ziel" != "/" ] && return 0
+    sleep 1
+  done
+  echo "[$LABEL] $mountpoint ist nach 120 s nicht gemountet." >&2
+  return 1
+}
+
 lade_modell() {
   # Ein winziger Embedding-Aufruf laedt das Modell und beweist, dass der
   # CPU-Runner wirklich arbeitet. /api/ps zeigt es danach sofort geladen.
@@ -66,6 +81,8 @@ if ! command -v ollama >/dev/null 2>&1; then
   echo "[$LABEL] ollama nicht gefunden." >&2
   exit 1
 fi
+
+warte_auf_modelle
 
 mkdir -p "$(dirname "$PIDFILE")"
 

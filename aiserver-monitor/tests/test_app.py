@@ -28,6 +28,14 @@ from aiserver_monitor.config import Config
 from aiserver_monitor.hindsight import DEFAULT_HINDSIGHT_MARKERS
 from aiserver_monitor.history import History
 from aiserver_monitor.jobs import JobStatus
+from aiserver_monitor.lifecycle import (
+    LifecycleConflictError,
+    LifecycleDisabledError,
+    LifecycleError,
+    LifecycleTimeoutError,
+    LifecycleUnavailableError,
+    UnknownProfileError,
+)
 from aiserver_monitor.metrics_parse import GpuSample
 from aiserver_monitor.priority import DEFAULT_MARKER
 from aiserver_monitor.proxy import Deps
@@ -110,11 +118,13 @@ class AppTestCase(unittest.TestCase):
 
     def app(self, *, transport=None, steuer_transport=None,
             enable_background: bool = False,
-            gpu_reader=None, server_control=None, **felder):
+            gpu_reader=None, server_control=None, model_lifecycle=None,
+            **felder):
         return create_app(self.config(**felder), transport=transport,
                           steuer_transport=steuer_transport,
                           gpu_reader=gpu_reader,
                           server_control=server_control,
+                          model_lifecycle=model_lifecycle,
                           enable_background=enable_background)
 
     def db_zeilen(self, sql: str, params=()) -> list[tuple]:
@@ -824,13 +834,20 @@ class TestStatsRoute(AppTestCase):
             samples=[_sample_dict(jetzt - 7200, running=2, waiting=1)])
         with TestClient(self.app()) as c:
             daten = c.get("/monitor/stats", params={"bucket": 60}).json()
-        self.assertEqual(sorted(daten), ["buckets", "overview"])
+        self.assertEqual(
+            sorted(daten), ["buckets", "errors", "models", "overview", "sources"])
         self.assertEqual(daten["overview"]["count"], 1)
         self.assertEqual(daten["overview"]["done"], 1)
         self.assertEqual(daten["overview"]["tokens_in"], 3)
         self.assertEqual(daten["overview"]["tokens_out"], 2)
+        self.assertIn("p99", daten["overview"]["ttft"])
+        self.assertIn("tok_per_s", daten["overview"])
+        self.assertEqual(daten["models"][0]["model"], "m")
+        self.assertEqual(daten["sources"][0]["source"], "10.0.0.1")
+        self.assertEqual(daten["errors"], [])
         self.assertEqual(len(daten["buckets"]), 1)
         self.assertEqual(daten["buckets"][0]["running"], 2.0)
+        self.assertEqual(daten["buckets"][0]["jobs"], 1)
 
     def test_fenster_wird_auf_30_tage_geklemmt(self):
         jetzt = time.time()
@@ -880,7 +897,13 @@ class TestV1Passthrough(AppTestCase):
         with TestClient(app) as c:
             antwort = c.get("/v1/models")
         self.assertEqual(antwort.status_code, 200)
-        self.assertEqual(antwort.json(), antwort_daten)
+        daten = antwort.json()
+        ids = [eintrag["id"] for eintrag in daten["data"]]
+        # Der Upstream-Eintrag bleibt, die stabilen Gateway-Namen kommen dazu.
+        self.assertEqual(ids[0], "fake-modell")
+        self.assertIn("escha-qwen38-27b-w2", ids)
+        self.assertIn("edge0-120b", ids)
+        self.assertEqual(daten["object"], "list")
         self.assertEqual(len(gesehen), 1)
         self.assertEqual(gesehen[0].method, "GET")
         self.assertEqual(str(gesehen[0].url),
@@ -1299,7 +1322,7 @@ class TestServerRoutes(AppTestCase):
         daten = antwort.json()
         self.assertIsNone(daten["backend"])
         self.assertEqual([b["name"] for b in daten["backends"]],
-                         ["qwen", "flint", "gptoss"])
+                         ["qwen", "flint", "gptoss", "abl", "edge0"])
 
     def test_start_mit_backend_gptoss_startet_gptoss(self):
         runner = _ServerRunner(unit_installiert=False, unit_aktiv=False,
@@ -1316,6 +1339,21 @@ class TestServerRoutes(AppTestCase):
             spawner.aufrufe,
             [["bash",
               str(Path("/repo") / "runtime/gptoss/start-gptoss.sh")]])
+
+    def test_start_mit_backend_abl_startet_abl(self):
+        runner = _ServerRunner(unit_installiert=False, unit_aktiv=False,
+                               prozess_laeuft=False)
+        spawner = _ServerSpawner()
+        control = self._control(runner=runner, spawner=spawner)
+        with TestClient(self.app(server_control=control)) as client:
+            antwort = client.post("/monitor/server/start",
+                                  json={"backend": "abl"})
+        self.assertEqual(antwort.status_code, 202)
+        self.assertEqual(antwort.json()["backend"], "abl")
+        self.assertEqual(antwort.json()["state"], "starting")
+        self.assertEqual(
+            spawner.aufrufe,
+            [["bash", str(Path("/repo") / "runtime/abl/start-abl.sh")]])
 
     def test_start_mit_backend_flint_startet_flint(self):
         runner = _ServerRunner(unit_installiert=False, unit_aktiv=False,
@@ -1339,6 +1377,190 @@ class TestServerRoutes(AppTestCase):
                                   json={"backend": "llama"})
         self.assertEqual(antwort.status_code, 400)
         self.assertIn("error", antwort.json())
+
+
+class TestLebenszyklusRouten(AppTestCase):
+    """POST /v1/load, POST /v1/unload und GET /v1/status mappen aufs Lifecycle."""
+
+    def _lifecycle(self):
+        return _FakeLifecycle()
+
+    def test_status_liefert_profiles_und_geladene(self):
+        with TestClient(self.app(model_lifecycle=self._lifecycle())) as client:
+            antwort = client.get("/v1/status")
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(antwort.json()["profiles"], ["a:b", "x/y"])
+        self.assertEqual(antwort.json()["loaded"][0]["profile"], "a:b")
+
+    def test_load_reicht_namen_exakt_durch(self):
+        lifecycle = self._lifecycle()
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/load",
+                                  json={"models": ["a:b", "x/y"]})
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(lifecycle.load_calls, [["a:b", "x/y"]])
+        self.assertEqual(antwort.json()["requested"], ["a:b", "x/y"])
+
+    def test_load_akzeptiert_einzelnen_namen(self):
+        lifecycle = self._lifecycle()
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/load", json={"model": "a:b"})
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(lifecycle.load_calls, [["a:b"]])
+
+    def test_load_akzeptiert_liste_als_body(self):
+        lifecycle = self._lifecycle()
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/load", json=["a:b", "x/y"])
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(lifecycle.load_calls, [["a:b", "x/y"]])
+
+    def test_load_pfad_mit_modellnamen(self):
+        lifecycle = self._lifecycle()
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/load/Qwen3-TTS")
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(lifecycle.load_calls, [["Qwen3-TTS"]])
+
+    def test_load_pfad_mit_schraegstrichen_im_namen(self):
+        lifecycle = self._lifecycle()
+        name = "hf.co/AtomicChat/Flint-GGUF:IQ4_XS"
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post(f"/v1/load/{name}")
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(lifecycle.load_calls, [[name]])
+
+    def test_load_ohne_body_ist_400(self):
+        lifecycle = self._lifecycle()
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/load")
+        self.assertEqual(antwort.status_code, 400)
+        self.assertEqual(lifecycle.load_calls, [])
+
+    def test_load_unbekannt_ist_404_mit_profiles(self):
+        lifecycle = self._lifecycle()
+        lifecycle.load_exc = UnknownProfileError(["boese"], ["a:b", "x/y"])
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/load", json={"models": ["boese"]})
+        self.assertEqual(antwort.status_code, 404)
+        self.assertEqual(antwort.json()["profiles"], ["a:b", "x/y"])
+
+    def test_load_konflikt_ist_409(self):
+        lifecycle = self._lifecycle()
+        lifecycle.load_exc = LifecycleConflictError("nur ein Chat-Backend")
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/load", json={"models": ["a:b", "x/y"]})
+        self.assertEqual(antwort.status_code, 409)
+        self.assertIn("error", antwort.json())
+
+    def test_load_deaktiviert_ist_503(self):
+        lifecycle = self._lifecycle()
+        lifecycle.load_exc = LifecycleDisabledError("deaktiviert")
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/load", json={"models": ["a:b"]})
+        self.assertEqual(antwort.status_code, 503)
+
+    def test_load_timeout_ist_504(self):
+        lifecycle = self._lifecycle()
+        lifecycle.load_exc = LifecycleTimeoutError("zu langsam")
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/load", json={"models": ["a:b"]})
+        self.assertEqual(antwort.status_code, 504)
+
+    def test_load_qwen3_tts_vram_503(self):
+        lifecycle = self._lifecycle()
+        lifecycle.load_exc = LifecycleUnavailableError("Nicht genug VRAM")
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/load", json={"model": "Qwen3-TTS"})
+        self.assertEqual(antwort.status_code, 503)
+        self.assertIn("VRAM", antwort.json()["error"])
+
+    def test_load_fehler_ist_502(self):
+        lifecycle = self._lifecycle()
+        lifecycle.load_exc = LifecycleError("kaputt")
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/load", json={"models": ["a:b"]})
+        self.assertEqual(antwort.status_code, 502)
+        self.assertIn("kaputt", antwort.json()["error"])
+
+    def test_unload_ohne_body_entlaedt_alles(self):
+        lifecycle = self._lifecycle()
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/unload")
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(lifecycle.unload_calls, [None])
+        self.assertEqual(antwort.json()["requested"], "all")
+
+    def test_unload_leeres_dict_entlaedt_alles(self):
+        lifecycle = self._lifecycle()
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/unload", json={})
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(lifecycle.unload_calls, [None])
+
+    def test_unload_all_true_entlaedt_alles(self):
+        lifecycle = self._lifecycle()
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/unload", json={"all": True})
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(lifecycle.unload_calls, [None])
+
+    def test_unload_pfad_entlaedt_einzelnes_profil(self):
+        lifecycle = self._lifecycle()
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/unload/Qwen3-TTS")
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(lifecycle.unload_calls, [["Qwen3-TTS"]])
+
+    def test_unload_gezielt_reicht_namen_durch(self):
+        lifecycle = self._lifecycle()
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/unload", json={"models": ["a:b"]})
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(lifecycle.unload_calls, [["a:b"]])
+
+    def test_unload_unbekannt_ist_404(self):
+        lifecycle = self._lifecycle()
+        lifecycle.unload_exc = UnknownProfileError(["boese"], ["a:b"])
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/unload", json={"models": ["boese"]})
+        self.assertEqual(antwort.status_code, 404)
+
+    def test_unload_ohne_body_meldet_leere_liste(self):
+        lifecycle = self._lifecycle()
+        with TestClient(self.app(model_lifecycle=lifecycle)) as client:
+            antwort = client.post("/v1/unload")
+        self.assertEqual(antwort.json()["unloaded"], [])
+
+
+class _FakeLifecycle:
+    """Minimaler Lifecycle-Ersatz fuer die Routen-/Fehlermapping-Tests."""
+
+    def __init__(self):
+        self.load_calls = []
+        self.unload_calls = []
+        self.load_exc = None
+        self.unload_exc = None
+
+    async def status(self):
+        return {
+            "profiles": ["a:b", "x/y"],
+            "loaded": [{"profile": "a:b", "backend": "qwen", "kind": "chat"}],
+        }
+
+    async def load(self, names):
+        if self.load_exc is not None:
+            raise self.load_exc
+        self.load_calls.append(list(names))
+        return {"requested": list(names), "profiles": ["a:b", "x/y"],
+                "loaded": [], "unloaded": []}
+
+    async def unload(self, names=None):
+        if self.unload_exc is not None:
+            raise self.unload_exc
+        self.unload_calls.append(names)
+        return {"requested": "all" if names is None else list(names),
+                "unloaded": [], "loaded": [], "profiles": ["a:b", "x/y"]}
 
 
 if __name__ == "__main__":

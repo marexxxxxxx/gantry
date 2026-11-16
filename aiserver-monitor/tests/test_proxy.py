@@ -2106,6 +2106,15 @@ class TestBackendProbe(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await BackendProbe(Config(), client).aktives_modell(),
                          modell)
 
+    async def test_probe_erkennt_abl(self):
+        modell = Config().abl_model
+        client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, json={"models": [{"name": modell}]})))
+        self.addAsyncCleanup(client.aclose)
+        self.assertEqual(await BackendProbe(Config(), client).aktives_modell(),
+                         modell)
+
     async def test_probe_ohne_ollama_und_bei_fehler_ist_none(self):
         client = httpx.AsyncClient(transport=httpx.MockTransport(
             lambda request: httpx.Response(404)))
@@ -2266,6 +2275,64 @@ class TestBackendModellAlias(ProxyTestBasis):
         self.assertEqual(gesendet["model"], "flint-modell")
         self.assertNotIn("temperature", gesendet)
         self.assertNotIn("reasoning_effort", gesendet)
+
+    async def test_abl_aktiv_schreibt_alias_um(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("abl-modell")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.abl_model = "abl-modell"
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "escha-qwen38-27b-w2",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "max_tokens": 4,
+            }), deps)
+        await _body(antwort)
+
+        self.assertEqual(fake.anfragen[0]["model"], "abl-modell")
+        self.assertNotIn("reasoning_effort", fake.anfragen[0])
+
+    async def test_abl_entfernt_reasoning_effort(self):
+        # Ollama lehnt reasoning_effort fuer das Abliterated-Modell mit
+        # "does not support thinking" ab. Hermes schickt es aber standardmaessig.
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("abl-modell")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.abl_model = "abl-modell"
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "escha-qwen38-27b-w2",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "reasoning_effort": "high",
+                "max_tokens": 4,
+            }), deps)
+        await _body(antwort)
+
+        gesendet = fake.anfragen[0]
+        self.assertEqual(gesendet["model"], "abl-modell")
+        self.assertNotIn("reasoning_effort", gesendet)
+
+    async def test_abl_modell_wird_auf_aktives_flint_umgebogen(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("flint-modell")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.flint_model = "flint-modell"
+        deps.config.abl_model = "abl-modell"
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "abl-modell",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "max_tokens": 4,
+            }), deps)
+        await _body(antwort)
+
+        self.assertEqual(fake.anfragen[0]["model"], "flint-modell")
 
     async def test_qwen_aktiv_laesst_alias_unveraendert(self):
         fake = fakes.FakeSglang()
