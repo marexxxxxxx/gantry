@@ -321,6 +321,14 @@ async def _modell_anpassen(deps: "Deps", koerper: dict, *,
     elif ziel == deps.config.abl_model and "reasoning_effort" in koerper:
         koerper.pop("reasoning_effort")
         geaendert = True
+    if (chat and ziel == deps.config.edge0_model
+            and deps.config.edge0_thinking == "off"
+            and "thinking" not in koerper):
+        # Edge0 denkt sonst bis zu 48k Tokens, bevor das erste sichtbare
+        # Token kommt; max_tokens begrenzt nur die Antwort. Ein explizites
+        # thinking-Feld des Clients gewinnt.
+        koerper["thinking"] = False
+        geaendert = True
     return geaendert
 
 

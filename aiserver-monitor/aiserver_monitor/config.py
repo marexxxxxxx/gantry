@@ -101,6 +101,11 @@ class Config:
     edge0_health_path: str = "/health"
     # Modellname, den Edge0 meldet (--alias in start-edge0.sh).
     edge0_model: str = "edge0-120b"
+    # Edge0 denkt von sich aus bis zu 48k Tokens; max_tokens kappt den
+    # Denkblock nicht. "off" setzt pro Request thinking=false, solange der
+    # Client nichts anderes verlangt (schnell: ~70 tok/s statt 5-7 min
+    # Denkpause). "on" laesst dem Modell seinen Default.
+    edge0_thinking: str = "off"
     # Modell-Alias: Clients (z. B. Hindsight und Hermes) senden weiterhin den
     # Qwen-Namen. Laeuft Flint, GPT-OSS, Abliterated oder Edge0, schreibt das
     # Gateway ihn auf das jeweilige Modell um; laeuft Qwen, bleibt er
@@ -157,6 +162,10 @@ class Config:
             if getattr(self, feld) <= 0:
                 raise ValueError(
                     f"{feld} muss positiv sein: {getattr(self, feld)}")
+        if self.edge0_thinking not in ("on", "off"):
+            raise ValueError(
+                "edge0_thinking muss 'on' oder 'off' sein: "
+                f"{self.edge0_thinking!r}")
         for feld in ("audio8_base", "audio8_model_dir",
                      "audio8_reference_audio", "audio8_reference_text",
                      "audio8_start_script", "audio8_stop_script",
