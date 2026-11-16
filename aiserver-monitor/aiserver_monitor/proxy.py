@@ -347,11 +347,19 @@ async def _modell_anpassen(deps: "Deps", koerper: dict, *,
             else:
                 koerper["reasoning_effort"] = "none"
             geaendert = True
+        deckel = deps.config.edge0_max_tokens
+        if deckel > 0:
+            ist = koerper.get("max_tokens")
+            if not isinstance(ist, int) or ist <= 0 or ist > deckel:
+                koerper["max_tokens"] = deckel
+                geaendert = True
         logger.info(
             "Edge0-Anfrage: client=%r modus=%s gesendet=(effort=%r, "
-            "budget=%r, thinking=%r)", kam, deps.config.edge0_thinking,
+            "budget=%r, max_tokens=%r, thinking=%r)", kam,
+            deps.config.edge0_thinking,
             koerper.get("reasoning_effort"),
             koerper.get("reasoning_budget_tokens"),
+            koerper.get("max_tokens"),
             koerper.get("thinking"))
     return geaendert
 
@@ -1322,6 +1330,9 @@ async def handle_v1(request: Request, deps: Deps) -> Response:
             ist_hindsight = deps.hindsight.matches(koerper)
             if deps.hindsight.blocked(koerper):
                 # Blockiert: sofort 503, ohne SGLang-Kontakt und ohne Job.
+                logger.info(
+                    "Hindsight-Request blockiert: marker=%r modell=%r",
+                    deps.hindsight.treffer(koerper), koerper.get("model"))
                 return _hindsight_antwort()
     if koerper.get("stream") is not True:
         if request.url.path.endswith(_CHAT_COMPLETIONS):

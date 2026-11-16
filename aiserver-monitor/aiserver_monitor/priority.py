@@ -113,6 +113,17 @@ def system_text(koerper: dict) -> str:
     return "\n".join(teile)
 
 
+def find_marker(koerper: dict, markers: tuple[str, ...] | list[str]) -> str | None:
+    """Der erste Marker, der in einer System-Nachricht vorkommt (oder None)."""
+    if not markers:
+        return None
+    text = _normalisiere(system_text(koerper))
+    for marker in markers:
+        if marker and _normalisiere(marker) in text:
+            return marker
+    return None
+
+
 def matches_markers(koerper: dict, markers: tuple[str, ...] | list[str]) -> bool:
     """True, wenn ein Marker in einer System-Nachricht vorkommt.
 
@@ -120,10 +131,7 @@ def matches_markers(koerper: dict, markers: tuple[str, ...] | list[str]) -> bool
     koennte derselbe Text zufaellig stehen, ohne dass der Request von Max
     kommt. Abstaende und Gross-/Kleinschreibung sind irrelevant.
     """
-    if not markers:
-        return False
-    text = _normalisiere(system_text(koerper))
-    return any(_normalisiere(marker) in text for marker in markers if marker)
+    return find_marker(koerper, markers) is not None
 
 
 class PriorityManager:

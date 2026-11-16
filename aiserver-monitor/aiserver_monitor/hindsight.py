@@ -15,7 +15,12 @@ import json
 import logging
 from dataclasses import dataclass
 
-from .priority import SettingsStore, matches_markers, normalize_markers
+from .priority import (
+    SettingsStore,
+    find_marker,
+    matches_markers,
+    normalize_markers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -115,3 +120,7 @@ class HindsightBlocker:
         einstellungen = self.settings()
         return (einstellungen.enabled
                 and matches_markers(koerper, einstellungen.markers))
+
+    def treffer(self, koerper: dict) -> str | None:
+        """Der erste Marker, der im System-Prompt vorkommt (Diagnose)."""
+        return find_marker(koerper, self.settings().markers)

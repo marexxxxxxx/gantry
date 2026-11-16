@@ -2398,6 +2398,42 @@ class TestBackendModellAlias(ProxyTestBasis):
         self.assertNotIn("reasoning_effort", gesendet)
         self.assertNotIn("thinking", gesendet)
 
+    async def test_edge0_deckelt_max_tokens(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("edge0-120b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.edge0_model = "edge0-120b"
+        deps.config.edge0_max_tokens = 8192
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "escha-qwen38-27b-w2",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "max_tokens": 64000,
+            }), deps)
+        await _body(antwort)
+
+        self.assertEqual(fake.anfragen[0]["max_tokens"], 8192)
+
+    async def test_edge0_laesst_kleines_max_tokens_stehen(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("edge0-120b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.edge0_model = "edge0-120b"
+        deps.config.edge0_max_tokens = 8192
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "escha-qwen38-27b-w2",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "max_tokens": 300,
+            }), deps)
+        await _body(antwort)
+
+        self.assertEqual(fake.anfragen[0]["max_tokens"], 300)
+
     async def test_flint_modell_wird_auf_aktives_gptoss_umgebogen(self):
         # Hindsight schickt je nach Lauf den Flint-Namen. Der Schalter im
         # Dashboard ist autoritativ: aktiv ist GPT-OSS, also GPT-OSS laden.

@@ -112,6 +112,12 @@ class Config:
     # sind 1024 Tokens rund 18 s; 0 waere "kein Budget" und damit wieder
     # der 48k-Default.
     edge0_thinking_budget_tokens: int = 1024
+    # Obergrenze fuer max_tokens bei Edge0-Chat-Requests. Edge0 antwortet
+    # auf Agenten-Prompts gern 4k+ Tokens lang; mit einem Client-Wert von
+    # 64000 dauert eine Antwort dann 15 Minuten und blockiert den einzigen
+    # Slot. 8192 Tokens (~2 Minuten) reichen fuer Antworten und Tool-Calls.
+    # 0 schaltet den Deckel ab.
+    edge0_max_tokens: int = 8192
     # Modell-Alias: Clients (z. B. Hindsight und Hermes) senden weiterhin den
     # Qwen-Namen. Laeuft Flint, GPT-OSS, Abliterated oder Edge0, schreibt das
     # Gateway ihn auf das jeweilige Modell um; laeuft Qwen, bleibt er
@@ -176,6 +182,9 @@ class Config:
             raise ValueError(
                 "edge0_thinking_budget_tokens muss positiv sein: "
                 f"{self.edge0_thinking_budget_tokens}")
+        if self.edge0_max_tokens < 0:
+            raise ValueError(
+                f"edge0_max_tokens muss >= 0 sein: {self.edge0_max_tokens}")
         for feld in ("audio8_base", "audio8_model_dir",
                      "audio8_reference_audio", "audio8_reference_text",
                      "audio8_start_script", "audio8_stop_script",
