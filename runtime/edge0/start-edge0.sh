@@ -26,6 +26,9 @@ BIN="${EDGE0_BIN:-$EDGE0_ROOT/edge0-infer/build/cpu/bin/edge0-infer}"
 STRATA_DIR="${EDGE0_STRATA_DIR:-$EDGE0_ROOT/edge0-strata}"
 CTX="${EDGE0_CTX:-131072}"
 ALIAS="${EDGE0_ALIAS:-edge0-120b}"
+# Groessere Prefill-Chunks (Template erlaubt via --prefill auto nur 8192).
+# Gemessen: 12k-Prompt 424 -> 537 tok/s Prefill, 64k bringt nichts mehr.
+export STRATA_PREFILL_AUTO_MAX="${STRATA_PREFILL_AUTO_MAX:-32768}"
 # Tuning fuer 16 GiB VRAM + 8-Kern-CPU (gemessen: ~60-70 tok/s Decode,
 # ~1.900 tok/s Prefill, Prefix-Cache greift bei stabilem Prompt-Anfang).
 STRATA_ARGS=(
@@ -37,6 +40,13 @@ STRATA_ARGS=(
   --pcie-mode dma
   --resident-budget-gib 16
 )
+# Zusaetzliche Engine-Argumente fuer Messlaeufe, z. B.
+#   EDGE0_STRATA_EXTRA="--prefill auto:32768 --spec 6" bash server.sh start edge0
+# Sie stehen hinter den Defaults, spaetere Flags gewinnen.
+if [ -n "${EDGE0_STRATA_EXTRA:-}" ]; then
+  # shellcheck disable=SC2206
+  STRATA_ARGS+=($EDGE0_STRATA_EXTRA)
+fi
 LABEL="${EDGE0_LABEL:-edge0}"
 
 laeuft() {
@@ -97,6 +107,12 @@ fi
 
 entlade_system_ollama
 mkdir -p "$(dirname "$PIDFILE")"
+
+# edge0-strata cached seine Startargumente in /tmp/edge0-strata-*. Bleibt der
+# Ordner von einem Lauf mit anderem --context liegen, startet die Engine mit
+# dem alten --max-context und bricht ab. Hier laeuft nachweislich kein Server
+# mehr, deshalb ist das Aufraeumen gefahrlos.
+rm -rf /tmp/edge0-strata-*
 
 args=(
   serve

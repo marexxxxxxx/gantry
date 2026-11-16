@@ -1,0 +1,58 @@
+{
+  "label": "baseline",
+  "requests": [
+    {
+      "time": "2026-11-16T09:56:27.323Z",
+      "endpoint": "/v1/chat/completions",
+      "source": "127.0.0.1",
+      "http_status": 200,
+      "stream": false,
+      "total_seconds": 10.46987933,
+      "stop_reason": "length",
+      "input_tokens": 3374,
+      "reused_tokens": 0,
+      "generated_tokens": 128,
+      "first_token_seconds": 7.69,
+      "decode_tokens_per_second": 46.1,
+      "prefill_tokens_per_second": 438.8,
+      "decode_seconds": 2.7748000000000004
+    },
+    {
+      "time": "2026-11-16T09:56:29.305Z",
+      "endpoint": "/v1/chat/completions",
+      "source": "127.0.0.1",
+      "http_status": 200,
+      "stream": false,
+      "total_seconds": 1.981763415,
+      "stop_reason": "length",
+      "input_tokens": 3374,
+      "reused_tokens": 3369,
+      "generated_tokens": 128,
+      "first_token_seconds": 0.11009999999999999,
+      "decode_tokens_per_second": 68.6,
+      "prefill_tokens_per_second": 45.4,
+      "decode_seconds": 1.8662999999999998
+    },
+    {
+      "time": "2026-11-16T09:56:56.216Z",
+      "endpoint": "/v1/chat/completions",
+      "source": "127.0.0.1",
+      "http_status": 200,
+      "stream": false,
+      "total_seconds": 26.91010845,
+      "stop_reason": "length",
+      "input_tokens": 9987,
+      "reused_tokens": 0,
+      "generated_tokens": 128,
+      "first_token_seconds": 23.5627,
+      "decode_tokens_per_second": 38.3,
+      "prefill_tokens_per_second": 423.8,
+      "decode_seconds": 3.3389
+    }
+  ],
+  "expert_cache": [
+    "[strata] done: 128 tokens in 10 s (46.1 tok/s) (length, cancel=False), expert cache 100.0% hit",
+    "[strata] done: 128 tokens in 2 s (68.6 tok/s) (length, cancel=False), expert cache 100.0% hit",
+    "[strata] done: 128 tokens in 27 s (38.3 tok/s) (length, cancel=False), expert cache 100.0% hit"
+  ]
+}
