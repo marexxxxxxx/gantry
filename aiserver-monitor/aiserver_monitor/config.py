@@ -106,7 +106,9 @@ class Config:
     # chat_template_kwargs - ein blosses "thinking": false ignoriert die
     # Engine. "off" setzt reasoning_effort "none", "low" setzt "low" plus
     # ein hartes Token-Budget (edge0_thinking_budget_tokens), "on" laesst
-    # dem Modell seinen Default. Ein eigener Wert des Clients gewinnt.
+    # dem Modell seinen Default. "auto" eskaliert nach Wiederholungen
+    # (thinking_auto): 1. Versuch ohne Denken, 2. mit 1024, ab dem 3. mit
+    # dem vollen Budget. Ein eigener Wert des Clients gewinnt.
     edge0_thinking: str = "off"
     # Harte Obergrenze fuer den Denkblock im Modus "low". Bei ~57 tok/s
     # sind 1024 Tokens rund 18 s; 0 waere "kein Budget" und damit wieder
@@ -125,6 +127,14 @@ class Config:
     model_alias: str = "escha-qwen38-27b-w2"
     flint_model: str = "hf.co/AtomicChat/Flint-GGUF:IQ4_XS"
     gptoss_model: str = "gpt-oss:20b"
+    # Obergrenze fuer max_tokens bei Requests an GPT-OSS. Hindsight schickt
+    # keinen Wert; ohne Deckel generierte eine Consolidation-Anfrage bis in
+    # die Kontextgrenze (gemessen 41k Tokens, 6 Minuten GPU) und lief dann in
+    # ein OutputTooLongError - der einzige Slot war so lange blockiert.
+    # Legitime Batch-Antworten lagen bei hoechstens 8.7k Tokens; 10240 laesst
+    # sie durch und passt auch mit einem 21k-Prompt in den 32k-Slot
+    # (GPTOSS_PARALLEL=2). 0 schaltet den Deckel ab.
+    gptoss_max_tokens: int = 10240
     abl_model: str = (
         "hf.co/bartowski/huihui-ai_Qwen3-14B-abliterated-GGUF:Q4_K_M")
 
@@ -174,9 +184,9 @@ class Config:
             if getattr(self, feld) <= 0:
                 raise ValueError(
                     f"{feld} muss positiv sein: {getattr(self, feld)}")
-        if self.edge0_thinking not in ("on", "low", "off"):
+        if self.edge0_thinking not in ("on", "low", "off", "auto"):
             raise ValueError(
-                "edge0_thinking muss 'on', 'low' oder 'off' sein: "
+                "edge0_thinking muss 'on', 'low', 'off' oder 'auto' sein: "
                 f"{self.edge0_thinking!r}")
         if self.edge0_thinking_budget_tokens <= 0:
             raise ValueError(
@@ -185,6 +195,9 @@ class Config:
         if self.edge0_max_tokens < 0:
             raise ValueError(
                 f"edge0_max_tokens muss >= 0 sein: {self.edge0_max_tokens}")
+        if self.gptoss_max_tokens < 0:
+            raise ValueError(
+                f"gptoss_max_tokens muss >= 0 sein: {self.gptoss_max_tokens}")
         for feld in ("audio8_base", "audio8_model_dir",
                      "audio8_reference_audio", "audio8_reference_text",
                      "audio8_start_script", "audio8_stop_script",

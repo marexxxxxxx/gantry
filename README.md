@@ -43,8 +43,10 @@ one. Flint runs as a separate `ollama serve` process
 system Ollama's models on `:11434` when it starts, freeing the GPU. Configure it
 with `FLINT_CTX` (default 32768), `FLINT_PARALLEL` (default 2) and
 `FLINT_KEEP_ALIVE` (default -1). GPT-OSS works the same way
-(`runtime/gptoss/start-gptoss.sh`) with `GPTOSS_CTX` (default 65536),
-`GPTOSS_PARALLEL` (default 1) and `GPTOSS_KEEP_ALIVE` (default -1).
+(`runtime/gptoss/start-gptoss.sh`) with `GPTOSS_CTX` (default 32768),
+`GPTOSS_PARALLEL` (default 2) and `GPTOSS_KEEP_ALIVE` (default -1). The
+gateway caps `max_tokens` for GPT-OSS at `gptoss_max_tokens` (default 10240)
+so a single batch request cannot occupy a slot for minutes.
 Abliterated is Qwen3-14B with the refusal direction removed (Q4_K_M, ~9 GB)
 and runs via `runtime/abl/start-abl.sh` with `ABL_CTX` (default 40960),
 `ABL_PARALLEL` (default 1), `ABL_KEEP_ALIVE` (default -1) and

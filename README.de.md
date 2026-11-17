@@ -44,8 +44,11 @@ auf dem System-Modelstore und entlaedt beim Start die Modelle des
 System-Ollama auf `:11434`, damit die GPU frei wird. Konfigurierbar per
 `FLINT_CTX` (Default 32768), `FLINT_PARALLEL` (Default 2) und
 `FLINT_KEEP_ALIVE` (Default -1). GPT-OSS laeuft genauso als eigener Prozess
-(`runtime/gptoss/start-gptoss.sh`) mit `GPTOSS_CTX` (Default 65536),
-`GPTOSS_PARALLEL` (Default 1) und `GPTOSS_KEEP_ALIVE` (Default -1).
+(`runtime/gptoss/start-gptoss.sh`) mit `GPTOSS_CTX` (Default 32768),
+`GPTOSS_PARALLEL` (Default 2) und `GPTOSS_KEEP_ALIVE` (Default -1). Das
+Gateway deckelt `max_tokens` fuer GPT-OSS auf `gptoss_max_tokens`
+(Default 10240), damit eine einzelne Batch-Anfrage keinen Slot minutenlang
+belegt.
 Abliterated ist Qwen3-14B ohne Refusal-Verhalten (Q4_K_M, ~9 GB) und laeuft
 ueber `runtime/abl/start-abl.sh` mit `ABL_CTX` (Default 40960),
 `ABL_PARALLEL` (Default 1), `ABL_KEEP_ALIVE` (Default -1) und

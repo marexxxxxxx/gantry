@@ -40,6 +40,7 @@ from aiserver_monitor.priority import (
     PriorityManager,
 )
 from aiserver_monitor.proxy import BackendProbe, Deps, ensure_rid, handle_v1
+from aiserver_monitor.thinking_auto import ThinkingEscalator
 
 #: rid-Muster des Gateways: uuid4().hex
 RID_MUSTER = re.compile(r"^[0-9a-f]{32}$")
@@ -2232,6 +2233,76 @@ class TestBackendModellAlias(ProxyTestBasis):
         self.assertEqual(gesendet["temperature"], 0)
         self.assertNotIn("reasoning_effort", gesendet)
 
+    async def test_gptoss_deckelt_max_tokens(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("gpt-oss:20b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.gptoss_model = "gpt-oss:20b"
+        deps.config.gptoss_max_tokens = 16384
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "escha-qwen38-27b-w2",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "max_tokens": 64000,
+            }), deps)
+        await _body(antwort)
+
+        self.assertEqual(fake.anfragen[0]["max_tokens"], 16384)
+
+    async def test_gptoss_laesst_kleines_max_tokens_stehen(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("gpt-oss:20b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.gptoss_model = "gpt-oss:20b"
+        deps.config.gptoss_max_tokens = 16384
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "escha-qwen38-27b-w2",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "max_tokens": 300,
+            }), deps)
+        await _body(antwort)
+
+        self.assertEqual(fake.anfragen[0]["max_tokens"], 300)
+
+    async def test_gptoss_setzt_deckel_ohne_client_wert(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("gpt-oss:20b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.gptoss_model = "gpt-oss:20b"
+        deps.config.gptoss_max_tokens = 16384
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "escha-qwen38-27b-w2",
+                "messages": [{"role": "user", "content": "Hallo"}],
+            }), deps)
+        await _body(antwort)
+
+        self.assertEqual(fake.anfragen[0]["max_tokens"], 16384)
+
+    async def test_gptoss_deckel_null_laesst_alles_stehen(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("gpt-oss:20b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.gptoss_model = "gpt-oss:20b"
+        deps.config.gptoss_max_tokens = 0
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "escha-qwen38-27b-w2",
+                "messages": [{"role": "user", "content": "Hallo"}],
+            }), deps)
+        await _body(antwort)
+
+        self.assertNotIn("max_tokens", fake.anfragen[0])
+
     async def test_edge0_schaltet_thinking_ab(self):
         fake = fakes.FakeSglang()
         probe = _FakeProbe("edge0-120b")
@@ -2433,6 +2504,88 @@ class TestBackendModellAlias(ProxyTestBasis):
         await _body(antwort)
 
         self.assertEqual(fake.anfragen[0]["max_tokens"], 300)
+
+    async def test_edge0_auto_erster_versuch_ohne_denken(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("edge0-120b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.edge0_model = "edge0-120b"
+        deps.config.edge0_thinking = "auto"
+        deps.thinking_auto = ThinkingEscalator()
+
+        for _ in range(2):
+            antwort = await handle_v1(
+                _request("POST", "/v1/chat/completions", {
+                    "model": "escha-qwen38-27b-w2",
+                    "messages": [{"role": "user", "content": "Hallo"}],
+                }), deps)
+            await _body(antwort)
+
+        erst, zweit = fake.anfragen[0], fake.anfragen[1]
+        self.assertEqual(erst["reasoning_effort"], "none")
+        self.assertNotIn("reasoning_budget_tokens", erst)
+        self.assertEqual(zweit["reasoning_effort"], "low")
+        self.assertEqual(zweit["reasoning_budget_tokens"], 1024)
+
+    async def test_edge0_auto_dritter_versuch_denkt_lang(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("edge0-120b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.edge0_model = "edge0-120b"
+        deps.config.edge0_thinking = "auto"
+        deps.thinking_auto = ThinkingEscalator()
+
+        for _ in range(3):
+            antwort = await handle_v1(
+                _request("POST", "/v1/chat/completions", {
+                    "model": "escha-qwen38-27b-w2",
+                    "messages": [{"role": "user", "content": "Hallo"}],
+                }), deps)
+            await _body(antwort)
+
+        dritt = fake.anfragen[2]
+        self.assertEqual(dritt["reasoning_effort"], "medium")
+        self.assertEqual(dritt["reasoning_budget_tokens"], 8192)
+
+    async def test_edge0_auto_ohne_eskalator_bleibt_bei_none(self):
+        # Ohne Zaehler (z. B. in Tests) darf "auto" nicht ins Leere greifen.
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("edge0-120b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.edge0_model = "edge0-120b"
+        deps.config.edge0_thinking = "auto"
+        deps.thinking_auto = None
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "escha-qwen38-27b-w2",
+                "messages": [{"role": "user", "content": "Hallo"}],
+            }), deps)
+        await _body(antwort)
+
+        self.assertEqual(fake.anfragen[0]["reasoning_effort"], "none")
+
+    async def test_edge0_auto_thinking_true_gewinnt(self):
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("edge0-120b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.edge0_model = "edge0-120b"
+        deps.config.edge0_thinking = "auto"
+        deps.thinking_auto = ThinkingEscalator()
+
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "escha-qwen38-27b-w2",
+                "messages": [{"role": "user", "content": "Hallo"}],
+                "thinking": True,
+            }), deps)
+        await _body(antwort)
+
+        self.assertNotIn("reasoning_effort", fake.anfragen[0])
 
     async def test_flint_modell_wird_auf_aktives_gptoss_umgebogen(self):
         # Hindsight schickt je nach Lauf den Flint-Namen. Der Schalter im

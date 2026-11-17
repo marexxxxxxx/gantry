@@ -314,6 +314,49 @@ Stopping is special: `edge0-infer` starts `edge0-strata` as a child process.
 Both run in their own process group via `setsid`; the stop script kills the
 **whole group** (`kill -- -$pid`), otherwise strata would keep ~15 GB of VRAM.
 
+#### Thinking control (`edge0_thinking`)
+
+On the OpenAI route Edge0 thinks up to 48,000 tokens on its own before the
+first visible token, and `max_tokens` does **not** cut that block. A single
+request therefore blocks the only slot for minutes. The gateway intervenes in
+two places:
+
+| Place | Effect |
+|---|---|
+| `runtime/edge0/start-edge0.sh` / model template `reasoning_budget_tokens` | hard cap on the thinking block, also for clients that bypass the gateway |
+| `edge0_max_tokens` (default 8192) | caps `max_tokens` so one answer cannot reach 64k tokens and 15 minutes |
+
+Four modes for `edge0_thinking`:
+
+| Mode | Behaviour |
+|---|---|
+| `off` | `reasoning_effort: "none"`, no thinking block |
+| `low` | `reasoning_effort: "low"` + `reasoning_budget_tokens` (default 1024) |
+| `on` | override nothing – model/client default |
+| `auto` | escalate on repetition (below) |
+
+`auto` (`aiserver_monitor/thinking_auto.py`) counts how often the same message
+history arrives within 300 s. The key is a hash over `messages`: every agent
+step appends a tool result and is therefore a new history, while a retry sends
+the same history again.
+
+| Attempt | Tier | Budget |
+|---|---|---|
+| 1 | `none` | – |
+| 2 | `low` | 1024 |
+| 3+ | `medium` | 8192 |
+
+So the first attempt answers immediately, and only when the agent repeats the
+same step – the signal that the last attempt was not enough – does it get
+thinking time. A `thinking: true` in the request overrides every mode (opt-in
+for hard tasks).
+
+What does **not** help: Laya, Jev or a trained router as a classifier in front
+of the request. On 42 real German agent requests `convaiinnovations/laya`
+scored 0.43 and `reasoning-router-mmbert-small` 0.55 accuracy – the majority
+baseline ("never think") sits at 0.52. Terse German agent language carries too
+little signal for an encoder.
+
 ### 5.4 The backend state machine
 
 `ServerControl.snapshot()` reports `running`, `starting`, `stopping` or

@@ -129,6 +129,7 @@ class Deps:
     client: httpx.AsyncClient
     priority: PriorityManager | None = None
     hindsight: HindsightBlocker | None = None
+    thinking_auto: "ThinkingEscalator | None" = None
     backend: "BackendProbe | None" = None
 
 
@@ -289,7 +290,8 @@ async def _modell_anpassen(deps: "Deps", koerper: dict, *,
     Unbekannte Modelle gehen unveraendert weiter; laeuft Qwen, bleibt alles
     unveraendert. Fuer GPT-OSS setzt das Gateway ausserdem die
     Hindsight-Defaults ``temperature: 0`` und ``reasoning_effort: "low"`` -
-    nur wenn der Client sie nicht selbst mitschickt. Fuer Abliterated wird
+    nur wenn der Client sie nicht selbst mitschickt - und deckelt
+    ``max_tokens`` auf ``gptoss_max_tokens``. Fuer Abliterated wird
     ``reasoning_effort`` entfernt, weil Ollama es bei diesem Modell mit
     "does not support thinking" ablehnt. Rueckgabe: True, wenn der Body
     geaendert wurde.
@@ -318,6 +320,15 @@ async def _modell_anpassen(deps: "Deps", koerper: dict, *,
         if chat and "reasoning_effort" not in koerper:
             koerper["reasoning_effort"] = "low"
             geaendert = True
+        # Ohne Deckel generiert GPT-OSS bei Batch-Prompts bis in die
+        # Kontextgrenze (gemessen 41k Tokens); ein Client-Wert unter dem
+        # Deckel bleibt stehen, damit kleine Anfragen unveraendert laufen.
+        deckel = deps.config.gptoss_max_tokens
+        if deckel > 0:
+            ist = koerper.get("max_tokens")
+            if not isinstance(ist, int) or ist <= 0 or ist > deckel:
+                koerper["max_tokens"] = deckel
+                geaendert = True
     elif ziel == deps.config.abl_model and "reasoning_effort" in koerper:
         koerper.pop("reasoning_effort")
         geaendert = True
@@ -334,18 +345,29 @@ async def _modell_anpassen(deps: "Deps", koerper: dict, *,
         # entscheidet deshalb die Gateway-Konfiguration, nicht der Client;
         # ein explizites "thinking": true im Body ist das Opt-in pro Request.
         opt_in = koerper.get("thinking") is True
-        if not opt_in and deps.config.edge0_thinking != "on":
-            if deps.config.edge0_thinking == "low":
-                koerper["reasoning_effort"] = "low"
-                koerper["reasoning_budget_tokens"] = (
-                    deps.config.edge0_thinking_budget_tokens)
-                ctk = koerper.get("chat_template_kwargs")
-                if isinstance(ctk, dict) and "reasoning_effort" in ctk:
-                    ctk = dict(ctk)
-                    ctk.pop("reasoning_effort")
-                    koerper["chat_template_kwargs"] = ctk
+        modus = deps.config.edge0_thinking
+        stufe, budget = None, None
+        if not opt_in and modus != "on":
+            if modus == "auto" and deps.thinking_auto is not None:
+                # Retry-Eskalation: frischer Verlauf denkt nicht, ein
+                # wiederholter Verlauf denkt mehr (thinking_auto.py).
+                plan = deps.thinking_auto.plan(koerper)
+                stufe, budget = plan.stufe, plan.budget
+            elif modus == "low":
+                stufe = "low"
+                budget = deps.config.edge0_thinking_budget_tokens
             else:
-                koerper["reasoning_effort"] = "none"
+                stufe = "none"
+            koerper["reasoning_effort"] = stufe
+            if budget is None:
+                koerper.pop("reasoning_budget_tokens", None)
+            else:
+                koerper["reasoning_budget_tokens"] = budget
+            ctk = koerper.get("chat_template_kwargs")
+            if isinstance(ctk, dict) and "reasoning_effort" in ctk:
+                ctk = dict(ctk)
+                ctk.pop("reasoning_effort")
+                koerper["chat_template_kwargs"] = ctk
             geaendert = True
         deckel = deps.config.edge0_max_tokens
         if deckel > 0:

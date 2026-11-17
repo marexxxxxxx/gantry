@@ -53,6 +53,7 @@ from .serverctl import (
     ServerControlError,
     standard_repo_root,
 )
+from .thinking_auto import ThinkingEscalator
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +229,9 @@ def create_app(config: Config, *,
             unload_timeout_s=config.lifecycle_unload_timeout_s)
     priority = PriorityManager(history)
     hindsight = HindsightBlocker(history)
+    # Im Modus "auto" entscheidet der Zaehler, wieviel Edge0 denken darf;
+    # in allen anderen Modi wird er nie gefragt.
+    thinking_auto = ThinkingEscalator()
     deps = Deps(
         config=config,
         registry=registry,
@@ -236,6 +240,7 @@ def create_app(config: Config, *,
         client=client,
         priority=priority,
         hindsight=hindsight,
+        thinking_auto=thinking_auto,
         # Eigener Pool (Steuer-Client): die Probe darf nicht hinter langen
         # Relay-Streams im Proxy-Pool warten.
         backend=BackendProbe(config, steuer_client,

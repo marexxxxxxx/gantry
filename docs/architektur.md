@@ -316,6 +316,49 @@ Kindprozess. Beide laufen via `setsid` in einer eigenen Prozessgruppe; das
 Stop-Skript killt die **ganze Gruppe** (`kill -- -$pid`), sonst bliebe strata
 mit ~15 GB VRAM zurück.
 
+#### Denksteuerung (`edge0_thinking`)
+
+Edge0 denkt auf der OpenAI-Route von sich aus bis zu 48 000 Tokens, bevor das
+erste sichtbare Token kommt; `max_tokens` kappt diesen Block **nicht**. Ein
+einzelner Request blockiert damit den einzigen Slot minutenlang. Das Gateway
+greift deshalb an zwei Stellen ein:
+
+| Stelle | Wirkung |
+|---|---|
+| `runtime/edge0/start-edge0.sh` / Modell-Template `reasoning_budget_tokens` | harte Obergrenze für den Denkblock, gilt auch für Clients, die das Gateway umgehen |
+| `edge0_max_tokens` (Default 8192) | deckelt `max_tokens`, damit eine Antwort nicht 64k Tokens und 15 Minuten erreicht |
+
+Vier Modi für `edge0_thinking`:
+
+| Modus | Verhalten |
+|---|---|
+| `off` | `reasoning_effort: "none"`, kein Denkblock |
+| `low` | `reasoning_effort: "low"` + `reasoning_budget_tokens` (Default 1024) |
+| `on` | nichts überschreiben – Modell-/Client-Default |
+| `auto` | nach Wiederholungen eskalieren (siehe unten) |
+
+`auto` (`aiserver_monitor/thinking_auto.py`) zählt, wie oft derselbe
+Nachrichtenverlauf innerhalb von 300 s ankommt. Der Schlüssel ist ein Hash
+über `messages`: jeder Agenten-Schritt hängt ein Tool-Ergebnis an und ist damit
+ein neuer Verlauf, ein Retry schickt denselben Verlauf erneut.
+
+| Versuch | Stufe | Budget |
+|---|---|---|
+| 1 | `none` | – |
+| 2 | `low` | 1024 |
+| 3+ | `medium` | 8192 |
+
+Damit antwortet der erste Versuch sofort (kein Denken), und erst wenn der
+Agent denselben Schritt wiederholt – das Signal für „der letzte Versuch hat
+nicht gereicht" – bekommt er Denkzeit. Ein `thinking: true` im Request
+überschreibt jeden Modus (Opt-in für harte Aufgaben).
+
+Was **nicht** hilft: Laya, Jev oder ein trainierter Router als Klassifikator
+vor dem Request. Auf 42 echten deutschen Agenten-Requests lagen
+`convaiinnovations/laya` bei 0,43 und `reasoning-router-mmbert-small` bei 0,55
+Trefferquote – die Majority-Baseline („immer ohne Denken") liegt bei 0,52. Die
+deutsche, knappe Agentensprache trägt zu wenig Signal für einen Encoder.
+
 ### 5.4 Der Backend-Zustandsautomat
 
 `ServerControl.snapshot()` liefert pro Backend `running`, `starting`,
