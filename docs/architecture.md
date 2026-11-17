@@ -348,8 +348,21 @@ the same history again.
 
 So the first attempt answers immediately, and only when the agent repeats the
 same step – the signal that the last attempt was not enough – does it get
-thinking time. A `thinking: true` in the request overrides every mode (opt-in
-for hard tasks).
+thinking time.
+
+`auto` also detects a **tool loop in the history itself**
+(`schleifen_tiefe`): if the agent sends the exact same call twice (name plus
+arguments, JSON-normalised), the first attempt achieved nothing. That is not a
+guess but an observation, so it escalates immediately – no retry required:
+
+| identical calls (in the last 8) | Tier |
+|---|---|
+| 2 | at least `low` (1024) |
+| 3+ | `medium` (8192) |
+
+Both rules are combined and the higher tier wins; `grund` in the gateway log
+(`versuch` or `schleife`) shows which one fired. A `thinking: true` in the
+request overrides every mode (opt-in for hard tasks).
 
 What does **not** help: Laya, Jev or a trained router as a classifier in front
 of the request. On 42 real German agent requests `convaiinnovations/laya`

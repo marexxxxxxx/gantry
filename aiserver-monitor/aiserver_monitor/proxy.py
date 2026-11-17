@@ -347,12 +347,14 @@ async def _modell_anpassen(deps: "Deps", koerper: dict, *,
         opt_in = koerper.get("thinking") is True
         modus = deps.config.edge0_thinking
         stufe, budget = None, None
+        grund = None
         if not opt_in and modus != "on":
             if modus == "auto" and deps.thinking_auto is not None:
-                # Retry-Eskalation: frischer Verlauf denkt nicht, ein
-                # wiederholter Verlauf denkt mehr (thinking_auto.py).
+                # Retry-Eskalation oder erkannte Tool-Schleife; beides
+                # steht im Verlauf, nichts wird geschaetzt (thinking_auto.py).
                 plan = deps.thinking_auto.plan(koerper)
                 stufe, budget = plan.stufe, plan.budget
+                grund = plan.grund
             elif modus == "low":
                 stufe = "low"
                 budget = deps.config.edge0_thinking_budget_tokens
@@ -377,12 +379,13 @@ async def _modell_anpassen(deps: "Deps", koerper: dict, *,
                 geaendert = True
         logger.info(
             "Edge0-Anfrage: client=%r modus=%s gesendet=(effort=%r, "
-            "budget=%r, max_tokens=%r, thinking=%r)", kam,
+            "budget=%r, max_tokens=%r, thinking=%r) grund=%r", kam,
             deps.config.edge0_thinking,
             koerper.get("reasoning_effort"),
             koerper.get("reasoning_budget_tokens"),
             koerper.get("max_tokens"),
-            koerper.get("thinking"))
+            koerper.get("thinking"),
+            grund)
     return geaendert
 
 

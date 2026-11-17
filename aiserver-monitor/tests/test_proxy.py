@@ -2587,6 +2587,65 @@ class TestBackendModellAlias(ProxyTestBasis):
 
         self.assertNotIn("reasoning_effort", fake.anfragen[0])
 
+    async def test_edge0_auto_schleife_eskaliert_sofort(self):
+        # Derselbe Tool-Call zweimal im Verlauf: kein Retry noetig, das
+        # Gateway eskaliert schon beim ersten Request dieses Verlaufs.
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("edge0-120b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.edge0_model = "edge0-120b"
+        deps.config.edge0_thinking = "auto"
+        deps.thinking_auto = ThinkingEscalator()
+
+        aufruf = {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c", "type": "function",
+             "function": {"name": "terminal",
+                          "arguments": '{"command": "grep -ri garmin ."}'}}]}
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "escha-qwen38-27b-w2",
+                "messages": [
+                    {"role": "user", "content": "such das"},
+                    aufruf,
+                    {"role": "tool", "tool_call_id": "c", "content": "nichts"},
+                    aufruf,
+                    {"role": "tool", "tool_call_id": "c", "content": "nichts"},
+                ],
+            }), deps)
+        await _body(antwort)
+
+        gesendet = fake.anfragen[0]
+        self.assertEqual(gesendet["reasoning_effort"], "low")
+        self.assertEqual(gesendet["reasoning_budget_tokens"], 1024)
+
+    async def test_edge0_auto_ohne_schleife_bleibt_bei_none(self):
+        # Drei verschiedene Aufrufe sind kein Loop.
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("edge0-120b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.edge0_model = "edge0-120b"
+        deps.config.edge0_thinking = "auto"
+        deps.thinking_auto = ThinkingEscalator()
+
+        messages = [{"role": "user", "content": "such das"}]
+        for nummer, befehl in enumerate(("ls", "cat a", "git status")):
+            messages.append({"role": "assistant", "content": "", "tool_calls": [
+                {"id": f"c{nummer}", "type": "function",
+                 "function": {"name": "terminal",
+                              "arguments": '{"command": "%s"}' % befehl}}]})
+            messages.append({"role": "tool", "tool_call_id": f"c{nummer}",
+                             "content": "ok"})
+        antwort = await handle_v1(
+            _request("POST", "/v1/chat/completions", {
+                "model": "escha-qwen38-27b-w2",
+                "messages": messages,
+            }), deps)
+        await _body(antwort)
+
+        self.assertEqual(fake.anfragen[0]["reasoning_effort"], "none")
+
     async def test_flint_modell_wird_auf_aktives_gptoss_umgebogen(self):
         # Hindsight schickt je nach Lauf den Flint-Namen. Der Schalter im
         # Dashboard ist autoritativ: aktiv ist GPT-OSS, also GPT-OSS laden.

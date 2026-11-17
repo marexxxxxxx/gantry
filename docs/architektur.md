@@ -350,8 +350,23 @@ ein neuer Verlauf, ein Retry schickt denselben Verlauf erneut.
 
 Damit antwortet der erste Versuch sofort (kein Denken), und erst wenn der
 Agent denselben Schritt wiederholt – das Signal für „der letzte Versuch hat
-nicht gereicht" – bekommt er Denkzeit. Ein `thinking: true` im Request
-überschreibt jeden Modus (Opt-in für harte Aufgaben).
+nicht gereicht" – bekommt er Denkzeit.
+
+Zusätzlich erkennt `auto` eine **Tool-Schleife im Verlauf selbst**
+(`schleifen_tiefe`): schickt der Agent zweimal exakt denselben Aufruf (Name
+plus Argumente, JSON-normalisiert), hat der erste Versuch nichts gebracht.
+Das ist kein Indiz, sondern ein Befund, und eskaliert sofort – ohne auf einen
+Retry zu warten:
+
+| gleiche Aufrufe (in den letzten 8) | Stufe |
+|---|---|
+| 2 | mindestens `low` (1024) |
+| 3+ | `medium` (8192) |
+
+Beide Regeln werden kombiniert, es gilt die höhere Stufe; der `grund` im
+Gateway-Log (`versuch` oder `schleife`) zeigt, welche gegriffen hat. Ein
+`thinking: true` im Request überschreibt jeden Modus (Opt-in für harte
+Aufgaben).
 
 Was **nicht** hilft: Laya, Jev oder ein trainierter Router als Klassifikator
 vor dem Request. Auf 42 echten deutschen Agenten-Requests lagen

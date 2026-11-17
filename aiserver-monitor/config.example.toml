@@ -141,6 +141,12 @@
 # edge0_thinking_budget_tokens = 1024
 # Obergrenze fuer max_tokens bei Edge0-Chats; 0 schaltet den Deckel ab.
 # edge0_max_tokens = 8192
+# Dasselbe fuer GPT-OSS. Hindsight schickt kein max_tokens; ohne Deckel
+# generierte eine Consolidation-Anfrage bis in die Kontextgrenze (gemessen
+# 41k Tokens, 6 Minuten) und lief in ein OutputTooLongError. 10240 deckt
+# legitime Batch-Antworten (max. 8.7k beobachtet) und passt mit einem
+# 21k-Prompt in den 32k-Slot. 0 schaltet den Deckel ab.
+# gptoss_max_tokens = 10240
 
 # --- Chatterbox (optionaler CPU-TTS-Worker) ---
 # Der Audio-Sidecar spricht den Worker auf 127.0.0.1:30004 an.
