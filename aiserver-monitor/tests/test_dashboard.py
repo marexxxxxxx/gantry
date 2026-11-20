@@ -84,6 +84,46 @@ class TestDashboardRoute(DashboardCase):
         # Die Deep-Link-Panels sind im Markup vorhanden und an die Tabs gebunden.
         self.assertEqual(antwort.text.count('role="tab"'), 3)
 
+    def test_priority_und_queue_panels_sind_komplett_verdrahtet(self) -> None:
+        """Jedes Bedienelement der Priority-/Queue-Ansicht traegt die ID,
+        die ``dashboard.js`` per ``$()`` erwartet.
+
+        Ein fehlendes Element wuerde die Tab-Listener bzw. die Renderfunktionen
+        still absterben lassen – genau die Symptomklasse „Priorität/Queue
+        funktionieren nicht“.
+        """
+        with TestClient(self.app()) as client:
+            antwort = client.get("/")
+        self.assertEqual(antwort.status_code, 200)
+        html = antwort.text
+        # Die zwei Marker-Blocker teilen sich das Schema ``<kind>-<suffix>``.
+        for art in ("priority", "hindsight"):
+            for suffix in (
+                "enabled", "enabled-hint", "chips", "empty",
+                "marker-input", "add", "save", "retry", "status",
+                "local-error", "add-form",
+            ):
+                self.assertIn(f'id="{art}-{suffix}"', html)
+        # Queue-Ansicht: Zaehler, Buttons und Zustands-Panels.
+        for qid in (
+            "queue-count", "queue-updated", "queue-clear", "queue-refresh",
+            "queue-note", "queue-loading", "queue-error", "queue-error-text",
+            "queue-retry", "queue-empty", "queue-table-wrap", "queue-body",
+        ):
+            self.assertIn(f'id="{qid}"', html)
+
+    def test_dashboard_assets_werden_versioniert_ausgeliefert(self) -> None:
+        """Die Asset-Referenzen tragen einen Cache-Busting-Query.
+
+        Ohne ihn haelt ein Browser nach einem Dashboard-Rebuild die alte,
+        tab-lose Variante fest; die Panels waeren dann unsichtbar.
+        """
+        with TestClient(self.app()) as client:
+            antwort = client.get("/")
+        self.assertEqual(antwort.status_code, 200)
+        self.assertIn("/dashboard.css?v=", antwort.text)
+        self.assertIn("/dashboard.js?v=", antwort.text)
+
     def test_dashboard_js_referenziert_steuer_und_queue_endpunkte(self) -> None:
         with TestClient(self.app()) as client:
             js = client.get("/dashboard.js")
