@@ -72,17 +72,18 @@ class TestDashboardRoute(DashboardCase):
         # Das alte Vite-Bundle wird nicht mehr referenziert.
         self.assertNotIn("/assets/index-", antwort.text)
 
-    def test_tab_leiste_hat_drei_ansichten(self) -> None:
+    def test_tab_leiste_hat_fuenf_ansichten(self) -> None:
         with TestClient(self.app()) as client:
             antwort = client.get("/")
         self.assertEqual(antwort.status_code, 200)
         self.assertIn("role=\"tablist\"", antwort.text)
-        for ansicht in ("Runtime", "Priorität", "Queue"):
+        for ansicht in ("Runtime", "Priorität", "Queue", "Statistik", "Chats"):
             self.assertIn(ansicht, antwort.text)
-        for panel in ("view-runtime", "view-priority", "view-queue"):
+        for panel in ("view-runtime", "view-priority", "view-queue",
+                      "view-stats", "view-chats"):
             self.assertIn(f'id="{panel}"', antwort.text)
         # Die Deep-Link-Panels sind im Markup vorhanden und an die Tabs gebunden.
-        self.assertEqual(antwort.text.count('role="tab"'), 3)
+        self.assertEqual(antwort.text.count('role="tab"'), 5)
 
     def test_priority_und_queue_panels_sind_komplett_verdrahtet(self) -> None:
         """Jedes Bedienelement der Priority-/Queue-Ansicht traegt die ID,
@@ -111,6 +112,40 @@ class TestDashboardRoute(DashboardCase):
             "queue-retry", "queue-empty", "queue-table-wrap", "queue-body",
         ):
             self.assertIn(f'id="{qid}"', html)
+
+    def test_statistik_und_chats_panels_sind_verdrahtet(self) -> None:
+        """Die neuen Statistik-/Chats-Ansichten tragen die IDs, die dashboard.js erwartet."""
+        with TestClient(self.app()) as client:
+            antwort = client.get("/")
+        self.assertEqual(antwort.status_code, 200)
+        html = antwort.text
+        for sid in (
+            "stats-updated", "stats-refresh", "stats-windows", "stats-note",
+            "stats-loading", "stats-error", "stats-error-text", "stats-retry",
+            "stats-empty", "stats-content", "stats-insights-section",
+            "stats-insights", "stats-kpis", "stats-charts", "stats-tables",
+        ):
+            self.assertIn(f'id="{sid}"', html)
+        for cid in (
+            "chats-count", "chats-updated", "chats-refresh", "chats-search-form",
+            "chats-search-q", "chats-search-model", "chats-search-source",
+            "chats-search-from", "chats-search-to", "chats-search-submit",
+            "chats-search-reset", "chats-note", "chats-loading", "chats-error",
+            "chats-error-text", "chats-retry", "chats-empty", "chats-list",
+        ):
+            self.assertIn(f'id="{cid}"', html)
+
+    def test_dashboard_js_referenziert_statistik_und_chats_endpunkte(self) -> None:
+        """dashboard.js spricht /monitor/stats und /api/chats an - ohne full_prompt."""
+        with TestClient(self.app()) as client:
+            js = client.get("/dashboard.js")
+        self.assertEqual(js.status_code, 200)
+        self.assertIn("/monitor/stats", js.text)
+        self.assertIn("/api/chats", js.text)
+        self.assertIn("/api/chats/search", js.text)
+        # Der volle Prompt bleibt bewusst unter dem Chat-Feld "prompt",
+        # nie unter dem Registry-Feldnamen "full_prompt".
+        self.assertNotIn("full_prompt", js.text)
 
     def test_dashboard_assets_werden_versioniert_ausgeliefert(self) -> None:
         """Die Asset-Referenzen tragen einen Cache-Busting-Query.

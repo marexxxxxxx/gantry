@@ -180,6 +180,63 @@ def _namen_aus_daten(daten: object) -> list[str] | None:
     return None
 
 
+def _chat_aus_job(job: dict) -> dict:
+    """Baut aus einem ``job_to_dict``-Dict einen Chat-Eintrag fuer ``/api/chats``.
+
+    ``prompt`` ist der volle Prompt aus der RAM-Registry (wird nie persistiert);
+    ``response``/``reasoning`` sind die Vorschau-Ringe (``content_preview``/
+    ``reasoning_preview``), deren Laenge ``preview_max_chars`` begrenzt.
+    Der Feldname ``prompt`` weicht bewusst von ``full_prompt`` ab, damit das
+    Dashboard die Chat-Ansicht nicht mit dem Rohfeld der Job-Registry
+    vermischt.
+    """
+    return {
+        "rid": job.get("rid"),
+        "source": job.get("source") or "",
+        "model": job.get("model") or "",
+        "status": job.get("status"),
+        "created_at_ms": job.get("created_at_ms"),
+        "ttft_ms": job.get("ttft_ms"),
+        "duration_ms": job.get("duration_ms"),
+        "prompt_tokens": job.get("prompt_tokens"),
+        "completion_tokens": job.get("completion_tokens"),
+        "tok_per_s": job.get("tok_per_s"),
+        "prompt": job.get("full_prompt") or "",
+        "response": job.get("content_preview") or "",
+        "reasoning": job.get("reasoning_preview") or "",
+        "error": job.get("error"),
+    }
+
+
+def _chat_passt(chat: dict, *, q: str | None, model: str | None,
+                source: str | None, from_ms: int | None,
+                to_ms: int | None) -> bool:
+    """True, wenn ein Chat alle Filter (Text, Modell, Quelle, Zeitraum) erfuellt.
+
+    ``q`` sucht case-insensitiv in Prompt, Antwort und Denken; ``model`` und
+    ``source`` sind case-insensitive Teilstrings. ``from_ms``/``to_ms``
+    begrenzen ``created_at_ms`` (Grenzen inklusiv). Ein leerer oder fehlender
+    Filter passt immer.
+    """
+    if q:
+        nadel = q.casefold()
+        if (nadel not in chat["prompt"].casefold()
+                and nadel not in chat["response"].casefold()
+                and nadel not in chat["reasoning"].casefold()):
+            return False
+    if model and model.casefold() not in chat["model"].casefold():
+        return False
+    if source and source.casefold() not in chat["source"].casefold():
+        return False
+    erstellt = chat["created_at_ms"]
+    if erstellt is not None:
+        if from_ms is not None and erstellt < from_ms:
+            return False
+        if to_ms is not None and erstellt > to_ms:
+            return False
+    return True
+
+
 def create_app(config: Config, *,
                transport: httpx.AsyncBaseTransport | None = None,
                steuer_transport: httpx.AsyncBaseTransport | None = None,
@@ -526,6 +583,7 @@ def create_app(config: Config, *,
         return JSONResponse(status_code=202, content=antwort)
 
     @app.get("/monitor/stats")
+    @app.get("/api/stats")
     async def monitor_stats(
             from_ms: int | None = Query(None, alias="from"),
             to_ms: int | None = Query(None, alias="to"),
@@ -552,6 +610,37 @@ def create_app(config: Config, *,
         if to_ms - from_ms > MAX_FENSTER_MS:
             from_ms = to_ms - MAX_FENSTER_MS
         return history.query_stats(from_ms / 1000.0, to_ms / 1000.0, bucket)
+
+    @app.get("/api/chats")
+    async def api_chats() -> dict:
+        """Letzte Chats aus der RAM-Registry (neueste zuerst).
+
+        Voller Prompt plus Antwort-/Denk-Vorschau. Die Liste ist auf die
+        RAM-Registry begrenzt (aktive Jobs plus die letzten
+        ``MAX_BEENDETE_JOBS`` abgeschlossenen); der volle Chat-Text wird
+        bewusst nie in die History-DB geschrieben.
+        """
+        chats = sorted(
+            (_chat_aus_job(job) for job in registry.snapshot()),
+            key=lambda chat: chat["created_at_ms"] or 0, reverse=True)
+        return {"chats": chats}
+
+    @app.get("/api/chats/search")
+    async def api_chats_search(
+            q: str | None = None,
+            model: str | None = None,
+            source: str | None = None,
+            from_ms: int | None = Query(None, alias="from"),
+            to_ms: int | None = Query(None, alias="to"),
+    ) -> dict:
+        """Sucht in den letzten Chats (Text, Modell, Quelle, Zeitraum)."""
+        chats = sorted(
+            (chat for chat in
+             (_chat_aus_job(job) for job in registry.snapshot())
+             if _chat_passt(chat, q=q, model=model, source=source,
+                            from_ms=from_ms, to_ms=to_ms)),
+            key=lambda chat: chat["created_at_ms"] or 0, reverse=True)
+        return {"chats": chats}
 
     def _lifecycle_fehler(exc: LifecycleError) -> JSONResponse:
         """Mappt Lifecycle-Fehler auf HTTP-Status und Fehlerkoerper."""

@@ -6,11 +6,13 @@
   const REFRESH_SYSTEM_MS = 4000;
   const REFRESH_INFO_MS = 15000;
   const REFRESH_QUEUE_MS = 3000;
+  const REFRESH_STATS_MS = 15000;
+  const REFRESH_CHATS_MS = 15000;
   const QUEUE_AGE_MS = 1000;
   const LOG_POLL_MS = 2000;
   const FETCH_TIMEOUT_MS = 9000;
   const ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
-  const VIEWS = ["runtime", "priority", "queue"];
+  const VIEWS = ["runtime", "priority", "queue", "stats", "chats"];
 
   const $ = (id) => document.getElementById(id);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
@@ -70,6 +72,16 @@
     aborted: { label: "abgebrochen", cls: "aborted" },
     error: { label: "Fehler", cls: "error" },
   };
+
+  //: Zeitfenster der Statistik (Spanne in ms, Bucket-Breite in Sekunden).
+  const STATS_WINDOWS = {
+    "1h": { label: "1 h", spanMs: 3600000, bucketS: 60 },
+    "24h": { label: "24 h", spanMs: 86400000, bucketS: 300 },
+    "7d": { label: "7 Tage", spanMs: 604800000, bucketS: 1800 },
+    "30d": { label: "30 Tage", spanMs: 2592000000, bucketS: 10800 },
+  };
+  const STATS_WINDOW_ORDER = ["1h", "24h", "7d", "30d"];
+  const CHART_COLORS = ["#4fc1ff", "#e5c07b", "#3fb950", "#f85149"];
 
   const state = {
     providers: [],
@@ -137,6 +149,21 @@
       updatedAt: 0,
       expanded: new Set(),
       canceling: new Set(),
+    },
+    stats: {
+      window: "24h",
+      data: null,
+      loaded: false,
+      loading: false,
+      error: null,
+      updatedAt: 0,
+    },
+    chats: {
+      chats: [],
+      loaded: false,
+      loading: false,
+      error: null,
+      updatedAt: 0,
     },
     confirm: { resolve: null, lastFocus: null },
   };
@@ -362,6 +389,8 @@
     if (changed) window.scrollTo({ top: 0, behavior: "auto" });
     if (next === "priority") ensureBlockersLoaded();
     if (next === "queue") loadQueue({ silent: true });
+    if (next === "stats") loadStats();
+    if (next === "chats") loadChats();
   }
 
   function navigateView(view) {
@@ -1440,6 +1469,597 @@
     });
   }
 
+  // ---------------------------------------------------------------- stats
+
+  function statNum(value) {
+    if (value === null || value === undefined) return "–";
+    return formatInt(value);
+  }
+
+  function statSec(value) {
+    if (value === null || value === undefined) return "–";
+    const n = Number(value);
+    if (!Number.isFinite(n)) return "–";
+    if (n >= 60) return `${(n / 60).toLocaleString("de-DE", { maximumFractionDigits: 1 })} min`;
+    if (n >= 1) return `${n.toLocaleString("de-DE", { maximumFractionDigits: 1 })} s`;
+    return `${Math.round(n * 1000)} ms`;
+  }
+
+  function statRate(value) {
+    if (value === null || value === undefined) return "–";
+    return `${formatRate(value)} tok/s`;
+  }
+
+  function statPct(part, whole) {
+    const p = Number(part);
+    const w = Number(whole);
+    if (!Number.isFinite(p) || !Number.isFinite(w) || w <= 0) return "–";
+    return `${((p / w) * 100).toLocaleString("de-DE", { maximumFractionDigits: 1 })} %`;
+  }
+
+  function statPctVal(value) {
+    return `${value.toLocaleString("de-DE", { maximumFractionDigits: 1 })} %`;
+  }
+
+  function statMax(buckets, field) {
+    let best = null;
+    for (const bucket of buckets) {
+      const value = field(bucket);
+      if (value !== null && value !== undefined && Number.isFinite(Number(value))
+          && (best === null || value > best)) best = value;
+    }
+    return best;
+  }
+
+  function statAvg(buckets, field) {
+    let sum = 0;
+    let count = 0;
+    for (const bucket of buckets) {
+      const value = field(bucket);
+      if (value !== null && value !== undefined && Number.isFinite(Number(value))) {
+        sum += Number(value);
+        count += 1;
+      }
+    }
+    return count ? sum / count : null;
+  }
+
+  function vramPct(bucket) {
+    const used = bucket.vram_used_mb;
+    const total = bucket.vram_total_mb;
+    if (used === null || used === undefined || total === null
+        || total === undefined || Number(total) <= 0) return null;
+    return (Number(used) / Number(total)) * 100;
+  }
+
+  function bucketPoints(buckets, field) {
+    const points = [];
+    for (const bucket of buckets) {
+      const value = field(bucket);
+      if (value !== null && value !== undefined && Number.isFinite(Number(value))) {
+        points.push([Number(bucket.ts), Number(value)]);
+      }
+    }
+    return points;
+  }
+
+  function statAxis(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return "";
+    if (Math.abs(n) >= 1e6) {
+      return `${(n / 1e6).toLocaleString("de-DE", { maximumFractionDigits: 1 })}M`;
+    }
+    if (Math.abs(n) >= 1000) {
+      return `${(n / 1000).toLocaleString("de-DE", { maximumFractionDigits: 1 })}K`;
+    }
+    return n.toLocaleString("de-DE", { maximumFractionDigits: 1 });
+  }
+
+  function statTime(ts) {
+    return new Date(Number(ts) * 1000).toLocaleTimeString("de-DE", {
+      hour: "2-digit", minute: "2-digit",
+    });
+  }
+
+  function buildChart(title, unit, seriesList) {
+    const wrap = el("div", "stat-chart");
+    const head = el("div", "stat-chart-head");
+    head.append(el("h4", "stat-chart-title", title), el("span", "stat-chart-unit", unit));
+    wrap.append(head);
+
+    const ns = "http://www.w3.org/2000/svg";
+    const W = 620;
+    const H = 200;
+    const padL = 46;
+    const padR = 10;
+    const padT = 14;
+    const padB = 24;
+    const plotW = W - padL - padR;
+    const plotH = H - padT - padB;
+
+    const allPoints = [];
+    for (const series of seriesList) for (const point of series.points) allPoints.push(point);
+
+    if (allPoints.length === 0) {
+      wrap.append(el("span", "stat-chart-empty", "keine Daten"));
+      return wrap;
+    }
+
+    const xs = allPoints.map((point) => point[0]);
+    const ys = allPoints.map((point) => point[1]);
+    let xMin = Math.min(...xs);
+    let xMax = Math.max(...xs);
+    let yMin = Math.min(...ys);
+    let yMax = Math.max(...ys);
+    if (xMax === xMin) { xMax += 1; xMin -= 1; }
+    if (yMax === yMin) { yMax += 1; yMin = Math.max(0, yMin - 1); }
+    const sx = (v) => padL + ((v - xMin) / (xMax - xMin)) * plotW;
+    const sy = (v) => padT + ((yMax - v) / (yMax - yMin)) * plotH;
+
+    const svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", `${title} (${unit})`);
+
+    const GRID = 4;
+    for (let i = 0; i <= GRID; i += 1) {
+      const value = yMin + ((yMax - yMin) * i) / GRID;
+      const yy = sy(value);
+      const grid = document.createElementNS(ns, "line");
+      grid.setAttribute("x1", String(padL));
+      grid.setAttribute("x2", String(W - padR));
+      grid.setAttribute("y1", String(yy));
+      grid.setAttribute("y2", String(yy));
+      grid.setAttribute("class", "stat-grid");
+      svg.append(grid);
+      const label = document.createElementNS(ns, "text");
+      label.setAttribute("x", String(padL - 6));
+      label.setAttribute("y", String(yy + 3));
+      label.setAttribute("class", "stat-axis-label");
+      label.setAttribute("text-anchor", "end");
+      label.textContent = statAxis(value);
+      svg.append(label);
+    }
+
+    const XTICKS = 3;
+    for (let i = 0; i <= XTICKS; i += 1) {
+      const value = xMin + ((xMax - xMin) * i) / XTICKS;
+      const xx = sx(value);
+      const label = document.createElementNS(ns, "text");
+      label.setAttribute("x", String(xx));
+      label.setAttribute("y", String(H - 6));
+      label.setAttribute("class", "stat-axis-label");
+      label.setAttribute("text-anchor", "middle");
+      label.textContent = statTime(value);
+      svg.append(label);
+    }
+
+    seriesList.forEach((series, index) => {
+      if (series.points.length === 0) return;
+      const line = document.createElementNS(ns, "polyline");
+      const points = series.points
+        .map((point) => `${sx(point[0]).toFixed(1)},${sy(point[1]).toFixed(1)}`)
+        .join(" ");
+      line.setAttribute("points", points);
+      line.setAttribute("class", "stat-line");
+      line.setAttribute("stroke", CHART_COLORS[index % CHART_COLORS.length]);
+      svg.append(line);
+    });
+    wrap.append(svg);
+
+    const legend = el("div", "stat-legend");
+    seriesList.forEach((series, index) => {
+      const item = el("span", "stat-legend-item");
+      const dot = el("span", "stat-legend-dot");
+      dot.style.background = CHART_COLORS[index % CHART_COLORS.length];
+      item.append(dot, el("span", null, series.label));
+      legend.append(item);
+    });
+    wrap.append(legend);
+    return wrap;
+  }
+
+  function statInsights(daten) {
+    const ov = daten.overview;
+    const buckets = daten.buckets || [];
+    const hints = [];
+    if (ov.count > 0 && ov.error > 0) {
+      const quote = (ov.error / ov.count) * 100;
+      if (quote >= 5) {
+        const top = daten.errors && daten.errors[0];
+        hints.push({
+          tone: "warn",
+          text: `Fehlerquote ${statPctVal(quote)} — ${ov.error} von ${ov.count} Jobs`
+            + `${top ? `, häufigste Ursache: ${top.kind} (${top.count}×)` : ""}.`,
+        });
+      }
+    }
+    const gpuMax = statMax(buckets, (b) => b.gpu_util);
+    const vramMax = statMax(buckets, vramPct);
+    const waitMax = statMax(buckets, (b) => b.waiting);
+    if (waitMax !== null && waitMax > 0
+        && ((gpuMax !== null && gpuMax >= 85) || (vramMax !== null && vramMax >= 90))) {
+      const parts = [];
+      if (gpuMax !== null) parts.push(`GPU ${statNum(gpuMax)} %`);
+      if (vramMax !== null) parts.push(`VRAM ${statNum(vramMax)} %`);
+      hints.push({
+        tone: "warn",
+        text: `Sättigung: bis zu ${statNum(waitMax)} wartend; Spitzen ${parts.join(" / ")}.`,
+      });
+    }
+    const ttft = ov.ttft || {};
+    if (ttft.p50 !== null && ttft.p50 !== undefined && ttft.p95 !== null
+        && ttft.p95 !== undefined && ttft.p50 > 0 && ttft.p95 >= ttft.p50 * 2) {
+      const factor = (ttft.p95 / ttft.p50).toLocaleString("de-DE", { maximumFractionDigits: 1 });
+      hints.push({
+        tone: "info",
+        text: `TTFT streut: p95 (${statSec(ttft.p95)}) beim ${factor}-Fachen des p50 (${statSec(ttft.p50)}).`,
+      });
+    }
+    if (buckets.length > 0) {
+      const available = buckets.reduce((sum, b) => sum + (Number(b.available) || 0), 0) / buckets.length;
+      if (available < 0.5) {
+        hints.push({
+          tone: "warn",
+          text: `Upstream war nur in ${(available * 100).toLocaleString("de-DE", { maximumFractionDigits: 0 })} % der Messungen erreichbar.`,
+        });
+      }
+    }
+    const rate = ov.tok_per_s || {};
+    if (rate.avg !== null && rate.avg !== undefined && ov.done > 0) {
+      hints.push({
+        tone: "info",
+        text: `Durchschnitt ${statRate(rate.avg)} über ${ov.done} fertige Jobs, Spitze ${statRate(rate.max)}.`,
+      });
+    }
+    if (hints.length === 0) {
+      hints.push({
+        tone: "info",
+        text: ov.count > 0
+          ? `Keine Auffälligkeiten: ${ov.done} von ${ov.count} Jobs fertig, ${ov.error} Fehler.`
+          : "Keine Jobs im Zeitfenster; es werden nur Messwerte angezeigt.",
+      });
+    }
+    return hints.slice(0, 4);
+  }
+
+  function statKpi(label, value, sub) {
+    const card = el("div", "kpi-card");
+    card.append(el("span", "kpi-label", label));
+    card.append(el("span", "kpi-value", value));
+    if (sub) card.append(el("span", "kpi-sub", sub));
+    return card;
+  }
+
+  function statTable(title, headers, rows) {
+    const group = el("section", "stat-group");
+    group.append(el("h3", "stat-group-title", title));
+    const frame = el("div", "stat-table-frame");
+    const table = el("table", "stat-table");
+    const thead = el("thead");
+    const headRow = el("tr");
+    headers.forEach((header) => headRow.append(el("th", null, header)));
+    thead.append(headRow);
+    const tbody = el("tbody");
+    rows.forEach((row) => {
+      const tr = el("tr");
+      row.forEach((cell, index) => {
+        tr.append(el("td", index === 0 ? "stat-cell-strong" : "", cell));
+      });
+      tbody.append(tr);
+    });
+    table.append(thead, tbody);
+    frame.append(table);
+    group.append(frame);
+    return group;
+  }
+
+  function renderStatsContent(daten) {
+    const ov = daten.overview;
+    const buckets = daten.buckets || [];
+
+    const hints = statInsights(daten);
+    const insightsSection = $("stats-insights-section");
+    const insightsList = $("stats-insights");
+    if (insightsSection && insightsList) {
+      insightsSection.hidden = hints.length === 0;
+      insightsList.replaceChildren();
+      hints.forEach((hint) => {
+        insightsList.append(el("li", `stat-hint stat-hint-${hint.tone}`, hint.text));
+      });
+    }
+
+    const gpuAvg = statAvg(buckets, (b) => b.gpu_util);
+    const gpuMax = statMax(buckets, (b) => b.gpu_util);
+    const vramMax = statMax(buckets, vramPct);
+    const runAvg = statAvg(buckets, (b) => b.running);
+    const waitMax = statMax(buckets, (b) => b.waiting);
+    const rate = ov.tok_per_s || {};
+    const ttft = ov.ttft || {};
+    const duration = ov.duration || {};
+
+    const kpis = $("stats-kpis");
+    if (kpis) {
+      kpis.replaceChildren();
+      const cards = [
+        statKpi("Jobs", statNum(ov.count), `${ov.done} fertig · ${ov.aborted} abgebrochen`),
+        statKpi("Erfolgsquote", statPct(ov.done, ov.count), `${ov.error} Fehler`),
+        statKpi("Fehler", statNum(ov.error), `Quote: ${statPct(ov.error, ov.count)}`),
+        statKpi("TTFT p50", statSec(ttft.p50), `p95: ${statSec(ttft.p95)} · p99: ${statSec(ttft.p99)}`),
+        statKpi("Dauer p50", statSec(duration.p50), `p95: ${statSec(duration.p95)}`),
+        statKpi("Token", `in ${statNum(ov.tokens_in)} / out ${statNum(ov.tokens_out)}`,
+          ov.tokens_in !== null && ov.tokens_out !== null
+            ? `gesamt: ${statNum(ov.tokens_in + ov.tokens_out)}` : ""),
+        statKpi("Durchsatz", rate.avg === null || rate.avg === undefined ? "–" : `Ø ${statRate(rate.avg)}`,
+          `Spitze ${statRate(rate.max)}`),
+        statKpi("GPU / VRAM", gpuAvg === null ? "–" : `Ø ${statNum(gpuAvg)} %`,
+          `Spitze ${statNum(gpuMax)} % · VRAM ${statNum(vramMax)} %`),
+        statKpi("Warteschlange",
+          `Ø ${runAvg === null ? "–" : runAvg.toLocaleString("de-DE", { maximumFractionDigits: 1 })} laufend`,
+          `Spitze ${statNum(waitMax)} wartend`),
+      ];
+      cards.forEach((card) => kpis.append(card));
+    }
+
+    const charts = $("stats-charts");
+    if (charts) {
+      charts.replaceChildren();
+      charts.append(buildChart("Warteschlange", "Jobs", [
+        { label: "laufend", points: bucketPoints(buckets, (b) => b.running) },
+        { label: "wartend", points: bucketPoints(buckets, (b) => b.waiting) },
+      ]));
+      charts.append(buildChart("Jobs nach Status", "Jobs", [
+        { label: "fertig", points: bucketPoints(buckets, (b) => b.done) },
+        { label: "Fehler", points: bucketPoints(buckets, (b) => b.error) },
+        { label: "abgebrochen", points: bucketPoints(buckets, (b) => b.aborted) },
+      ]));
+      charts.append(buildChart("Latenz", "s", [
+        { label: "TTFT p50", points: bucketPoints(buckets, (b) => b.ttft_p50) },
+        { label: "Dauer p50", points: bucketPoints(buckets, (b) => b.duration_p50) },
+      ]));
+      charts.append(buildChart("Durchsatz", "tok/s", [
+        { label: "tok/s", points: bucketPoints(buckets, (b) => b.throughput ?? b.tok_per_s) },
+      ]));
+      charts.append(buildChart("Token", "Token", [
+        { label: "Eingabe", points: bucketPoints(buckets, (b) => b.tokens_in) },
+        { label: "Ausgabe", points: bucketPoints(buckets, (b) => b.tokens_out) },
+      ]));
+      charts.append(buildChart("GPU und VRAM", "%", [
+        { label: "GPU", points: bucketPoints(buckets, (b) => b.gpu_util) },
+        { label: "VRAM", points: bucketPoints(buckets, vramPct) },
+      ]));
+    }
+
+    const tables = $("stats-tables");
+    if (tables) {
+      tables.replaceChildren();
+      tables.append(statTable("Modelle",
+        ["Modell", "Jobs", "Fertig", "Fehler", "Ø TTFT", "Ø Rate", "Tokens out"],
+        (daten.models || []).slice(0, 10).map((model) => [
+          model.model || "–", statNum(model.jobs), statNum(model.done),
+          statNum(model.error), statSec(model.avg_ttft),
+          statRate(model.avg_tok_per_s), statNum(model.tokens_out),
+        ])));
+      tables.append(statTable("Quellen",
+        ["Quelle", "Jobs", "Fertig", "Fehler", "Ø TTFT", "Ø Rate", "Tokens out"],
+        (daten.sources || []).slice(0, 10).map((source) => [
+          source.source || "–", statNum(source.jobs), statNum(source.done),
+          statNum(source.error), statSec(source.avg_ttft),
+          statRate(source.avg_tok_per_s), statNum(source.tokens_out),
+        ])));
+      const errors = daten.errors || [];
+      const errorTotal = errors.reduce((sum, e) => sum + e.count, 0);
+      tables.append(statTable("Fehlerursachen", ["Ursache", "Anzahl", "Anteil"],
+        errors.length > 0
+          ? errors.map((e) => [e.kind || "Unbekannt", statNum(e.count), statPct(e.count, errorTotal)])
+          : [["keine Fehler", "0", "–"]]));
+    }
+  }
+
+  function renderStats() {
+    const data = state.stats;
+    const windows = $("stats-windows");
+    if (windows) {
+      windows.replaceChildren();
+      for (const id of STATS_WINDOW_ORDER) {
+        const button = el("button", "stat-chip");
+        button.type = "button";
+        button.dataset.window = id;
+        button.textContent = STATS_WINDOWS[id].label;
+        button.setAttribute("aria-pressed", data.window === id ? "true" : "false");
+        button.addEventListener("click", () => {
+          if (data.window !== id) {
+            data.window = id;
+            data.loaded = false;
+            data.data = null;
+            loadStats();
+          }
+        });
+        windows.append(button);
+      }
+      windows.append(el("span", "stat-ladehinweis", data.loading ? "lade …" : ""));
+    }
+
+    setText("stats-updated", data.updatedAt ? `Zuletzt ${formatClock(new Date(data.updatedAt))}` : "–");
+
+    const note = $("stats-note");
+    if (note) {
+      if (data.error && data.loaded) {
+        note.hidden = false;
+        note.textContent = `Aktualisierung fehlgeschlagen: ${data.error}`;
+      } else {
+        note.hidden = true;
+        note.textContent = "";
+      }
+    }
+
+    const loading = $("stats-loading");
+    if (loading) loading.hidden = !(data.loading && !data.loaded);
+    const errorBox = $("stats-error");
+    if (errorBox) errorBox.hidden = !(data.error && !data.loaded);
+    if (data.error && !data.loaded) setText("stats-error-text", data.error);
+
+    const hasData = data.loaded && data.data
+      && (data.data.overview.count > 0
+        || (Array.isArray(data.data.buckets) && data.data.buckets.length > 0));
+    const empty = $("stats-empty");
+    const content = $("stats-content");
+    if (empty) empty.hidden = !(data.loaded && !hasData);
+    if (content) content.hidden = !hasData;
+    if (!hasData) return;
+    renderStatsContent(data.data);
+  }
+
+  async function loadStats() {
+    const data = state.stats;
+    if (data.loading) return;
+    data.loading = true;
+    if (!data.loaded) data.error = null;
+    renderStats();
+    try {
+      const window = STATS_WINDOWS[data.window];
+      const to = Date.now();
+      const from = to - window.spanMs;
+      const response = await api(`/monitor/stats?from=${from}&to=${to}&bucket=${window.bucketS}`);
+      if (!response || typeof response !== "object" || !response.overview) {
+        throw new ApiError("Ungültige Statistik-Antwort");
+      }
+      data.data = response;
+      data.loaded = true;
+      data.error = null;
+      data.updatedAt = Date.now();
+    } catch (err) {
+      data.error = errorText(err);
+    } finally {
+      data.loading = false;
+      renderStats();
+    }
+  }
+
+  // ---------------------------------------------------------------- chats
+
+  function chatStatusMeta(status) {
+    return QUEUE_STATUS[status] || { label: status || "unbekannt", cls: "unknown" };
+  }
+
+  function chatBlock(label, text) {
+    const block = el("div", "chat-block");
+    block.append(el("h4", "chat-block-title", label));
+    block.append(el("pre", "chat-block-text", text));
+    return block;
+  }
+
+  function chatCard(chat) {
+    const status = chatStatusMeta(chat.status);
+    const card = el("article", `chat-card chat-${status.cls}`);
+
+    const head = el("header", "chat-head");
+    head.append(el("span", `status-badge ${status.cls}`, status.label));
+    const meta = el("div", "chat-meta");
+    meta.append(el("strong", "chat-model", chat.model || "–"));
+    if (chat.source) meta.append(el("span", "chat-source", chat.source));
+    const tokens = el("span", "chat-tokens",
+      `in ${tokenValue(chat.prompt_tokens)} · out ${tokenValue(chat.completion_tokens)}`);
+    const created = Number(chat.created_at_ms);
+    const time = el("span", "chat-time",
+      Number.isFinite(created) ? new Date(created).toLocaleString("de-DE") : "–");
+    head.append(meta, tokens, time);
+    card.append(head);
+
+    if (chat.error) card.append(el("div", "chat-error", chat.error));
+    if (chat.prompt) card.append(chatBlock("Prompt", chat.prompt));
+    if (chat.reasoning) card.append(chatBlock("Reasoning", chat.reasoning));
+    if (chat.response) card.append(chatBlock("Antwort", chat.response));
+    return card;
+  }
+
+  function renderChats() {
+    const data = state.chats;
+    setText("chats-count", data.loaded ? formatInt(data.chats.length) : "–");
+    setText("chats-updated", data.updatedAt ? `Zuletzt ${formatClock(new Date(data.updatedAt))}` : "–");
+
+    const note = $("chats-note");
+    if (note) {
+      if (data.error && data.loaded) {
+        note.hidden = false;
+        note.textContent = `Aktualisierung fehlgeschlagen: ${data.error}`;
+      } else {
+        note.hidden = true;
+        note.textContent = "";
+      }
+    }
+
+    const loading = $("chats-loading");
+    if (loading) loading.hidden = !(data.loading && !data.loaded);
+    const errorBox = $("chats-error");
+    if (errorBox) errorBox.hidden = !(data.error && !data.loaded);
+    if (data.error && !data.loaded) setText("chats-error-text", data.error);
+
+    const showList = data.loaded && data.chats.length > 0;
+    const empty = $("chats-empty");
+    const list = $("chats-list");
+    if (empty) empty.hidden = !(data.loaded && data.chats.length === 0);
+    if (list) list.hidden = !showList;
+    if (!showList) {
+      if (list) list.replaceChildren();
+      return;
+    }
+    const fragment = document.createDocumentFragment();
+    data.chats.forEach((chat) => fragment.append(chatCard(chat)));
+    if (list) list.replaceChildren(fragment);
+  }
+
+  async function loadChats({ silent = false } = {}) {
+    const data = state.chats;
+    if (data.loading) return;
+    data.loading = true;
+    if (!data.loaded) data.error = null;
+    renderChats();
+    try {
+      const params = new URLSearchParams();
+      const q = inputValue("chats-search-q");
+      const model = inputValue("chats-search-model");
+      const source = inputValue("chats-search-source");
+      const fromRaw = inputValue("chats-search-from");
+      const toRaw = inputValue("chats-search-to");
+      if (q) params.set("q", q);
+      if (model) params.set("model", model);
+      if (source) params.set("source", source);
+      if (fromRaw) {
+        const fromMs = new Date(fromRaw).getTime();
+        if (Number.isFinite(fromMs)) params.set("from", String(fromMs));
+      }
+      if (toRaw) {
+        const toMs = new Date(toRaw).getTime();
+        if (Number.isFinite(toMs)) params.set("to", String(toMs));
+      }
+      const query = params.toString();
+      const response = await api(query ? `/api/chats/search?${query}` : "/api/chats");
+      if (!response || !Array.isArray(response.chats)) {
+        throw new ApiError("Ungültige Chats-Antwort");
+      }
+      data.chats = response.chats;
+      data.loaded = true;
+      data.error = null;
+      data.updatedAt = Date.now();
+    } catch (err) {
+      data.error = errorText(err);
+      if (!silent) toast("Chats nicht erreichbar", "error", data.error);
+    } finally {
+      data.loading = false;
+      renderChats();
+    }
+  }
+
+  function resetChatsSearch() {
+    for (const id of ["chats-search-q", "chats-search-model", "chats-search-source",
+      "chats-search-from", "chats-search-to"]) {
+      const node = $(id);
+      if (node) node.value = "";
+    }
+    loadChats({ silent: true });
+  }
+
   // ---------------------------------------------------------------- actions
 
   async function providerAction(action, id) {
@@ -2084,6 +2704,17 @@
     $("queue-retry")?.addEventListener("click", () => loadQueue({ silent: true }));
     $("queue-clear")?.addEventListener("click", () => clearQueueJobs());
 
+    $("stats-refresh")?.addEventListener("click", () => loadStats());
+    $("stats-retry")?.addEventListener("click", () => loadStats());
+    $("chats-refresh")?.addEventListener("click", () => loadChats({ silent: true }));
+    $("chats-retry")?.addEventListener("click", () => loadChats({ silent: true }));
+    $("chats-search-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      state.chats.loaded = false;
+      loadChats();
+    });
+    $("chats-search-reset")?.addEventListener("click", () => resetChatsSearch());
+
     $("editor-overlay")?.addEventListener("click", (event) => {
       if (event.target === $("editor-overlay")) requestCloseEditor();
     });
@@ -2128,6 +2759,8 @@
         loadInfo();
         if (state.view === "queue") loadQueue({ silent: true });
         if (state.view === "priority") ensureBlockersLoaded();
+        if (state.view === "stats") loadStats();
+        if (state.view === "chats") loadChats({ silent: true });
       }
     });
   }
@@ -2181,6 +2814,12 @@
     setInterval(() => {
       if (state.view === "queue" && !document.hidden) loadQueue({ silent: true });
     }, REFRESH_QUEUE_MS);
+    setInterval(() => {
+      if (state.view === "stats" && !document.hidden) loadStats();
+    }, REFRESH_STATS_MS);
+    setInterval(() => {
+      if (state.view === "chats" && !document.hidden) loadChats({ silent: true });
+    }, REFRESH_CHATS_MS);
     setInterval(updateQueueLive, QUEUE_AGE_MS);
     setInterval(renderUptime, 1000);
   }

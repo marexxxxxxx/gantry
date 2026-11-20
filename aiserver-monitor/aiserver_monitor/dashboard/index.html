@@ -100,6 +100,13 @@
     <symbol id="i-chevron" viewBox="0 0 24 24">
       <path d="M6 9l6 6 6-6"/>
     </symbol>
+    <symbol id="i-stats" viewBox="0 0 24 24">
+      <path d="M4 20V10M10 20V4M16 20v-8M22 20H2"/>
+    </symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24">
+      <path d="M4 5h16v11H9l-5 4z"/>
+      <path d="M8 9h8M8 12h5"/>
+    </symbol>
   </svg>
 
   <div class="page">
@@ -151,6 +158,16 @@
                   aria-selected="false" aria-controls="view-queue" data-view="queue" tabindex="-1">
             <svg class="icon" aria-hidden="true"><use href="#i-logs"></use></svg>
             <span>Queue</span>
+          </button>
+          <button class="tab" id="tab-stats" type="button" role="tab"
+                  aria-selected="false" aria-controls="view-stats" data-view="stats" tabindex="-1">
+            <svg class="icon" aria-hidden="true"><use href="#i-stats"></use></svg>
+            <span>Statistik</span>
+          </button>
+          <button class="tab" id="tab-chats" type="button" role="tab"
+                  aria-selected="false" aria-controls="view-chats" data-view="chats" tabindex="-1">
+            <svg class="icon" aria-hidden="true"><use href="#i-chat"></use></svg>
+            <span>Chats</span>
           </button>
         </div>
       </nav>
@@ -460,6 +477,139 @@
               <tbody id="queue-body"></tbody>
             </table>
           </div>
+        </div>
+      </section>
+
+      <section class="view" id="view-stats" role="tabpanel" aria-labelledby="tab-stats" tabindex="0" hidden>
+        <div class="section-head">
+          <div class="section-title">
+            <span class="eyebrow">Historie</span>
+            <h2>Statistik</h2>
+            <p>Requests, Tokens, Latenz und GPU-Auslastung über wählbare Zeitfenster.</p>
+          </div>
+          <div class="section-tools">
+            <span class="updated" id="stats-updated">–</span>
+            <button class="btn btn-ghost btn-sm" id="stats-refresh" type="button">
+              <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+              Aktualisieren
+            </button>
+          </div>
+        </div>
+
+        <div class="stat-windows" id="stats-windows" role="group" aria-label="Zeitfenster"></div>
+
+        <div id="stats-note" class="inline-note" role="alert" hidden></div>
+
+        <div class="card">
+          <div id="stats-loading" class="queue-loading" role="status">
+            <svg class="icon spin" aria-hidden="true"><use href="#i-refresh"></use></svg>
+            <span>Lade Statistik …</span>
+          </div>
+
+          <div id="stats-error" class="error-state queue-state" hidden>
+            <span class="error-icon"><svg class="icon" aria-hidden="true"><use href="#i-alert"></use></svg></span>
+            <h3>Statistik konnte nicht geladen werden</h3>
+            <p id="stats-error-text">Das Gateway antwortet nicht.</p>
+            <button class="btn btn-primary btn-sm" id="stats-retry" type="button">
+              <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+              Erneut versuchen
+            </button>
+          </div>
+
+          <div id="stats-empty" class="empty-state queue-state" hidden>
+            <span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-stats"></use></svg></span>
+            <h3>Keine Daten im Zeitfenster</h3>
+            <p>Wähle ein anderes Zeitfenster – oder warte, bis erste Jobs und Messwerte anfallen.</p>
+          </div>
+
+          <div id="stats-content" hidden>
+            <section class="stat-insights" id="stats-insights-section" aria-label="Auffälligkeiten" hidden>
+              <h3 class="stat-group-title">Auffälligkeiten</h3>
+              <ul class="stat-insights-list" id="stats-insights"></ul>
+            </section>
+            <div class="stat-kpis" id="stats-kpis"></div>
+            <div class="stat-charts" id="stats-charts"></div>
+            <div class="stat-tables" id="stats-tables"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" id="view-chats" role="tabpanel" aria-labelledby="tab-chats" tabindex="0" hidden>
+        <div class="section-head">
+          <div class="section-title">
+            <span class="eyebrow">Verlauf</span>
+            <h2>Chats <span class="count-pill" id="chats-count">–</span></h2>
+            <p>Vergangene Konversationen ansehen und nach Text, Modell, Quelle oder Zeitraum durchsuchen.</p>
+          </div>
+          <div class="section-tools">
+            <span class="updated" id="chats-updated">–</span>
+            <button class="btn btn-ghost btn-sm" id="chats-refresh" type="button">
+              <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+              Aktualisieren
+            </button>
+          </div>
+        </div>
+
+        <form class="chats-search" id="chats-search-form" novalidate>
+          <label class="chats-search-field chats-search-q">
+            <span class="chats-search-label">Text</span>
+            <input id="chats-search-q" type="search" autocomplete="off" spellcheck="false"
+                   placeholder="Prompt, Antwort oder Denken durchsuchen" aria-label="Volltextsuche">
+          </label>
+          <label class="chats-search-field">
+            <span class="chats-search-label">Modell</span>
+            <input id="chats-search-model" type="search" autocomplete="off" spellcheck="false"
+                   placeholder="z. B. edge0-120b" aria-label="Modell-Filter">
+          </label>
+          <label class="chats-search-field">
+            <span class="chats-search-label">Quelle</span>
+            <input id="chats-search-source" type="search" autocomplete="off" spellcheck="false"
+                   placeholder="z. B. 10.0.0.1" aria-label="Quellen-Filter">
+          </label>
+          <label class="chats-search-field">
+            <span class="chats-search-label">Von</span>
+            <input id="chats-search-from" type="datetime-local" aria-label="Zeitraum von">
+          </label>
+          <label class="chats-search-field">
+            <span class="chats-search-label">Bis</span>
+            <input id="chats-search-to" type="datetime-local" aria-label="Zeitraum bis">
+          </label>
+          <div class="chats-search-actions">
+            <button class="btn btn-primary btn-sm" id="chats-search-submit" type="submit">
+              <svg class="icon" aria-hidden="true"><use href="#i-chat"></use></svg>
+              Suchen
+            </button>
+            <button class="btn btn-ghost btn-sm" id="chats-search-reset" type="button">
+              Zurücksetzen
+            </button>
+          </div>
+        </form>
+
+        <div id="chats-note" class="inline-note" role="alert" hidden></div>
+
+        <div class="card">
+          <div id="chats-loading" class="queue-loading" role="status">
+            <svg class="icon spin" aria-hidden="true"><use href="#i-refresh"></use></svg>
+            <span>Lade Chats …</span>
+          </div>
+
+          <div id="chats-error" class="error-state queue-state" hidden>
+            <span class="error-icon"><svg class="icon" aria-hidden="true"><use href="#i-alert"></use></svg></span>
+            <h3>Chats konnten nicht geladen werden</h3>
+            <p id="chats-error-text">Das Gateway antwortet nicht.</p>
+            <button class="btn btn-primary btn-sm" id="chats-retry" type="button">
+              <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+              Erneut versuchen
+            </button>
+          </div>
+
+          <div id="chats-empty" class="empty-state queue-state" hidden>
+            <span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-chat"></use></svg></span>
+            <h3>Keine Chats gefunden</h3>
+            <p>Es liegen noch keine (passenden) Konversationen im Speicher vor.</p>
+          </div>
+
+          <div id="chats-list" class="chats-list"></div>
         </div>
       </section>
     </main>
