@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers
 from starlette.responses import Response, StreamingResponse
 
+from .autoload import ProviderRouter
 from .cancel import abort_request
 from .collector import Collector
 from .config import Config
@@ -45,7 +46,7 @@ from .lifecycle import (
 )
 from .metrics_parse import GpuSample
 from .priority import PriorityManager
-from .proxy import BackendProbe, Deps, handle_v1
+from .proxy import BackendProbe, Deps
 from .serverctl import (
     BACKEND_NAMES,
     ServerConflictError,
@@ -54,6 +55,7 @@ from .serverctl import (
     standard_repo_root,
 )
 from .thinking_auto import ThinkingEscalator
+from .webapi import SystemProbe, handle_v1_routed, register_provider_routes
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +186,8 @@ def create_app(config: Config, *,
                gpu_reader: Callable[[], Awaitable[GpuSample]] | None = None,
                server_control: ServerControl | None = None,
                model_lifecycle: ModelLifecycle | None = None,
+               provider_router: ProviderRouter | None = None,
+               system_probe: SystemProbe | None = None,
                enable_background: bool = True) -> FastAPI:
     """Baut die Gateway-App aus Config, optionalem Transport und GPU-Reader.
 
@@ -218,6 +222,8 @@ def create_app(config: Config, *,
         timeout=httpx.Timeout(_STEUER_TIMEOUT_S))
     if server_control is None:
         server_control = ServerControl.from_config(config, client=steuer_client)
+    if provider_router is None:
+        provider_router = ProviderRouter(config, server_control)
     # Der Lifecycle spricht mit ServerControl und den Ollama-Sidecars; ein
     # eigener Client haelt ihn unabhaengig von langen Proxy-Streams.
     lifecycle_client = httpx.AsyncClient(transport=transport)
@@ -258,12 +264,22 @@ def create_app(config: Config, *,
         stale = history.mark_stale_running(jetzt)
         logger.info("Start-Recovery: %s aktive Jobs als error markiert", stale)
         task = None
+        idle_task = None
         if enable_background:
             task = asyncio.create_task(collector.run(), name="collector")
+            idle_task = asyncio.create_task(
+                provider_router.run_idle_loop(), name="provider-idle")
         app.state.collector_task = task
+        app.state.idle_task = idle_task
         try:
             yield
         finally:
+            if idle_task is not None:
+                idle_task.cancel()
+                try:
+                    await idle_task
+                except asyncio.CancelledError:
+                    pass
             if task is not None:
                 task.cancel()
                 try:
@@ -280,9 +296,11 @@ def create_app(config: Config, *,
     app.add_middleware(_CfClientMiddleware)
     app.state.deps = deps
     app.state.collector_task = None
+    app.state.idle_task = None
     app.state.collector_client = collector_client
     app.state.steuer_client = steuer_client
     app.state.server_control = server_control
+    app.state.provider_router = provider_router
     app.state.lifecycle = model_lifecycle
 
     async def _abbrechen(*, rid: str | None, abort_all: bool) -> bool:
@@ -620,7 +638,11 @@ def create_app(config: Config, *,
     @app.api_route("/v1/{pfad:path}", methods=["GET", "POST"])
     async def v1_passthrough(pfad: str, request: Request) -> Response:
         """Reicht die Anfrage weiter; ``pfad`` dient nur dem Routing."""
-        return await handle_v1(request, deps)
+        return await handle_v1_routed(request, deps, provider_router)
+
+    register_provider_routes(
+        app, config=config, server_control=server_control,
+        router=provider_router, system_probe=system_probe)
 
     static_verzeichnis = Path(__file__).parent / "static"
     if static_verzeichnis.is_dir():

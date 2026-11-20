@@ -34,7 +34,12 @@ from urllib.parse import urlparse
 import httpx
 
 from .config import Config, load_config
-from .registry import Provider, RegistryError, load_registry
+from .registry import (
+    Provider,
+    RegistryError,
+    default_registry_dir,
+    load_registry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +131,22 @@ class Backend:
     scope_unit: str | None = None
     #: MemoryMax des Scopes; leer/None laesst ihn unbeschraenkt.
     memory_max: str | None = None
+    #: Host/Port des Providers. ``base_url`` ist die daraus gebaute Wurzel;
+    #: ein leerer Wert bedeutet "gemeinsamer Upstream" (Legacy-Backends).
+    host: str = "127.0.0.1"
+    port: int = 0
+    base_url: str = ""
+    #: Vollstaendige Health-URL (falls der Provider eine absolute URL nennt).
+    health_url: str = ""
+    #: Modellname des Providers (fuer Routing und Anzeige).
+    model: str = ""
+    #: Logdatei des Providers; Fehlermeldungen zitieren daraus das Ende.
+    logfile: str | None = None
+    #: Provider-Einstellungen, die die Steuerung/Veraumnahme beeinflussen.
+    auto_load: bool = True
+    idle_unload_min: int = 0
+    exclusive_gpu: bool = False
+    enabled: bool = True
 
 
 def _health_path_from_url(url: str, *, default: str = "/health") -> str:
@@ -156,13 +177,23 @@ def _unit_from_command(command: Sequence[str] | None) -> str | None:
     return None
 
 
+def _absolute_url(url: str) -> str:
+    """``url`` als absolute HTTP(S)-URL, sonst leerer String."""
+    text = str(url or "").strip()
+    parsed = urlparse(text)
+    if parsed.scheme in ("http", "https") and parsed.netloc:
+        return text
+    return ""
+
+
 def _backend_from_provider(provider: Provider) -> Backend:
     """Registry-Provider in ein :class:`Backend` uebersetzen.
 
     ``scope_unit``/``memory_max`` (und optional ``unit``/``process_pattern``)
     stehen in ``[settings]``; alle anderen Felder kommen aus den Top-Level-
-    Keys. Der Health-Pfad wird aus ``health_url`` extrahiert, damit die
-    bestehende Poll-Logik gegen den gemeinsamen Upstream unveraendert bleibt.
+    Keys. Der Health-Pfad wird aus ``health_url`` extrahiert; eine absolute
+    URL bleibt zusaetzlich vollstaendig erhalten, damit auch Provider auf
+    einem eigenen Port (z. B. qwen-coder auf 8080) korrekt gepollt werden.
     """
     settings = provider.settings or {}
     default_health = ("/api/version" if provider.kind == "ollama"
@@ -173,6 +204,8 @@ def _backend_from_provider(provider: Provider) -> Backend:
         unit = unit or _unit_from_command(provider.start_cmd)
         unit = unit or _unit_from_command(provider.stop_cmd)
         process_pattern = process_pattern or DEFAULT_PROCESS_PATTERN
+    base_url = (f"http://{provider.host}:{provider.port}"
+                if provider.port else "")
     return Backend(
         name=provider.id,
         label=provider.name,
@@ -186,6 +219,16 @@ def _backend_from_provider(provider: Provider) -> Backend:
         workdir=provider.workdir or ".",
         scope_unit=str(settings.get("scope_unit") or "").strip() or None,
         memory_max=str(settings.get("memory_max") or "").strip() or None,
+        host=provider.host or "127.0.0.1",
+        port=int(provider.port or 0),
+        base_url=base_url,
+        health_url=_absolute_url(provider.health_url),
+        model=provider.model,
+        logfile=provider.logfile or None,
+        auto_load=bool(settings.get("auto_load", True)),
+        idle_unload_min=int(settings.get("idle_unload_min") or 0),
+        exclusive_gpu=bool(settings.get("exclusive_gpu", False)),
+        enabled=bool(provider.enabled),
     )
 
 
@@ -209,6 +252,34 @@ class ServerConflictError(ServerControlError):
 def standard_repo_root() -> Path:
     """Repo-Wurzel dieses Checkouts (``.../aiserver-monitor/aiserver_monitor``)."""
     return Path(__file__).resolve().parents[2]
+
+
+def read_log_tail(path: Path | str, lines: int = 200) -> list[str]:
+    """Letzte ``lines`` Zeilen einer Datei, ohne sie komplett zu laden.
+
+    Fehlende oder unlesbare Dateien ergeben eine leere Liste: ein Log-Tail
+    ist Beiwerk einer Fehlermeldung und darf sie nie ersetzen.
+    """
+    try:
+        anzahl = max(1, min(int(lines), 2000))
+    except (TypeError, ValueError):
+        anzahl = 200
+    pfad = Path(path)
+    try:
+        with open(pfad, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            block = 8192
+            daten = b""
+            while position > 0 and daten.count(b"\n") <= anzahl:
+                schritt = min(block, position)
+                position -= schritt
+                handle.seek(position)
+                daten = handle.read(schritt) + daten
+                block *= 2
+    except OSError:
+        return []
+    return daten.decode(errors="replace").splitlines()[-anzahl:]
 
 
 def _backend_zustand(aktiv: bool, health: bool) -> str:
@@ -263,10 +334,12 @@ class ServerControl:
             edge0_scope_unit: str | None = DEFAULT_EDGE0_SCOPE_UNIT,
             edge0_memory_max: str | None = DEFAULT_EDGE0_MEMORY_MAX,
             backends: dict[str, Backend] | None = None,
+            registry_dir: Path | str | None = None,
             runner: Callable[[Sequence[str]], Awaitable[tuple[int, str, str]]]
             | None = None,
             spawner: Callable[[Sequence[str]], None] | None = None,
-            command_spawner: Callable[[Sequence[str], str], None] | None = None,
+            command_spawner: Callable[[Sequence[str], str], object | None]
+            | None = None,
             command_runner: Callable[[Sequence[str], str],
                                      Awaitable[tuple[int, str, str]]]
             | None = None,
@@ -331,6 +404,8 @@ class ServerControl:
         # Rueckfall, siehe :meth:`from_config`).
         self._backends: dict[str, Backend] = (
             dict(backends) if backends is not None else legacy_backends)
+        self._registry_dir = (Path(registry_dir) if registry_dir is not None
+                              else None)
         self._backend_names = tuple(self._backends)
         self._default_backend = (
             DEFAULT_BACKEND if DEFAULT_BACKEND in self._backends
@@ -357,6 +432,11 @@ class ServerControl:
         self._wechsel_task: asyncio.Task | None = None
         self._error: str | None = None
         self._lock = asyncio.Lock()
+        #: Handles der per start_cmd gestarteten Prozesse (Best effort). Sie
+        #: ueberbruecken das Fenster zwischen Prozessstart und erstem
+        #: erfolgreichen Health-Poll, in dem ein Provider ohne PID-File sonst
+        #: als "gestoppt" gaelte und ein Stopp no-op waere.
+        self._spawned: dict[str, object] = {}
 
     # --- Konstruktion aus der Provider-Registry -----------------------------
 
@@ -369,6 +449,16 @@ class ServerControl:
     def backend_names(self) -> tuple[str, ...]:
         """Backend-Namen in Anzeigereihenfolge (Registry bzw. eingebaut)."""
         return self._backend_names
+
+    @property
+    def transitioning(self) -> bool:
+        """Laeuft gerade ein Start-/Stop-Uebergang?"""
+        return self._transition is not None
+
+    @property
+    def transition_backend(self) -> str | None:
+        """Backend des laufenden Uebergangs (None ohne Uebergang)."""
+        return self._transition_backend
 
     @classmethod
     def from_registry(
@@ -398,6 +488,8 @@ class ServerControl:
                        else standard_repo_root()),
             unit=unit,
             backends=backends,
+            registry_dir=(Path(registry_dir) if registry_dir is not None
+                          else default_registry_dir()),
             **kwargs,
         )
 
@@ -426,6 +518,7 @@ class ServerControl:
                 repo_root=standard_repo_root(),
                 unit=unit,
                 backends=backends,
+                registry_dir=default_registry_dir(),
                 client=client,
             )
         return cls(
@@ -460,22 +553,37 @@ class ServerControl:
         """Aktueller Zustand als JSON-faehiges Dict (ohne ``enabled``)."""
         jetzt = self._clock()
         unit_installiert = await self._unit_installiert()
-        qwen_aktiv = (
-            await self._unit_aktiv(unit_installiert)
-            or await self._prozess_laeuft()
-        )
 
         zustaende: dict[str, str] = {}
         for name, backend_info in self._backends.items():
-            if backend_info.unit is not None:
-                aktiv = qwen_aktiv
-                health = await self._health_ok(backend_info) if aktiv else False
-            else:
+            if backend_info.pidfile is not None:
                 # Ollama-Backends teilen sich /api/version; nur das PID-File
                 # sagt, welcher Prozess laeuft. Health entscheidet danach
                 # zwischen "starting" und "running".
                 aktiv = self._pid_laeuft(backend_info.pidfile)
                 health = await self._health_ok(backend_info) if aktiv else False
+            elif backend_info.unit is not None:
+                unit_installiert_backend = (
+                    unit_installiert if backend_info.unit == self._unit
+                    else await self._unit_installiert(backend_info.unit))
+                aktiv = (
+                    await self._unit_aktiv(unit_installiert_backend,
+                                           backend_info.unit)
+                    or await self._prozess_laeuft(backend_info)
+                )
+                health = await self._health_ok(backend_info) if aktiv else False
+            else:
+                # Provider ohne PID-File und ohne Unit (z. B. qwen-coder auf
+                # Port 8080): allein der provider-eigene Health-Endpunkt sagt,
+                # ob er laeuft. Waehrend eines Starts bleibt der Zustand
+                # "starting", damit die Grace-Pruefung den Ladevorgang nicht
+                # nach wenigen Sekunden als Fehler abbricht.
+                health = await self._health_ok(backend_info)
+                aktiv = health or self._spawn_lebt(name)
+                if (not aktiv and self._transition == "starting"
+                        and self._transition_backend == name):
+                    zustaende[name] = "starting"
+                    continue
             zustaende[name] = _backend_zustand(aktiv, health)
         self._uebergang_pruefen(jetzt, zustaende)
 
@@ -539,7 +647,7 @@ class ServerControl:
                 self._transition_backend = None
                 self._error = (
                     "Der Start dauert laenger als "
-                    f"{int(self._start_timeout_s)} s - Log pruefen.")
+                    f"{self._start_timeout_s:g} s - Log pruefen.")
             elif (not wechsel_laeuft
                   and all(z == "stopped" for z in zustaende.values())
                   and vergangen >= self._start_grace_s):
@@ -547,7 +655,10 @@ class ServerControl:
                 self._transition_backend = None
                 self._error = "Der Server wurde beim Start beendet."
         else:  # stopping
-            if all(z == "stopped" for z in zustaende.values()):
+            ziel = self._transition_backend
+            ziel_gestoppt = (ziel is not None
+                             and zustaende.get(ziel) == "stopped")
+            if ziel_gestoppt or all(z == "stopped" for z in zustaende.values()):
                 self._transition = None
                 self._transition_backend = None
                 self._error = None
@@ -556,7 +667,7 @@ class ServerControl:
                 self._transition_backend = None
                 self._error = (
                     "Der Stopp dauert laenger als "
-                    f"{int(self._stop_timeout_s)} s - Log pruefen.")
+                    f"{self._stop_timeout_s:g} s - Log pruefen.")
 
     # --- Aktionen -----------------------------------------------------------
 
@@ -581,7 +692,7 @@ class ServerControl:
                     and vorher["backend"] == ziel:
                 return vorher
 
-            andere = [name for name in self._backends if name != ziel]
+            andere = self._konflikt_backends(ziel)
             laufend = [name for name in andere
                        if await self._backend_aktiv(name)]
             self._transition = "starting"
@@ -614,10 +725,14 @@ class ServerControl:
                 raise ServerConflictError(
                     "Es laeuft bereits ein Start- oder Stoppvorgang.")
             vorher = await self.snapshot()
-            if vorher["state"] == "stopped":
-                return vorher
-
             ziel = backend or vorher["backend"] or self._default_backend
+            if backend is not None:
+                # Gezielter Stopp: nur dieser Provider zaehlt. Laeuft ein
+                # anderer Provider weiter, darf das kein No-op verhindern.
+                if not await self._backend_aktiv(ziel):
+                    return vorher
+            elif vorher["state"] == "stopped":
+                return vorher
             self._transition = "stopping"
             self._transition_backend = ziel
             self._transition_start = self._clock()
@@ -632,6 +747,142 @@ class ServerControl:
                 raise ServerControlError(self._error) from exc
             return await self.snapshot()
 
+    async def start_and_wait(self, backend: str | None = None, *,
+                             timeout_s: float | None = None) -> dict:
+        """Startet ``backend`` und wartet, bis dessen Health-Endpunkt ok ist.
+
+        Anders als :meth:`start` (das sofort mit ``starting`` zurueckkehrt)
+        blockiert dieser Pfad bis zum Health-Erfolg. Ein Fehlschlag nennt das
+        Ende der Provider-Logdatei, damit die Ursache ohne zweite Abfrage
+        sichtbar ist.
+        """
+        timeout = self._start_timeout_s if timeout_s is None else float(timeout_s)
+        if timeout <= 0:
+            raise ValueError("timeout_s muss positiv sein")
+        snap = await self.start(backend)
+        ziel = snap.get("backend") or backend or self._default_backend
+        if ziel not in self._backends:
+            raise ServerControlError(f"Unbekanntes Backend {ziel!r}")
+        return await self.wait_for_health(ziel, timeout_s=timeout)
+
+    async def wait_for_health(self, backend: str, *,
+                              timeout_s: float | None = None) -> dict:
+        """Wartet auf ``/health`` des Backends (oder bricht mit Log-Tail ab)."""
+        if backend not in self._backends:
+            raise ValueError(
+                f"Unbekanntes Backend {backend!r}; erlaubt: "
+                f"{', '.join(self._backends)}")
+        timeout = self._start_timeout_s if timeout_s is None else float(timeout_s)
+        if timeout <= 0:
+            raise ValueError("timeout_s muss positiv sein")
+        info = self._backends[backend]
+        deadline = self._clock() + timeout
+        while True:
+            if await self._health_ok(info):
+                return await self.snapshot()
+            snap = await self.snapshot()
+            if snap.get("error"):
+                raise ServerControlError(
+                    self._mit_log(backend, str(snap["error"])))
+            if self._clock() >= deadline:
+                raise ServerControlError(self._mit_log(
+                    backend,
+                    f"{info.label} wurde nach {timeout:g} s nicht "
+                    "gesund (Health nicht ok)."))
+            await self._sleeper(self._switch_poll_s)
+
+    async def stop_and_wait(self, backend: str, *,
+                            timeout_s: float | None = None) -> dict:
+        """Stoppt ``backend`` und wartet, bis Prozess/Health weg sind."""
+        if backend not in self._backends:
+            raise ValueError(
+                f"Unbekanntes Backend {backend!r}; erlaubt: "
+                f"{', '.join(self._backends)}")
+        timeout = self._stop_timeout_s if timeout_s is None else float(timeout_s)
+        if timeout <= 0:
+            raise ValueError("timeout_s muss positiv sein")
+        await self.stop(backend)
+        deadline = self._clock() + timeout
+        while await self._backend_aktiv(backend):
+            if self._clock() >= deadline:
+                raise ServerControlError(self._mit_log(
+                    backend,
+                    f"{self._backends[backend].label} liess sich nach "
+                    f"{timeout:g} s nicht stoppen."))
+            await self._sleeper(self._switch_poll_s)
+        return await self.snapshot()
+
+    def log_lines(self, backend: str, lines: int = 200) -> list[str]:
+        """Letzte Zeilen der Provider-Logdatei ( leer, wenn keine/kein File)."""
+        info = self._backends.get(backend)
+        if info is None or not info.logfile:
+            return []
+        return read_log_tail(self._skript(info.logfile), lines)
+
+    def _mit_log(self, backend: str, meldung: str) -> str:
+        """Meldung plus Log-Ende (fuer Start-/Stop-Fehler in der API)."""
+        zeilen = self.log_lines(backend, 20)
+        if not zeilen:
+            return meldung
+        return f"{meldung}\nLog (letzte {len(zeilen)} Zeilen):\n" + \
+            "\n".join(zeilen)
+
+    def _backend_endpoint(self, backend: Backend) -> str:
+        """Effektiver HTTP-Endpunkt des Backends (Port oder gemeinsamer Upstream)."""
+        return (backend.base_url or self._upstream_base).rstrip("/")
+
+    def _konflikt_backends(self, ziel: str) -> list[str]:
+        """Backends, die fuer einen Start von ``ziel`` weichen muessen.
+
+        Zwei Provider auf demselben Host/Port koennen nicht gleichzeitig
+        laufen. Zusaetzlich verdrängen sich Provider mit
+        ``exclusive_gpu=true`` gegenseitig: die GPU traegt nur ein grosses
+        Modell zur Zeit (VRAM-Guard).
+        """
+        backend = self._backends[ziel]
+        endpoint = self._backend_endpoint(backend)
+        konflikte: list[str] = []
+        for name, other in self._backends.items():
+            if name == ziel:
+                continue
+            if self._backend_endpoint(other) == endpoint:
+                konflikte.append(name)
+            elif backend.exclusive_gpu and other.exclusive_gpu:
+                konflikte.append(name)
+        return konflikte
+
+    def refresh_from_registry(
+            self, directory: Path | str | None = None) -> bool:
+        """Backends nach einer Registry-Aenderung neu einlesen.
+
+        Waehrend eines Start-/Stop-Uebergangs wird nicht getauscht: der
+        laufende Hintergrund-Task haelt Backend-Namen fest. Ein leerer oder
+        kaputter Registry-Stand laesst die bisherigen Backends stehen.
+        """
+        if self._transition is not None:
+            return False
+        ziel_dir = (Path(directory) if directory is not None
+                    else self._registry_dir)
+        try:
+            providers = load_registry(ziel_dir)
+        except (RegistryError, OSError) as exc:
+            logger.warning("Provider-Registry nicht neu lesbar: %s", exc)
+            return False
+        if not providers:
+            return False
+        backends = _backends_from_providers(providers)
+        self._backends = backends
+        self._backend_names = tuple(backends)
+        self._default_backend = (
+            DEFAULT_BACKEND if DEFAULT_BACKEND in backends
+            else (self._backend_names[0] if self._backend_names
+                  else DEFAULT_BACKEND))
+        self._unit = next((backend.unit for backend in backends.values()
+                           if backend.unit), self._unit)
+        if ziel_dir is not None:
+            self._registry_dir = Path(ziel_dir)
+        return True
+
     async def _wechsel(self, ziel: str, laufend: Sequence[str]) -> None:
         """Stoppt die laufenden Backends, wartet auf den Port, startet ``ziel``."""
         try:
@@ -642,7 +893,7 @@ class ServerControl:
                 if self._clock() >= ende:
                     raise ServerControlError(
                         "Der laufende Server gibt den Port nicht frei "
-                        f"(nach {int(self._stop_timeout_s)} s).")
+                        f"(nach {self._stop_timeout_s:g} s).")
                 await self._sleeper(self._switch_poll_s)
             self._transition_start = self._clock()
             await self._start_backend(ziel)
@@ -659,10 +910,12 @@ class ServerControl:
             befehl = list(backend.start_cmd)
             if backend.scope_unit:
                 befehl = self._scope_befehl(backend, befehl)
-            self._command_spawner(
+            handle = self._command_spawner(
                 befehl, str(self._backend_workdir(backend)))
+            if handle is not None:
+                self._spawned[name] = handle
             return
-        if backend.unit and await self._unit_installiert():
+        if backend.unit and await self._unit_installiert(backend.unit):
             rc, out, err = await self._runner(
                 ["systemctl", "--user", "start", "--no-block", backend.unit])
             if rc != 0:
@@ -720,8 +973,9 @@ class ServerControl:
                 raise ServerControlError(self._error)
             return
         if backend.unit:
-            unit_installiert = await self._unit_installiert()
-            if unit_installiert and await self._unit_aktiv(unit_installiert):
+            unit_installiert = await self._unit_installiert(backend.unit)
+            if unit_installiert and await self._unit_aktiv(
+                    unit_installiert, backend.unit):
                 rc, out, err = await self._runner(
                     ["systemctl", "--user", "stop", "--no-block",
                      backend.unit])
@@ -746,35 +1000,61 @@ class ServerControl:
 
     # --- Zustandsquellen ----------------------------------------------------
 
-    async def _unit_installiert(self) -> bool:
+    async def _unit_installiert(self, unit: str | None = None) -> bool:
         rc, _out, _err = await self._runner(
-            ["systemctl", "--user", "cat", self._unit])
+            ["systemctl", "--user", "cat", unit or self._unit])
         return rc == 0
 
-    async def _unit_aktiv(self, unit_installiert: bool) -> bool:
+    async def _unit_aktiv(self, unit_installiert: bool,
+                          unit: str | None = None) -> bool:
         if not unit_installiert:
             return False
         rc, _out, _err = await self._runner(
-            ["systemctl", "--user", "is-active", "--quiet", self._unit])
+            ["systemctl", "--user", "is-active", "--quiet",
+             unit or self._unit])
         return rc == 0
 
-    async def _prozess_laeuft(self) -> bool:
-        qwen = self._backends.get("qwen")
-        muster = qwen.process_pattern if qwen is not None else None
+    async def _prozess_laeuft(self, backend: Backend | None = None) -> bool:
+        if backend is not None:
+            muster = backend.process_pattern
+        else:
+            qwen = self._backends.get("qwen")
+            muster = qwen.process_pattern if qwen is not None else None
         if not muster:
             return False
         rc, _out, _err = await self._runner(["pgrep", "-f", muster])
         return rc == 0
 
     async def _backend_aktiv(self, name: str) -> bool:
-        """Laeuft das Backend (Prozess/Unit bzw. PID-File)? Ohne Health."""
+        """Laeuft das Backend (Prozess/Unit bzw. Health)? Ohne Health-Details."""
         backend = self._backends[name]
         if backend.pidfile is not None:
             return self._pid_laeuft(backend.pidfile)
         if backend.unit is not None:
-            unit_installiert = await self._unit_installiert()
-            return (await self._unit_aktiv(unit_installiert)
-                    or await self._prozess_laeuft())
+            unit_installiert = await self._unit_installiert(backend.unit)
+            return (await self._unit_aktiv(unit_installiert, backend.unit)
+                    or await self._prozess_laeuft(backend))
+        # Provider ohne PID-File/Unit: der Health-Endpunkt ist die einzige
+        # verlaessliche Quelle (qwen-coder auf Port 8080). Ein noch laufender
+        # start_cmd-Prozess ueberbrueckt die Ladezeit bis zum ersten Health-OK.
+        if await self._health_ok(backend):
+            return True
+        return self._spawn_lebt(name)
+
+    def _spawn_lebt(self, name: str) -> bool:
+        """Lebt das per start_cmd gestartete Popen-Handle noch?"""
+        handle = self._spawned.get(name)
+        if handle is None:
+            return False
+        poll = getattr(handle, "poll", None)
+        if poll is None:
+            return True
+        try:
+            if poll() is None:
+                return True
+        except Exception:
+            pass
+        self._spawned.pop(name, None)
         return False
 
     def _pid_laeuft(self, pidfile: str | None) -> bool:
@@ -801,7 +1081,13 @@ class ServerControl:
             except Exception as exc:  # Health darf den Status nie sprengen.
                 logger.debug("Health-Pruefung fehlgeschlagen: %s", exc)
                 return False
-        url = f"{self._upstream_base}{backend.health_path}"
+        if backend.health_url:
+            # Provider-eigene absolute URL: qwen-coder auf 8080, nicht der
+            # gemeinsame Upstream auf 30001.
+            url = backend.health_url
+        else:
+            basis = (backend.base_url or self._upstream_base).rstrip("/")
+            url = f"{basis}{backend.health_path}"
         try:
             if self._client is None:
                 async with httpx.AsyncClient(
@@ -855,13 +1141,14 @@ class ServerControl:
             start_new_session=True,
         )
 
-    def _spawn_command(self, args: Sequence[str], cwd: str) -> None:
+    def _spawn_command(self, args: Sequence[str], cwd: str):
         """Startet ein ``start_cmd`` aus der Registry detached im workdir.
 
         Wie ``_spawn_subprocess``: eigener Prozess-Session, keine Ausgabe -
-        die Startskripte/Engines loggen selbst.
+        die Startskripte/Engines loggen selbst. Das Popen-Handle erlaubt der
+        Steuerung, den Prozess bis zum ersten Health-Erfolg zu erkennen.
         """
-        subprocess.Popen(
+        return subprocess.Popen(
             list(args),
             cwd=cwd,
             stdin=subprocess.DEVNULL,
@@ -889,7 +1176,7 @@ class ServerControl:
         except TimeoutError:
             prozess.kill()
             await prozess.wait()
-            return 124, "", f"Timeout nach {int(self._stop_timeout_s)} s"
+            return 124, "", f"Timeout nach {self._stop_timeout_s:g} s"
         return (
             prozess.returncode or 0,
             stdout.decode(errors="replace"),
