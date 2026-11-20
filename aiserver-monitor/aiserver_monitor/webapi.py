@@ -29,6 +29,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response
 from starlette.background import BackgroundTask
@@ -44,6 +45,7 @@ from .registry import (
     Provider,
     RegistryError,
     delete_provider,
+    load_registry,
     save_provider,
 )
 from .serverctl import (
@@ -242,11 +244,51 @@ def _freigabe_nach_antwort(antwort: Response, router: ProviderRouter,
     antwort.background = BackgroundTask(_freigeben)
 
 
+def _ist_modellliste_get(request: Request) -> bool:
+    """True fuer ``GET /v1/models`` (mit oder ohne Schraegstrich)."""
+    return (request.method == "GET"
+            and request.url.path.rstrip("/").endswith("/v1/models"))
+
+
+def _modelle_aus_registry(registry_dir: Path | None = None) -> JSONResponse:
+    """OpenAI-Modellliste aus der Provider-Registry.
+
+    Ein Eintrag je aktiviertem Provider: ``id`` ist der Provider-Modellname
+    (leer -> Anzeigename), ``owned_by`` die Provider-ID. Ohne aktivierte
+    Provider bleibt die Liste leer. Das ist der Rueckfall fuer
+    ``GET /v1/models``, wenn kein Backend erreichbar ist.
+    """
+    try:
+        providers = load_registry(registry_dir)
+    except (RegistryError, OSError):
+        providers = {}
+    daten = [
+        {
+            "id": provider.model or provider.name,
+            "object": "model",
+            "owned_by": provider.id,
+        }
+        for provider in providers.values()
+        if provider.enabled
+    ]
+    return JSONResponse({"object": "list", "data": daten})
+
+
 async def handle_v1_routed(request: Request, deps: Deps,
                            router: ProviderRouter) -> Response:
     """``handle_v1`` mit provider-eigenem Upstream und Auto-Load."""
     model = await _request_modell(request)
     if model is None:
+        if _ist_modellliste_get(request):
+            # /v1/models darf nie mit 500 enden: ist kein Backend erreichbar,
+            # liefert das Gateway die Modellliste aus der Provider-Registry.
+            try:
+                return await handle_v1(request, deps)
+            except (httpx.ConnectError, httpx.ConnectTimeout,
+                    httpx.HTTPStatusError):
+                logger.warning("Upstream fuer /v1/models nicht erreichbar; "
+                               "liefere Registry-Liste aus.")
+                return _modelle_aus_registry(router.registry_dir)
         return await handle_v1(request, deps)
     try:
         route = await router.prepare(model)
