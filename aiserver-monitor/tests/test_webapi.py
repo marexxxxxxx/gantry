@@ -242,6 +242,189 @@ class TestProviderApi(ApiCase):
         self.assertEqual(daten["disk"]["mount"], "/")
 
 
+class TestProviderWriteApi(ApiCase):
+    """POST/DELETE/Rename: Registry-Schreibpfade der Dashboard-API."""
+
+    def test_post_legt_provider_an_und_schreibt_toml(self) -> None:
+        control = FakeControl({"alpha": "stopped"})
+        with TestClient(self.app(control)) as client:
+            antwort = client.post("/api/providers", json={
+                "id": "neu",
+                "name": "Neuer Provider",
+                "kind": "custom",
+                "host": "127.0.0.1",
+                "port": 8090,
+                "model": "neu-modell",
+                "health_url": "/health",
+                "logfile": "/tmp/neu.log",
+                "workdir": "/tmp",
+                "start_cmd": ["echo", "start"],
+                "stop_cmd": ["echo", "stop"],
+                "settings": {
+                    "context": 4096,
+                    "max_tokens": 512,
+                    "auto_load": False,
+                    "idle_unload_min": 5,
+                    "exclusive_gpu": True,
+                },
+            })
+        self.assertEqual(antwort.status_code, 201, antwort.text)
+        daten = antwort.json()
+        self.assertEqual(daten["id"], "neu")
+        self.assertEqual(daten["status"], "stopped")
+        self.assertEqual(daten["settings"]["context"], 4096)
+        self.assertFalse(daten["auto_load"])
+        self.assertTrue(daten["exclusive_gpu"])
+        # Startbefehle bleiben aus der oeffentlichen Antwort heraus.
+        self.assertNotIn("start_cmd", daten)
+        self.assertNotIn("stop_cmd", daten)
+
+        gespeichert = load_registry(self.dir)["neu"]
+        self.assertEqual(gespeichert.name, "Neuer Provider")
+        self.assertEqual(gespeichert.port, 8090)
+        self.assertEqual(gespeichert.start_cmd, ["echo", "start"])
+        self.assertEqual(gespeichert.stop_cmd, ["echo", "stop"])
+        self.assertEqual(gespeichert.settings["context"], 4096)
+        self.assertIs(gespeichert.settings["auto_load"], False)
+
+    def test_post_ohne_name_nimmt_die_id(self) -> None:
+        control = FakeControl({"alpha": "stopped"})
+        with TestClient(self.app(control)) as client:
+            antwort = client.post("/api/providers",
+                                  json={"id": "ohne-name"})
+        self.assertEqual(antwort.status_code, 201, antwort.text)
+        self.assertEqual(antwort.json()["name"], "ohne-name")
+        self.assertEqual(load_registry(self.dir)["ohne-name"].name,
+                         "ohne-name")
+
+    def test_post_duplikat_ist_409(self) -> None:
+        self.provider("alpha", name="Alpha")
+        control = FakeControl({"alpha": "stopped"})
+        with TestClient(self.app(control)) as client:
+            antwort = client.post("/api/providers",
+                                  json={"id": "alpha", "name": "Doppelt"})
+        self.assertEqual(antwort.status_code, 409)
+        self.assertIn("existiert bereits", antwort.json()["error"])
+        self.assertEqual(load_registry(self.dir)["alpha"].name, "Alpha")
+
+    def test_post_validierungsfehler_sind_400(self) -> None:
+        control = FakeControl({"alpha": "stopped"})
+        faelle = [
+            ({}, "id"),
+            ({"id": ""}, "id"),
+            ({"id": "Gross!"}, "id"),
+            ({"id": "x", "kind": "unbekannt"}, "kind"),
+            ({"id": "x", "port": 70000}, "port"),
+            ({"id": "x", "name": 5}, "name"),
+            ({"id": "x", "settings": []}, "settings"),
+            ({"id": "x", "zauber": 1}, "unbekannt"),
+            ({"id": "x", "enabled": "ja"}, "enabled"),
+            ({"id": "x", "start_cmd": [1]}, "start_cmd"),
+        ]
+        with TestClient(self.app(control)) as client:
+            for body, stichwort in faelle:
+                with self.subTest(body=body):
+                    antwort = client.post("/api/providers", json=body)
+                    self.assertEqual(antwort.status_code, 400, antwort.text)
+                    self.assertIn(stichwort, antwort.json()["error"])
+        self.assertEqual(load_registry(self.dir), {})
+
+    def test_post_kaputtes_json_ist_400(self) -> None:
+        control = FakeControl({"alpha": "stopped"})
+        with TestClient(self.app(control)) as client:
+            antwort = client.post("/api/providers", content="kein json",
+                                  headers={"content-type": "application/json"})
+        self.assertEqual(antwort.status_code, 400)
+        self.assertIn("JSON", antwort.json()["error"])
+
+    def test_delete_entfernt_provider_und_datei(self) -> None:
+        self.provider("alpha", name="Alpha")
+        control = FakeControl({"alpha": "stopped"})
+        with TestClient(self.app(control)) as client:
+            antwort = client.delete("/api/providers/alpha")
+            zweite = client.delete("/api/providers/alpha")
+        self.assertEqual(antwort.status_code, 200, antwort.text)
+        self.assertEqual(antwort.json()["deleted"], "alpha")
+        self.assertNotIn("alpha", load_registry(self.dir))
+        self.assertFalse((self.dir / "alpha.toml").exists())
+        self.assertEqual(zweite.status_code, 404)
+
+    def test_delete_unbekannt_ist_404(self) -> None:
+        control = FakeControl({"alpha": "stopped"})
+        with TestClient(self.app(control)) as client:
+            antwort = client.delete("/api/providers/nope")
+        self.assertEqual(antwort.status_code, 404)
+
+    def test_rename_verschiebt_datei_und_erhaelt_felder(self) -> None:
+        self.provider("alpha", name="Alpha", port=8081,
+                      start_cmd=["echo", "start"],
+                      settings={"context": 4096, "max_tokens": 256})
+        control = FakeControl({"alpha": "stopped"})
+        with TestClient(self.app(control)) as client:
+            antwort = client.post("/api/providers/alpha/rename",
+                                  json={"id": "beta"})
+            alt = client.get("/api/providers/alpha")
+            neu = client.get("/api/providers/beta")
+        self.assertEqual(antwort.status_code, 200, antwort.text)
+        self.assertEqual(antwort.json()["id"], "beta")
+        self.assertFalse((self.dir / "alpha.toml").exists())
+        self.assertTrue((self.dir / "beta.toml").exists())
+        gespeichert = load_registry(self.dir)["beta"]
+        self.assertEqual(gespeichert.start_cmd, ["echo", "start"])
+        self.assertEqual(gespeichert.settings["context"], 4096)
+        self.assertEqual(gespeichert.settings["max_tokens"], 256)
+        self.assertEqual(alt.status_code, 404)
+        self.assertEqual(neu.status_code, 200)
+        self.assertEqual(neu.json()["id"], "beta")
+
+    def test_rename_setzt_name_auf_neue_id_wenn_name_gleich_id(self) -> None:
+        save_provider(Provider(id="alpha", name="alpha"), self.dir)
+        control = FakeControl({"alpha": "stopped"})
+        with TestClient(self.app(control)) as client:
+            antwort = client.post("/api/providers/alpha/rename",
+                                  json={"id": "beta"})
+        self.assertEqual(antwort.status_code, 200, antwort.text)
+        self.assertEqual(load_registry(self.dir)["beta"].name, "beta")
+
+    def test_rename_fehler_sind_404_409_und_400(self) -> None:
+        self.provider("alpha", name="Alpha")
+        self.provider("beta", name="Beta")
+        control = FakeControl({"alpha": "stopped", "beta": "stopped"})
+        with TestClient(self.app(control)) as client:
+            unbekannt = client.post("/api/providers/nope/rename",
+                                    json={"id": "gamma"})
+            konflikt = client.post("/api/providers/alpha/rename",
+                                   json={"id": "beta"})
+            ungueltig = client.post("/api/providers/alpha/rename",
+                                    json={"id": "Gross!"})
+            fehlt = client.post("/api/providers/alpha/rename", json={})
+            gleich = client.post("/api/providers/alpha/rename",
+                                 json={"id": "alpha"})
+        self.assertEqual(unbekannt.status_code, 404)
+        self.assertEqual(konflikt.status_code, 409)
+        self.assertEqual(ungueltig.status_code, 400)
+        self.assertEqual(fehlt.status_code, 400)
+        self.assertEqual(gleich.status_code, 400)
+        # Bei Fehlern bleibt die Registry unveraendert.
+        self.assertEqual(sorted(load_registry(self.dir)), ["alpha", "beta"])
+
+    def test_edit_route_liefert_prozessfelder_nur_im_detail(self) -> None:
+        self.provider("alpha", name="Alpha", start_cmd=["echo", "start"],
+                      stop_cmd=["echo", "stop"], logfile="/tmp/a.log",
+                      workdir="/tmp")
+        control = FakeControl({"alpha": "stopped"})
+        with TestClient(self.app(control)) as client:
+            liste = client.get("/api/providers")
+            detail = client.get("/api/providers/alpha/edit")
+            fehlt = client.get("/api/providers/nope/edit")
+        self.assertNotIn("start_cmd", liste.json()[0])
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["start_cmd"], ["echo", "start"])
+        self.assertEqual(detail.json()["stop_cmd"], ["echo", "stop"])
+        self.assertEqual(detail.json()["logfile"], "/tmp/a.log")
+        self.assertEqual(fehlt.status_code, 404)
+
+
 class TestRoutingApi(ApiCase):
     def _app_mit_transport(self, control, seen, *, config=None,
                            router=None):

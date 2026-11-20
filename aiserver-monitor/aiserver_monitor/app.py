@@ -644,10 +644,15 @@ def create_app(config: Config, *,
         app, config=config, server_control=server_control,
         router=provider_router, system_probe=system_probe)
 
+    # Neues, build-freies Dashboard. Der alte ``static``-Build bleibt als
+    # Fallback erhalten, falls das Verzeichnis (z. B. in einem Deploy) fehlt.
+    dashboard_verzeichnis = Path(__file__).parent / "dashboard"
     static_verzeichnis = Path(__file__).parent / "static"
-    if static_verzeichnis.is_dir():
+    web_verzeichnis = (dashboard_verzeichnis if dashboard_verzeichnis.is_dir()
+                       else static_verzeichnis)
+    if web_verzeichnis.is_dir():
         # Zuletzt: der Mount faengt alles ab, was keine Route matcht.
-        app.mount("/", StaticFiles(directory=str(static_verzeichnis),
+        app.mount("/", StaticFiles(directory=str(web_verzeichnis),
                                    html=True), name="static")
     else:
         @app.get("/")

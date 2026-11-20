@@ -10,10 +10,12 @@ Zwei Aufgaben, bewusst in einem neuen Modul statt in ``proxy.py``:
 * :func:`register_provider_routes` haengt die Dashboard-API unter ``/api``
   ein: Providerliste/-detail, PATCH, Start/Stop, Systemwerte und Log-Tail.
 
-Secrets werden nicht ausgegeben: Die API zeigt nur die explizit gelisteten
-Felder und die Provider-Settings; Startbefehle und Umgebungsvariablen bleiben
-aussen vor. Logs stammen ausschliesslich aus der in der Registry eingetragenen
-Logdatei.
+Secrets werden nicht ausgegeben: Die Listen- und Detailantworten zeigen nur
+die explizit gelisteten Felder und die Provider-Settings; Startbefehle und
+Umgebungsvariablen bleiben aussen vor. Einzige Ausnahme ist die lokale
+Editor-Route ``GET /api/providers/{id}/edit``, die dem Formular die
+Prozessfelder zum Vorbefuellen liefert. Logs stammen ausschliesslich aus der
+in der Registry eingetragenen Logdatei.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import asyncio
 import json
 import logging
 import shutil
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -31,13 +34,16 @@ from fastapi.responses import JSONResponse, Response
 from starlette.background import BackgroundTask
 from starlette.responses import StreamingResponse
 
+from . import __version__
 from .autoload import ProviderRouter, ProviderUnavailable
 from .config import Config
 from .proxy import Deps, handle_v1
 from .registry import (
+    PROVIDER_ID_RE,
     SETTING_DEFAULTS,
     Provider,
     RegistryError,
+    delete_provider,
     save_provider,
 )
 from .serverctl import (
@@ -58,6 +64,56 @@ _PATCH_PROVIDER_FELDER = frozenset((
 
 #: Settings, die auch als Top-Level-Feld im PATCH-Body erlaubt sind.
 _PATCH_SETTING_FELDER = frozenset(SETTING_DEFAULTS)
+
+#: Felder, die beim Anlegen direkt am Provider gesetzt werden duerfen.
+_ADD_PROVIDER_FELDER = _PATCH_PROVIDER_FELDER | {"id"}
+
+
+def _provider_aus_body(daten: dict[str, Any]) -> Provider:
+    """Baut aus einem POST-Body einen validierten :class:`Provider`.
+
+    ``name`` fehlt -> die ID wird zum Anzeigenamen (wie beim Laden einer
+    TOML-Datei). Unbekannte Felder sind ein Fehler, damit Tippfehler in der
+    Oberflaeche nicht stillschweigend verschwinden. Startbefehle bleiben
+    erlaubt, werden aber nie in der oeffentlichen Antwort ausgegeben.
+    """
+    unbekannt = sorted(set(daten)
+                       - _ADD_PROVIDER_FELDER
+                       - _PATCH_SETTING_FELDER
+                       - {"settings"})
+    if unbekannt:
+        raise RegistryError(
+            f"unbekannte(s) Feld(er): {', '.join(unbekannt)}")
+    roh_id = daten.get("id")
+    if not isinstance(roh_id, str) or not roh_id.strip():
+        raise RegistryError("id fehlt")
+    provider_id = roh_id.strip().lower()
+    if not PROVIDER_ID_RE.match(provider_id):
+        raise RegistryError(
+            f"ungueltige id {provider_id!r}: nur Kleinbuchstaben, Ziffern, "
+            "'-' und '_' (max. 64 Zeichen)")
+
+    name = daten.get("name")
+    if name is None or (isinstance(name, str) and not name.strip()):
+        name = provider_id
+    if not isinstance(name, str):
+        raise RegistryError("name muss ein Text sein")
+
+    roh_settings = daten.get("settings")
+    if roh_settings is not None and not isinstance(roh_settings, dict):
+        raise RegistryError("settings muss ein Objekt sein")
+    einstellungen = dict(SETTING_DEFAULTS)
+    einstellungen.update(roh_settings or {})
+    for key in _PATCH_SETTING_FELDER:
+        if key in daten:
+            einstellungen[key] = daten[key]
+
+    felder = {key: daten[key] for key in _ADD_PROVIDER_FELDER
+              if key in daten and key not in ("id", "name")}
+    if "enabled" in felder and not isinstance(felder["enabled"], bool):
+        raise RegistryError("enabled muss true oder false sein")
+    return Provider(id=provider_id, name=name,
+                    settings=einstellungen, **felder)
 
 
 def _provider_dict(provider: Provider, *, status: str, uptime: int) -> dict:
@@ -348,6 +404,7 @@ def register_provider_routes(
 ) -> None:
     """Haengt ``/api/providers*`` und ``/api/system`` an ``app``."""
     probe = system_probe or SystemProbe()
+    gestartet = time.monotonic()
 
     def _provider_oder_404(provider_id: str
                            ) -> tuple[Provider | None, JSONResponse | None]:
@@ -363,6 +420,21 @@ def register_provider_routes(
         return _provider_dict(provider,
                               status=states.get(provider.id, "stopped"),
                               uptime=router.uptime(provider.id))
+
+    def _registry_neu_laden() -> bool:
+        """Router-Cache verwerfen und ServerControl neu einlesen."""
+        router.reload()
+        return bool(server_control.refresh_from_registry(router.registry_dir))
+
+    @app.get("/api/info")
+    async def api_info() -> Response:
+        """Name, Version und Laufzeit des Gateways (fuer den Header)."""
+        return JSONResponse(content={
+            "name": "Gantry",
+            "version": __version__,
+            "uptime_seconds": max(0, int(time.monotonic() - gestartet)),
+            "providers": len(router.providers()),
+        })
 
     @app.get("/api/providers")
     async def api_providers() -> Response:
@@ -382,6 +454,150 @@ def register_provider_routes(
         if fehler is not None:
             return fehler
         return JSONResponse(content=await _detail(provider))
+
+    @app.get("/api/providers/{provider_id}/edit")
+    async def api_provider_edit(provider_id: str) -> Response:
+        """Vollstaendige Editor-Sicht (inkl. Start-/Stopbefehl) fuer ein Detail.
+
+        Die Listen- und Detailantworten bleiben bewusst schlank; nur diese
+        lokale Editor-Route liefert die Prozessfelder, damit das Formular sie
+        vorbefuellen kann. Zugangsdaten/Umgebungsvariablen gibt es im
+        Datenmodell nicht.
+        """
+        provider, fehler = _provider_oder_404(provider_id)
+        if fehler is not None:
+            return fehler
+        return JSONResponse(content=provider.to_dict())
+
+    @app.post("/api/providers", status_code=201)
+    async def api_provider_create(request: Request) -> Response:
+        try:
+            daten = await request.json()
+        except ValueError:
+            daten = None
+        if not isinstance(daten, dict):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "JSON-Objekt erwartet"})
+        try:
+            provider = _provider_aus_body(daten)
+        except RegistryError as exc:
+            return JSONResponse(status_code=400,
+                                content={"error": str(exc)})
+
+        router.reload()
+        if (provider.id in router.providers()
+                or (router.registry_dir / f"{provider.id}.toml").exists()):
+            return JSONResponse(
+                status_code=409,
+                content={"error": f"Provider {provider.id!r} existiert "
+                                  f"bereits"})
+        try:
+            save_provider(provider, router.registry_dir)
+        except RegistryError as exc:
+            return JSONResponse(status_code=400,
+                                content={"error": str(exc)})
+        except OSError as exc:
+            logger.warning("Provider %s anlegen fehlgeschlagen: %s",
+                           provider.id, exc)
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"Provider konnte nicht gespeichert "
+                                  f"werden: {exc}"})
+        neu_geladen = _registry_neu_laden()
+        antwort = await _detail(provider)
+        antwort["reload_pending"] = not neu_geladen
+        return JSONResponse(status_code=201, content=antwort)
+
+    @app.delete("/api/providers/{provider_id}")
+    async def api_provider_delete(provider_id: str) -> Response:
+        router.reload()
+        provider, fehler = _provider_oder_404(provider_id)
+        if fehler is not None:
+            return fehler
+        try:
+            geloescht = delete_provider(provider.id, router.registry_dir)
+        except OSError as exc:
+            logger.warning("Provider %s loeschen fehlgeschlagen: %s",
+                           provider_id, exc)
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"Provider konnte nicht geloescht "
+                                  f"werden: {exc}"})
+        if not geloescht:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Provider {provider_id!r} nicht gefunden"})
+        neu_geladen = _registry_neu_laden()
+        return JSONResponse(content={
+            "deleted": provider.id,
+            "reload_pending": not neu_geladen,
+        })
+
+    @app.post("/api/providers/{provider_id}/rename")
+    async def api_provider_rename(provider_id: str,
+                                  request: Request) -> Response:
+        router.reload()
+        provider, fehler = _provider_oder_404(provider_id)
+        if fehler is not None:
+            return fehler
+        try:
+            daten = await request.json()
+        except ValueError:
+            daten = None
+        if not isinstance(daten, dict):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "JSON-Objekt erwartet"})
+        roh_id = daten.get("id")
+        if not isinstance(roh_id, str) or not roh_id.strip():
+            return JSONResponse(
+                status_code=400,
+                content={"error": "id fehlt"})
+        neu_id = roh_id.strip().lower()
+        if neu_id == provider.id:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "neue id muss sich von der alten "
+                                  "unterscheiden"})
+        if not PROVIDER_ID_RE.match(neu_id):
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"ungueltige id {neu_id!r}: nur "
+                                  f"Kleinbuchstaben, Ziffern, '-' und '_' "
+                                  f"(max. 64 Zeichen)"})
+        if (neu_id in router.providers()
+                or (router.registry_dir / f"{neu_id}.toml").exists()):
+            return JSONResponse(
+                status_code=409,
+                content={"error": f"Provider {neu_id!r} existiert bereits"})
+
+        neuer_name = provider.name
+        if not neuer_name or neuer_name == provider.id:
+            neuer_name = neu_id
+        try:
+            umbenannt = replace(provider, id=neu_id, name=neuer_name)
+        except (RegistryError, TypeError, ValueError) as exc:
+            return JSONResponse(status_code=400,
+                                content={"error": str(exc)})
+        try:
+            save_provider(umbenannt, router.registry_dir)
+        except RegistryError as exc:
+            return JSONResponse(status_code=400,
+                                content={"error": str(exc)})
+        except OSError as exc:
+            logger.warning("Provider %s umbenennen fehlgeschlagen: %s",
+                           provider_id, exc)
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"Provider konnte nicht umbenannt "
+                                  f"werden: {exc}"})
+        alt = router.registry_dir / f"{provider.id}.toml"
+        alt.unlink(missing_ok=True)
+        neu_geladen = _registry_neu_laden()
+        antwort = await _detail(umbenannt)
+        antwort["reload_pending"] = not neu_geladen
+        return JSONResponse(content=antwort)
 
     @app.patch("/api/providers/{provider_id}")
     async def api_provider_patch(provider_id: str,

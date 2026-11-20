@@ -1,0 +1,544 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#070a10">
+  <meta name="description" content="Gantry – Local AI Runtime Manager">
+  <title>Gantry – Local AI Runtime</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230b1220'/%3E%3Cpath d='M7 25V13l9-6 9 6v12' fill='none' stroke='%235eead4' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M12 25v-8h8v8' fill='none' stroke='%2360a5fa' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/dashboard.css">
+  <script defer src="/dashboard.js"></script>
+</head>
+<body>
+  <!-- Inline-Sprite: keine externen Icons, funktioniert offline. -->
+  <svg class="sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+    <symbol id="i-logo" viewBox="0 0 24 24">
+      <path d="M4 21V9l8-5 8 5v12"/>
+      <path d="M8 21v-8h8v8"/>
+      <path d="M12 7v4"/>
+    </symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24">
+      <path d="M12 5v14M5 12h14"/>
+    </symbol>
+    <symbol id="i-play" viewBox="0 0 24 24">
+      <path d="M8 5.5l10.5 6.5L8 18.5z"/>
+    </symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24">
+      <rect x="6.5" y="6.5" width="11" height="11" rx="2"/>
+    </symbol>
+    <symbol id="i-logs" viewBox="0 0 24 24">
+      <rect x="3.5" y="4.5" width="17" height="15" rx="2"/>
+      <path d="M8 9.5l3 2.5-3 2.5M13 15h4"/>
+    </symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24">
+      <path d="M4 20h4L20.5 7.5a2.1 2.1 0 0 0-3-3L5 17v3z"/>
+      <path d="M13.5 6.5l4 4"/>
+    </symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24">
+      <path d="M4 7h16M9.5 7V4h5v3M6.5 7l1 13h9l1-13M10 11v5M14 11v5"/>
+    </symbol>
+    <symbol id="i-x" viewBox="0 0 24 24">
+      <path d="M6 6l12 12M18 6L6 18"/>
+    </symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24">
+      <rect x="9" y="9" width="11" height="11" rx="2"/>
+      <path d="M15 5H6a2 2 0 0 0-2 2v9"/>
+    </symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24">
+      <path d="M20 8V4m0 0h-4M20 4l-3.2 3.2A8 8 0 0 0 4.4 11"/>
+      <path d="M4 16v4m0 0h4m-4 0l3.2-3.2A8 8 0 0 0 19.6 13"/>
+    </symbol>
+    <symbol id="i-server" viewBox="0 0 24 24">
+      <rect x="4" y="4" width="16" height="6" rx="1.5"/>
+      <rect x="4" y="14" width="16" height="6" rx="1.5"/>
+      <path d="M7.5 7h.01M7.5 17h.01M12 7h4M12 17h4"/>
+    </symbol>
+    <symbol id="i-gpu" viewBox="0 0 24 24">
+      <rect x="3.5" y="5.5" width="17" height="12" rx="2"/>
+      <path d="M8 21h8M12 17.5V21M7 10h2M7 13h2"/>
+    </symbol>
+    <symbol id="i-memory" viewBox="0 0 24 24">
+      <rect x="5" y="7" width="14" height="10" rx="2"/>
+      <path d="M8 7V4M12 7V4M16 7V4M8 20v-3M12 20v-3M16 20v-3"/>
+    </symbol>
+    <symbol id="i-disk" viewBox="0 0 24 24">
+      <ellipse cx="12" cy="6.5" rx="7.5" ry="3"/>
+      <path d="M4.5 6.5v11c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3v-11"/>
+      <path d="M4.5 12c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3"/>
+    </symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="8.5"/>
+      <path d="M12 7.5V12l3 2"/>
+    </symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24">
+      <rect x="3.5" y="4.5" width="17" height="15" rx="2"/>
+      <path d="M7.5 9.5l3 2.5-3 2.5M13 15h3.5"/>
+    </symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24">
+      <path d="M12 4l9 16H3z"/>
+      <path d="M12 9.5v4.5M12 17.5h.01"/>
+    </symbol>
+    <symbol id="i-check" viewBox="0 0 24 24">
+      <path d="M5 12.5l4.5 4.5L19 7.5"/>
+    </symbol>
+    <symbol id="i-bolt" viewBox="0 0 24 24">
+      <path d="M13 3L5 13.5h5L10 21l8-10.5h-5z"/>
+    </symbol>
+    <symbol id="i-link" viewBox="0 0 24 24">
+      <path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 1 0-5.7-5.7L11.5 7"/>
+      <path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 1 0 5.7 5.7l1.5-1.7"/>
+    </symbol>
+    <symbol id="i-command" viewBox="0 0 24 24">
+      <path d="M9 6.5a2.5 2.5 0 1 0-2.5 2.5H9V6.5zM9 17.5A2.5 2.5 0 1 1 6.5 15H9v2.5zM15 6.5A2.5 2.5 0 1 1 17.5 9H15V6.5zM15 17.5a2.5 2.5 0 1 0 2.5-2.5H15v2.5z"/>
+      <path d="M9 9h6v6H9z"/>
+    </symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24">
+      <path d="M6 9l6 6 6-6"/>
+    </symbol>
+  </svg>
+
+  <div class="page">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg class="icon"><use href="#i-logo"></use></svg>
+        </span>
+        <div class="brand-text">
+          <div class="brand-line">
+            <h1>Gantry</h1>
+            <span class="brand-tag">Local AI Runtime</span>
+          </div>
+          <p>Provider orchestrieren. Modelle on demand. Alles bleibt lokal.</p>
+        </div>
+      </div>
+      <div class="topbar-meta">
+        <span class="live-pill" id="live-pill" title="Verbindung zum Gateway">
+          <span class="live-dot" id="live-dot"></span>
+          <span id="live-label">Verbinde…</span>
+        </span>
+        <div class="meta-block">
+          <span class="meta-label">Uptime</span>
+          <strong id="gateway-uptime">–</strong>
+        </div>
+        <div class="meta-block">
+          <span class="meta-label">Version</span>
+          <strong id="gateway-version">–</strong>
+        </div>
+        <button class="btn btn-primary" id="add-provider" data-action="add-provider" type="button">
+          <svg class="icon"><use href="#i-plus"></use></svg>
+          <span>Provider hinzufügen</span>
+        </button>
+      </div>
+    </header>
+
+    <main class="main">
+      <div id="global-error" class="alert alert-error" role="alert" hidden>
+        <svg class="icon"><use href="#i-alert"></use></svg>
+        <div class="alert-text">
+          <strong>Verbindung gestört</strong>
+          <span id="global-error-text">Das Gateway antwortet nicht.</span>
+        </div>
+        <button class="btn btn-ghost btn-sm" id="global-error-retry" type="button">
+          <svg class="icon"><use href="#i-refresh"></use></svg>
+          Erneut versuchen
+        </button>
+      </div>
+
+      <section class="status-strip" aria-label="Übersicht">
+        <div class="status-item">
+          <span class="status-kicker"><svg class="icon"><use href="#i-server"></use></svg> Provider</span>
+          <strong id="summary-providers">–</strong>
+          <span class="status-sub" id="summary-providers-sub">wird geladen</span>
+        </div>
+        <div class="status-item">
+          <span class="status-kicker"><svg class="icon"><use href="#i-gpu"></use></svg> GPU-VRAM</span>
+          <strong id="summary-gpu">–</strong>
+          <span class="status-sub" id="summary-gpu-sub">–</span>
+        </div>
+        <div class="status-item">
+          <span class="status-kicker"><svg class="icon"><use href="#i-memory"></use></svg> Arbeitsspeicher</span>
+          <strong id="summary-ram">–</strong>
+          <span class="status-sub" id="summary-ram-sub">–</span>
+        </div>
+        <div class="status-item">
+          <span class="status-kicker"><svg class="icon"><use href="#i-clock"></use></svg> Aktualisiert</span>
+          <strong id="summary-sync">–</strong>
+          <span class="status-sub" id="summary-sync-sub">Auto-Refresh aktiv</span>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="system-title">
+        <div class="section-head">
+          <div class="section-title">
+            <span class="eyebrow">Live</span>
+            <h2 id="system-title">System-Monitor</h2>
+            <p>GPU, Speicher und Disk des lokalen Rechners.</p>
+          </div>
+          <div class="section-tools">
+            <span class="updated" id="system-updated">–</span>
+            <button class="btn btn-ghost btn-sm" id="refresh-system" type="button">
+              <svg class="icon"><use href="#i-refresh"></use></svg>
+              Aktualisieren
+            </button>
+          </div>
+        </div>
+        <div id="system-note" class="inline-note" hidden></div>
+        <div id="system-grid" class="system-grid" aria-live="polite">
+          <article class="card system-card skeleton-card"><div class="skeleton w-40"></div><div class="skeleton w-70"></div><div class="skeleton w-90"></div></article>
+          <article class="card system-card skeleton-card"><div class="skeleton w-40"></div><div class="skeleton w-70"></div><div class="skeleton w-90"></div></article>
+          <article class="card system-card skeleton-card"><div class="skeleton w-40"></div><div class="skeleton w-70"></div><div class="skeleton w-90"></div></article>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="provider-title">
+        <div class="section-head">
+          <div class="section-title">
+            <span class="eyebrow">Registry</span>
+            <h2 id="provider-title">Provider <span class="count-pill" id="provider-count">–</span></h2>
+            <p>Jeder Provider ist eine TOML-Datei. Start, Stop und Idle-Unload laufen über dieselbe Registry.</p>
+          </div>
+          <div class="section-tools">
+            <button class="btn btn-ghost btn-sm" id="refresh-providers" type="button">
+              <svg class="icon"><use href="#i-refresh"></use></svg>
+              Aktualisieren
+            </button>
+            <button class="btn btn-primary btn-sm" data-action="add-provider" type="button">
+              <svg class="icon"><use href="#i-plus"></use></svg>
+              Neu
+            </button>
+          </div>
+        </div>
+        <div id="provider-grid" class="provider-grid" aria-live="polite">
+          <article class="card provider-card skeleton-card"><div class="skeleton w-40"></div><div class="skeleton w-70"></div><div class="skeleton w-90"></div></article>
+          <article class="card provider-card skeleton-card"><div class="skeleton w-40"></div><div class="skeleton w-70"></div><div class="skeleton w-90"></div></article>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="api-title">
+        <div class="section-head">
+          <div class="section-title">
+            <span class="eyebrow">Schnittstelle</span>
+            <h2 id="api-title">API &amp; CLI</h2>
+            <p>OpenAI-kompatibel auf Port 30000 – und dieselbe Registry über die Kommandozeile.</p>
+          </div>
+        </div>
+        <div class="help-grid">
+          <article class="card help-card">
+            <div class="help-head">
+              <span class="help-icon"><svg class="icon"><use href="#i-link"></use></svg></span>
+              <div>
+                <h3>OpenAI-kompatibel</h3>
+                <p>Jeder Provider ist über Modell-ID oder Anzeigename erreichbar.</p>
+              </div>
+            </div>
+            <div class="field-label">Basis-URL</div>
+            <div class="code-row">
+              <code class="code-block" id="api-endpoint">http://127.0.0.1:30000/v1</code>
+              <button class="btn btn-ghost btn-sm btn-icon-label" id="copy-endpoint" type="button" title="Basis-URL kopieren">
+                <svg class="icon"><use href="#i-copy"></use></svg>
+                <span>Kopieren</span>
+              </button>
+            </div>
+            <div class="field-label">Chat-Completion</div>
+            <div class="code-wrap">
+              <pre class="code-block code-pre" id="curl-example">curl …</pre>
+              <button class="btn btn-ghost btn-sm btn-icon-label code-copy" id="copy-curl" type="button" title="curl-Beispiel kopieren">
+                <svg class="icon"><use href="#i-copy"></use></svg>
+                <span>Kopieren</span>
+              </button>
+            </div>
+          </article>
+
+          <article class="card help-card">
+            <div class="help-head">
+              <span class="help-icon"><svg class="icon"><use href="#i-terminal"></use></svg></span>
+              <div>
+                <h3>Provider-CLI</h3>
+                <p>Dieselben Schreibpfade wie das Dashboard, ohne Neustart des Gateways.</p>
+              </div>
+            </div>
+            <div class="cli-list">
+              <div class="cli-row"><code>./server.sh provider list</code><span>Alle Provider anzeigen</span></div>
+              <div class="cli-row"><code>./server.sh provider add --help</code><span>Neuen Provider anlegen</span></div>
+              <div class="cli-row"><code>./server.sh provider edit &lt;id&gt; --port 8080</code><span>Felder ändern</span></div>
+              <div class="cli-row"><code>./server.sh provider rename &lt;alt&gt; &lt;neu&gt;</code><span>Umbenennen</span></div>
+              <div class="cli-row"><code>./server.sh provider rm &lt;id&gt;</code><span>Entfernen</span></div>
+              <div class="cli-row"><code>./server.sh provider path</code><span>Registry-Verzeichnis</span></div>
+            </div>
+            <p class="help-footnote">
+              <svg class="icon"><use href="#i-bolt"></use></svg>
+              Änderungen greifen sofort – laufende Modellprozesse werden dabei nicht neu gestartet.
+            </p>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>Gantry · Local AI Runtime</span>
+      <span class="footer-dot">·</span>
+      <span>Alle Daten bleiben auf diesem Rechner.</span>
+      <span class="footer-spacer"></span>
+      <span id="footer-status">Gateway verbunden</span>
+    </footer>
+  </div>
+
+  <!-- Provider-Editor -->
+  <div class="overlay" id="editor-overlay" hidden>
+    <aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="editor-title">
+      <header class="drawer-head">
+        <div>
+          <span class="eyebrow" id="editor-eyebrow">Neuer Eintrag</span>
+          <h2 id="editor-title">Provider hinzufügen</h2>
+          <p id="editor-subtitle">Startbefehl, Port und Einstellungen für die Registry.</p>
+        </div>
+        <button class="btn-icon" id="editor-close" type="button" aria-label="Editor schließen">
+          <svg class="icon"><use href="#i-x"></use></svg>
+        </button>
+      </header>
+
+      <form id="editor-form" class="drawer-body" novalidate>
+        <div id="editor-error" class="alert alert-error" role="alert" hidden>
+          <svg class="icon"><use href="#i-alert"></use></svg>
+          <div class="alert-text"><strong>Speichern fehlgeschlagen</strong><span id="editor-error-text"></span></div>
+        </div>
+
+        <div class="form-section">
+          <h3>Basis</h3>
+          <div class="form-grid">
+            <div class="field">
+              <label for="f-id">Provider-ID <span class="req">*</span></label>
+              <input id="f-id" name="id" type="text" autocomplete="off" spellcheck="false" placeholder="z. B. qwen-coder" required>
+              <p class="hint" id="id-hint">Kleinbuchstaben, Ziffern, <code>-</code> und <code>_</code>. Beim Bearbeiten benennt eine neue ID den Provider um.</p>
+              <p class="field-error" data-error-for="id"></p>
+            </div>
+            <div class="field">
+              <label for="f-name">Anzeigename <span class="req">*</span></label>
+              <input id="f-name" name="name" type="text" autocomplete="off" placeholder="z. B. Qwen Coder" required>
+              <p class="field-error" data-error-for="name"></p>
+            </div>
+            <div class="field">
+              <label for="f-kind">Typ</label>
+              <select id="f-kind" name="kind">
+                <option value="strata">strata</option>
+                <option value="ollama">ollama</option>
+                <option value="sglang">sglang</option>
+                <option value="custom">custom</option>
+              </select>
+            </div>
+            <div class="field">
+              <label class="toggle" for="f-enabled">
+                <input id="f-enabled" name="enabled" type="checkbox" checked>
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-text">Aktiviert<small>Provider darf automatisch starten</small></span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-section">
+          <h3>Verbindung</h3>
+          <div class="form-grid">
+            <div class="field">
+              <label for="f-host">Host</label>
+              <input id="f-host" name="host" type="text" autocomplete="off" spellcheck="false" placeholder="127.0.0.1">
+              <p class="field-error" data-error-for="host"></p>
+            </div>
+            <div class="field">
+              <label for="f-port">Port</label>
+              <input id="f-port" name="port" type="number" min="0" max="65535" step="1" placeholder="8080">
+              <p class="field-error" data-error-for="port"></p>
+            </div>
+            <div class="field full">
+              <label for="f-model">Modell-ID beim Provider</label>
+              <input id="f-model" name="model" type="text" autocomplete="off" spellcheck="false" placeholder="z. B. qwen3.8-flash-next-coder-iq1_m">
+              <p class="hint">Exakt der Name, den der Upstream erwartet. Leer = Provider-ID wird durchgereicht.</p>
+              <p class="field-error" data-error-for="model"></p>
+            </div>
+            <div class="field full">
+              <label for="f-health-url">Health-URL</label>
+              <input id="f-health-url" name="health_url" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:8080/health oder /health">
+              <p class="hint">Absolute URL oder Pfad relativ zu Host und Port.</p>
+              <p class="field-error" data-error-for="health_url"></p>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-section">
+          <h3>Prozess</h3>
+          <div class="form-grid">
+            <div class="field full">
+              <label for="f-workdir">Arbeitsverzeichnis</label>
+              <input id="f-workdir" name="workdir" type="text" autocomplete="off" spellcheck="false" placeholder="/home/user/edge0/edge0-strata">
+              <p class="hint">Relativ zum Repo-Root oder absolut.</p>
+              <p class="field-error" data-error-for="workdir"></p>
+            </div>
+            <div class="field">
+              <label for="f-logfile">Logdatei</label>
+              <input id="f-logfile" name="logfile" type="text" autocomplete="off" spellcheck="false" placeholder="/tmp/qwen-coder.log">
+              <p class="field-error" data-error-for="logfile"></p>
+            </div>
+            <div class="field">
+              <label for="f-pidfile">PID-Datei</label>
+              <input id="f-pidfile" name="pidfile" type="text" autocomplete="off" spellcheck="false" placeholder="runtime/qwen-coder/qwen-coder.pid">
+              <p class="field-error" data-error-for="pidfile"></p>
+            </div>
+            <div class="field full">
+              <label for="f-start-cmd">Startbefehl <span class="label-hint">eine Zeile pro Argument</span></label>
+              <textarea id="f-start-cmd" name="start_cmd" rows="4" spellcheck="false" placeholder=".venv/bin/python&#10;serve/server.py&#10;--config&#10;strata-coder-iq1_m.json"></textarea>
+              <p class="field-error" data-error-for="start_cmd"></p>
+            </div>
+            <div class="field full">
+              <label for="f-stop-cmd">Stopbefehl <span class="label-hint">eine Zeile pro Argument</span></label>
+              <textarea id="f-stop-cmd" name="stop_cmd" rows="3" spellcheck="false" placeholder="pkill&#10;-INT&#10;-f&#10;^\.venv/bin/python serve/server.py"></textarea>
+              <p class="field-error" data-error-for="stop_cmd"></p>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-section">
+          <h3>Einstellungen</h3>
+          <div class="form-grid">
+            <div class="field">
+              <label for="f-context">Context</label>
+              <input id="f-context" name="context" type="number" min="0" step="1" placeholder="131072">
+              <p class="hint">Kontextfenster in Tokens.</p>
+              <p class="field-error" data-error-for="context"></p>
+            </div>
+            <div class="field">
+              <label for="f-max-tokens">max_tokens</label>
+              <input id="f-max-tokens" name="max_tokens" type="number" min="0" step="1" placeholder="8192">
+              <p class="hint">Obergrenze pro Antwort.</p>
+              <p class="field-error" data-error-for="max_tokens"></p>
+            </div>
+            <div class="field">
+              <label for="f-kv">KV-Cache</label>
+              <input id="f-kv" name="kv" type="text" list="kv-options" autocomplete="off" spellcheck="false" placeholder="int8">
+              <datalist id="kv-options">
+                <option value=""></option>
+                <option value="fp8"></option>
+                <option value="int8"></option>
+                <option value="int4"></option>
+              </datalist>
+              <p class="field-error" data-error-for="kv"></p>
+            </div>
+            <div class="field">
+              <label for="f-keep-alive">keep_alive</label>
+              <input id="f-keep-alive" name="keep_alive" type="number" step="1" placeholder="-1">
+              <p class="hint">-1 = dauerhaft geladen.</p>
+              <p class="field-error" data-error-for="keep_alive"></p>
+            </div>
+            <div class="field">
+              <label for="f-parallel">Parallel-Slots</label>
+              <input id="f-parallel" name="parallel" type="number" min="1" step="1" placeholder="1">
+              <p class="field-error" data-error-for="parallel"></p>
+            </div>
+            <div class="field">
+              <label for="f-idle-unload">Idle-Unload (Minuten)</label>
+              <input id="f-idle-unload" name="idle_unload_min" type="number" min="0" step="1" placeholder="0">
+              <p class="hint">0 = nie automatisch entladen.</p>
+              <p class="field-error" data-error-for="idle_unload_min"></p>
+            </div>
+            <div class="field">
+              <label for="f-vram-reserve">VRAM-Reserve (MiB)</label>
+              <input id="f-vram-reserve" name="vram_reserve_mib" type="number" min="0" step="1" placeholder="1152">
+              <p class="field-error" data-error-for="vram_reserve_mib"></p>
+            </div>
+            <div class="field">
+              <label class="toggle" for="f-auto-load">
+                <input id="f-auto-load" name="auto_load" type="checkbox" checked>
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-text">Auto-Load<small>Beim ersten Request starten</small></span>
+              </label>
+            </div>
+            <div class="field full">
+              <label class="toggle" for="f-exclusive-gpu">
+                <input id="f-exclusive-gpu" name="exclusive_gpu" type="checkbox">
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-text">Exklusive GPU<small>Andere GPU-Provider vor dem Start stoppen</small></span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <p class="form-footnote">
+          <svg class="icon"><use href="#i-bolt"></use></svg>
+          Speichert direkt in <code>providers/&lt;id&gt;.toml</code>. Ein laufender Prozess wird nicht automatisch neu gestartet.
+        </p>
+      </form>
+
+      <footer class="drawer-foot">
+        <button class="btn btn-ghost" id="editor-cancel" type="button">Abbrechen</button>
+        <button class="btn btn-primary" id="editor-submit" type="submit" form="editor-form">
+          <svg class="icon"><use href="#i-check"></use></svg>
+          <span id="editor-submit-label">Provider anlegen</span>
+        </button>
+      </footer>
+    </aside>
+  </div>
+
+  <!-- Live-Logs -->
+  <div class="overlay" id="logs-overlay" hidden>
+    <div class="modal logs-modal" role="dialog" aria-modal="true" aria-labelledby="logs-title">
+      <header class="modal-head">
+        <div>
+          <span class="eyebrow">Live-Tail</span>
+          <h2 id="logs-title">Logs</h2>
+          <p class="modal-sub" id="logs-path">–</p>
+        </div>
+        <button class="btn-icon" id="logs-close" type="button" aria-label="Log-Viewer schließen">
+          <svg class="icon"><use href="#i-x"></use></svg>
+        </button>
+      </header>
+      <div class="logs-toolbar">
+        <label class="select-label" for="logs-lines">Zeilen
+          <select id="logs-lines">
+            <option value="100">100</option>
+            <option value="200" selected>200</option>
+            <option value="500">500</option>
+            <option value="1000">1000</option>
+            <option value="2000">2000</option>
+          </select>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="logs-autoscroll" checked>
+          <span>Autoscroll</span>
+        </label>
+        <span class="logs-status" id="logs-status">–</span>
+        <span class="toolbar-spacer"></span>
+        <button class="btn btn-ghost btn-sm" id="logs-refresh" type="button">
+          <svg class="icon"><use href="#i-refresh"></use></svg>
+          Aktualisieren
+        </button>
+        <button class="btn btn-ghost btn-sm" id="logs-copy" type="button">
+          <svg class="icon"><use href="#i-copy"></use></svg>
+          Kopieren
+        </button>
+      </div>
+      <div id="logs-note" class="inline-note" hidden></div>
+      <div class="logs-body">
+        <pre class="logs-pre" id="logs-pre">Lade Log …</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bestätigung -->
+  <div class="overlay" id="confirm-overlay" hidden>
+    <div class="modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+      <span class="confirm-icon" id="confirm-icon">
+        <svg class="icon"><use href="#i-alert"></use></svg>
+      </span>
+      <h2 id="confirm-title">Sicher?</h2>
+      <p id="confirm-message"></p>
+      <div class="confirm-actions">
+        <button class="btn btn-ghost" id="confirm-cancel" type="button">Abbrechen</button>
+        <button class="btn btn-danger" id="confirm-ok" type="button">Löschen</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+</body>
+</html>
