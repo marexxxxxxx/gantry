@@ -1,0 +1,21 @@
+id = "qwen"
+name = "Qwen (SGLang)"
+kind = "sglang"
+enabled = true
+host = "127.0.0.1"
+port = 30001
+model = "escha-qwen38-27b-w2"
+health_url = "http://127.0.0.1:30001/health"
+pidfile = ""
+logfile = ""
+workdir = "."
+start_cmd = ["systemctl", "--user", "start", "escha-server.service"]
+stop_cmd = ["systemctl", "--user", "stop", "escha-server.service"]
+
+[settings]
+context = 84000
+max_tokens = 8192
+auto_load = false
+idle_unload_min = 0
+exclusive_gpu = true
+parallel = 1

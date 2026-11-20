@@ -1,0 +1,25 @@
+id = "edge0"
+name = "Edge0 120B (NVFP4)"
+kind = "custom"
+enabled = true
+host = "127.0.0.1"
+port = 30001
+model = "edge0-120b"
+health_url = "http://127.0.0.1:30001/health"
+pidfile = "runtime/edge0/edge0.pid"
+logfile = "/tmp/edge0_server.log"
+workdir = "."
+start_cmd = ["runtime/edge0/start-edge0.sh"]
+stop_cmd = ["runtime/edge0/stop-edge0.sh"]
+
+[settings]
+context = 131072
+max_tokens = 8192
+auto_load = false
+idle_unload_min = 0
+exclusive_gpu = true
+parallel = 1
+scope_unit = "edge0-backend.scope"
+memory_max = "44G"
+thinking = "off"
+thinking_budget_tokens = 1024

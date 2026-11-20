@@ -1,0 +1,22 @@
+id = "gptoss"
+name = "GPT-OSS 20B"
+kind = "ollama"
+enabled = true
+host = "127.0.0.1"
+port = 30001
+model = "gpt-oss:20b"
+health_url = "http://127.0.0.1:30001/api/version"
+pidfile = "runtime/gptoss/gptoss.pid"
+logfile = "/tmp/gptoss_server.log"
+workdir = "."
+start_cmd = ["runtime/gptoss/start-gptoss.sh"]
+stop_cmd = ["runtime/gptoss/stop-gptoss.sh"]
+
+[settings]
+context = 32768
+max_tokens = 10240
+keep_alive = -1
+auto_load = false
+idle_unload_min = 0
+exclusive_gpu = true
+parallel = 2

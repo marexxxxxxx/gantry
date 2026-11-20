@@ -1,0 +1,24 @@
+id = "qwen-coder"
+name = "Qwen3.8 Flash Next Coder (abliterated)"
+kind = "strata"
+enabled = true
+host = "127.0.0.1"
+port = 8080
+model = "qwen3.8-flash-next-coder-iq1_m"
+health_url = "http://127.0.0.1:8080/health"
+pidfile = ""
+logfile = "/tmp/qwen_serve.log"
+workdir = "/home/user/edge0/edge0-strata"
+start_cmd = ["/home/user/edge0/edge0-strata/.venv/bin/python", "serve/server.py", "--engine", "strata", "--config", "strata-coder-iq1_m.json", "--port", "8080"]
+stop_cmd = ['pkill', '-INT', '-f', '^\.venv/bin/python serve/server.py']
+
+[settings]
+context = 131072
+max_tokens = 8192
+kv = "int8"
+keep_alive = -1
+auto_load = true
+idle_unload_min = 30
+exclusive_gpu = true
+vram_reserve_mib = 1152
+parallel = 1

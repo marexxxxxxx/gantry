@@ -1,0 +1,22 @@
+id = "abl"
+name = "Qwen3-14B Abliterated"
+kind = "ollama"
+enabled = true
+host = "127.0.0.1"
+port = 30001
+model = "hf.co/bartowski/huihui-ai_Qwen3-14B-abliterated-GGUF:Q4_K_M"
+health_url = "http://127.0.0.1:30001/api/version"
+pidfile = "runtime/abl/abl.pid"
+logfile = "/tmp/abl_server.log"
+workdir = "."
+start_cmd = ["runtime/abl/start-abl.sh"]
+stop_cmd = ["runtime/abl/stop-abl.sh"]
+
+[settings]
+context = 40256
+max_tokens = 8192
+keep_alive = -1
+auto_load = false
+idle_unload_min = 0
+exclusive_gpu = true
+parallel = 1

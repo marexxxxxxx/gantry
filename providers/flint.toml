@@ -1,0 +1,22 @@
+id = "flint"
+name = "Flint (Ollama)"
+kind = "ollama"
+enabled = true
+host = "127.0.0.1"
+port = 30001
+model = "hf.co/AtomicChat/Flint-GGUF:IQ4_XS"
+health_url = "http://127.0.0.1:30001/api/version"
+pidfile = "runtime/flint/flint.pid"
+logfile = "/tmp/flint_server.log"
+workdir = "."
+start_cmd = ["runtime/flint/start-flint.sh"]
+stop_cmd = ["runtime/flint/stop-flint.sh"]
+
+[settings]
+context = 32768
+max_tokens = 8192
+keep_alive = -1
+auto_load = false
+idle_unload_min = 0
+exclusive_gpu = true
+parallel = 2
