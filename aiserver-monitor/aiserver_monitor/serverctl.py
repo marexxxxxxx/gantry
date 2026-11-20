@@ -29,12 +29,17 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
 from .config import Config, load_config
+from .registry import Provider, RegistryError, load_registry
 
 logger = logging.getLogger(__name__)
+
+#: Upstream, gegen den Health-Polls laufen, wenn keine Config vorliegt.
+DEFAULT_UPSTREAM_BASE = "http://127.0.0.1:30001"
 
 #: Unit, die den Modellserver betreibt (Default; per Config ueberschreibbar).
 DEFAULT_UNIT = "escha-server.service"
@@ -80,6 +85,16 @@ DEFAULT_EDGE0_STOP_SCRIPT = "runtime/edge0/stop-edge0.sh"
 DEFAULT_EDGE0_PIDFILE = "runtime/edge0/edge0.pid"
 DEFAULT_EDGE0_HEALTH_PATH = "/health"
 
+#: Edge0 laeuft in einem eigenen systemd-Scope mit MemoryMax. Ohne Scope
+#: teilt die Engine den cgroup mit dem Gateway, und der Kernel-OOM-Killer
+#: reisst beim RAM-Druck das Gateway samt Sidecars mit (beobachtet 19.11.
+#: 08:08 und 08:20, siehe /tmp/edge0_server.log). 44G liegt ueber dem
+#: gemessenen Bedarf (~38G) und unter den 60G des Hosts, damit noch Platz
+#: fuer Gateway, Ollama und Renderings bleibt. Leerer Scope-Name schaltet
+#: die Isolation ab.
+DEFAULT_EDGE0_SCOPE_UNIT = "edge0-backend.scope"
+DEFAULT_EDGE0_MEMORY_MAX = "44G"
+
 
 @dataclass(frozen=True)
 class Backend:
@@ -99,6 +114,88 @@ class Backend:
     stop_script: str | None = None
     process_pattern: str | None = None
     pidfile: str | None = None
+    #: Direkter Startbefehl aus der Provider-Registry; gewinnt gegen unit/
+    #: start_script. Wird detached im ``workdir`` ausgefuehrt.
+    start_cmd: list[str] | None = None
+    #: Direkter Stopbefehl aus der Provider-Registry; gewinnt gegen unit/
+    #: stop_script. Wird blockierend (mit Timeout) im ``workdir`` ausgefuehrt.
+    stop_cmd: list[str] | None = None
+    #: Arbeitsverzeichnis fuer start_cmd/stop_cmd (relativ zur Repo-Wurzel).
+    workdir: str | None = None
+    #: Eigener systemd-Scope fuer den Start (cgroup-Isolation, optional).
+    scope_unit: str | None = None
+    #: MemoryMax des Scopes; leer/None laesst ihn unbeschraenkt.
+    memory_max: str | None = None
+
+
+def _health_path_from_url(url: str, *, default: str = "/health") -> str:
+    """Pfad aus ``health_url`` extrahieren (absolute URL oder blosser Pfad)."""
+    text = str(url or "").strip()
+    if not text:
+        return default
+    parsed = urlparse(text)
+    path = parsed.path if (parsed.scheme or parsed.netloc) else text
+    if not path:
+        return default
+    if not path.startswith("/"):
+        path = "/" + path
+    return path
+
+
+def _unit_from_command(command: Sequence[str] | None) -> str | None:
+    """Unit-Namen aus ``systemctl ... start|stop <unit>`` ableiten."""
+    if not command or Path(command[0]).name != "systemctl":
+        return None
+    for aktion in ("start", "restart", "stop"):
+        if aktion not in command:
+            continue
+        rest = [teil for teil in command[command.index(aktion) + 1:]
+                if not teil.startswith("-")]
+        if rest and rest[0].endswith(".service"):
+            return rest[0]
+    return None
+
+
+def _backend_from_provider(provider: Provider) -> Backend:
+    """Registry-Provider in ein :class:`Backend` uebersetzen.
+
+    ``scope_unit``/``memory_max`` (und optional ``unit``/``process_pattern``)
+    stehen in ``[settings]``; alle anderen Felder kommen aus den Top-Level-
+    Keys. Der Health-Pfad wird aus ``health_url`` extrahiert, damit die
+    bestehende Poll-Logik gegen den gemeinsamen Upstream unveraendert bleibt.
+    """
+    settings = provider.settings or {}
+    default_health = ("/api/version" if provider.kind == "ollama"
+                      else "/health")
+    unit = str(settings.get("unit") or "").strip() or None
+    process_pattern = str(settings.get("process_pattern") or "").strip() or None
+    if provider.kind == "sglang":
+        unit = unit or _unit_from_command(provider.start_cmd)
+        unit = unit or _unit_from_command(provider.stop_cmd)
+        process_pattern = process_pattern or DEFAULT_PROCESS_PATTERN
+    return Backend(
+        name=provider.id,
+        label=provider.name,
+        health_path=_health_path_from_url(provider.health_url,
+                                          default=default_health),
+        unit=unit,
+        start_cmd=list(provider.start_cmd) or None,
+        stop_cmd=list(provider.stop_cmd) or None,
+        process_pattern=process_pattern,
+        pidfile=provider.pidfile or None,
+        workdir=provider.workdir or ".",
+        scope_unit=str(settings.get("scope_unit") or "").strip() or None,
+        memory_max=str(settings.get("memory_max") or "").strip() or None,
+    )
+
+
+def _backends_from_providers(
+        providers: dict[str, Provider]) -> dict[str, Backend]:
+    """Backends in stabiler Reihenfolge: bekannte Namen zuerst, dann neue."""
+    bekannt = {name: index for index, name in enumerate(BACKEND_NAMES)}
+    namen = sorted(providers,
+                   key=lambda name: (bekannt.get(name, len(bekannt)), name))
+    return {name: _backend_from_provider(providers[name]) for name in namen}
 
 
 class ServerControlError(RuntimeError):
@@ -121,10 +218,11 @@ def _backend_zustand(aktiv: bool, health: bool) -> str:
     return "starting" if aktiv else "stopped"
 
 
-def _aktives_backend(zustaende: dict[str, str]) -> str | None:
+def _aktives_backend(zustaende: dict[str, str],
+                     namen: Sequence[str] = BACKEND_NAMES) -> str | None:
     """Backend, das die UI als aktiv zeigen soll (running vor starting)."""
     for gesucht in ("running", "starting"):
-        for name in BACKEND_NAMES:
+        for name in namen:
             if zustaende.get(name) == gesucht:
                 return name
     return None
@@ -162,9 +260,16 @@ class ServerControl:
             edge0_stop_script: str = DEFAULT_EDGE0_STOP_SCRIPT,
             edge0_pidfile: str = DEFAULT_EDGE0_PIDFILE,
             edge0_health_path: str = DEFAULT_EDGE0_HEALTH_PATH,
+            edge0_scope_unit: str | None = DEFAULT_EDGE0_SCOPE_UNIT,
+            edge0_memory_max: str | None = DEFAULT_EDGE0_MEMORY_MAX,
+            backends: dict[str, Backend] | None = None,
             runner: Callable[[Sequence[str]], Awaitable[tuple[int, str, str]]]
             | None = None,
             spawner: Callable[[Sequence[str]], None] | None = None,
+            command_spawner: Callable[[Sequence[str], str], None] | None = None,
+            command_runner: Callable[[Sequence[str], str],
+                                     Awaitable[tuple[int, str, str]]]
+            | None = None,
             health_reader: Callable[[str], Awaitable[bool]] | None = None,
             clock: Callable[[], float] = time.monotonic,
             sleeper: Callable[[float], Awaitable[None]] | None = None,
@@ -176,7 +281,7 @@ class ServerControl:
     ):
         self._upstream_base = upstream_base.rstrip("/")
         self._repo_root = Path(repo_root)
-        self._backends: dict[str, Backend] = {
+        legacy_backends: dict[str, Backend] = {
             "qwen": Backend(
                 name="qwen",
                 label="Qwen (SGLang)",
@@ -217,12 +322,26 @@ class ServerControl:
                 start_script=edge0_start_script,
                 stop_script=edge0_stop_script,
                 pidfile=edge0_pidfile,
+                scope_unit=edge0_scope_unit or None,
+                memory_max=edge0_memory_max or None,
             ),
         }
+        # Eine explizit uebergebene Registry ersetzt die eingebauten Backends;
+        # ein leeres Dict bleibt leer (der Aufrufer entscheidet ueber den
+        # Rueckfall, siehe :meth:`from_config`).
+        self._backends: dict[str, Backend] = (
+            dict(backends) if backends is not None else legacy_backends)
+        self._backend_names = tuple(self._backends)
+        self._default_backend = (
+            DEFAULT_BACKEND if DEFAULT_BACKEND in self._backends
+            else (self._backend_names[0] if self._backend_names
+                  else DEFAULT_BACKEND))
         #: Kompatibilitaet: ``unit`` ist die Unit des Qwen-Backends.
         self._unit = unit
         self._runner = runner or self._run_subprocess
         self._spawner = spawner or self._spawn_subprocess
+        self._command_spawner = command_spawner or self._spawn_command
+        self._command_runner = command_runner or self._run_command
         self._health_reader = health_reader
         self._clock = clock
         self._sleeper = sleeper or asyncio.sleep
@@ -239,11 +358,76 @@ class ServerControl:
         self._error: str | None = None
         self._lock = asyncio.Lock()
 
-    # --- Konstruktion aus der Gateway-Config --------------------------------
+    # --- Konstruktion aus der Provider-Registry -----------------------------
+
+    @property
+    def backends(self) -> dict[str, Backend]:
+        """Kopie der bekannten Backends (Name -> Backend)."""
+        return dict(self._backends)
+
+    @property
+    def backend_names(self) -> tuple[str, ...]:
+        """Backend-Namen in Anzeigereihenfolge (Registry bzw. eingebaut)."""
+        return self._backend_names
+
+    @classmethod
+    def from_registry(
+            cls,
+            registry_dir: Path | str | None = None,
+            *,
+            upstream_base: str = DEFAULT_UPSTREAM_BASE,
+            repo_root: Path | str | None = None,
+            **kwargs,
+    ) -> "ServerControl":
+        """Backends aus ``providers/*.toml`` bauen.
+
+        ``registry_dir=None`` nimmt :func:`default_registry_dir` (bzw.
+        ``GANTRY_PROVIDERS_DIR``). Eine leere Registry ergibt eine leere
+        Backend-Liste; den Rueckfall auf die eingebauten Backends entscheidet
+        :meth:`from_config`.
+        """
+        providers = load_registry(registry_dir)
+        backends = _backends_from_providers(providers)
+        unit = kwargs.pop("unit", None)
+        if unit is None:
+            unit = next((backend.unit for backend in backends.values()
+                         if backend.unit), DEFAULT_UNIT)
+        return cls(
+            upstream_base=upstream_base,
+            repo_root=(Path(repo_root) if repo_root is not None
+                       else standard_repo_root()),
+            unit=unit,
+            backends=backends,
+            **kwargs,
+        )
 
     @classmethod
     def from_config(cls, config: Config, *,
                     client: httpx.AsyncClient | None = None) -> "ServerControl":
+        """Registry-Backends, sonst die eingebauten (Rueckfall).
+
+        Eine fehlende oder unlesbare ``providers/``-Registry darf das Gateway
+        nicht am Start hindern; sie faellt dann auf die hartkodierten Backends
+        zurueck. Gueltige Provider-Dateien sind die einzige Quelle.
+        """
+        try:
+            providers = load_registry()
+        except (RegistryError, OSError) as exc:
+            logger.warning(
+                "Provider-Registry nicht lesbar (%s) - nutze eingebaute "
+                "Backends.", exc)
+            providers = {}
+        if providers:
+            backends = _backends_from_providers(providers)
+            unit = next((backend.unit for backend in backends.values()
+                         if backend.unit), config.server_unit)
+            return cls(
+                upstream_base=config.upstream_base,
+                repo_root=standard_repo_root(),
+                unit=unit,
+                backends=backends,
+                client=client,
+            )
         return cls(
             upstream_base=config.upstream_base,
             repo_root=standard_repo_root(),
@@ -265,6 +449,8 @@ class ServerControl:
             edge0_stop_script=config.edge0_stop_script,
             edge0_pidfile=config.edge0_pidfile,
             edge0_health_path=config.edge0_health_path,
+            edge0_scope_unit=config.edge0_scope_unit,
+            edge0_memory_max=config.edge0_memory_max,
             client=client,
         )
 
@@ -304,8 +490,9 @@ class ServerControl:
         else:
             state = "stopped"
 
-        backend = self._transition_backend or _aktives_backend(zustaende)
-        gewaehlt = self._backends.get(backend or DEFAULT_BACKEND)
+        backend = self._transition_backend or _aktives_backend(
+            zustaende, self._backend_names)
+        gewaehlt = self._backends.get(backend or self._default_backend)
         unit = gewaehlt.unit if gewaehlt and gewaehlt.unit else self._unit
 
         # Ein laufender Server raeumt keinen alten Fehler weg: die UI zeigt
@@ -338,7 +525,7 @@ class ServerControl:
             return
         vergangen = jetzt - self._transition_start
         if self._transition == "starting":
-            ziel = self._transition_backend or DEFAULT_BACKEND
+            ziel = self._transition_backend or self._default_backend
             wechsel_laeuft = (
                 self._wechsel_task is not None
                 and not self._wechsel_task.done()
@@ -389,7 +576,7 @@ class ServerControl:
                 raise ServerConflictError(
                     "Es laeuft bereits ein Start- oder Stoppvorgang.")
             vorher = await self.snapshot()
-            ziel = backend or vorher["backend"] or DEFAULT_BACKEND
+            ziel = backend or vorher["backend"] or self._default_backend
             if vorher["state"] in ("running", "starting") \
                     and vorher["backend"] == ziel:
                 return vorher
@@ -430,7 +617,7 @@ class ServerControl:
             if vorher["state"] == "stopped":
                 return vorher
 
-            ziel = backend or vorher["backend"] or DEFAULT_BACKEND
+            ziel = backend or vorher["backend"] or self._default_backend
             self._transition = "stopping"
             self._transition_backend = ziel
             self._transition_start = self._clock()
@@ -466,6 +653,15 @@ class ServerControl:
 
     async def _start_backend(self, name: str) -> None:
         backend = self._backends[name]
+        # Registry-Befehl gewinnt: er laeuft detached im Provider-workdir.
+        # Ein systemd-Scope (cgroup-Isolation) bleibt auch fuer ihn aktiv.
+        if backend.start_cmd:
+            befehl = list(backend.start_cmd)
+            if backend.scope_unit:
+                befehl = self._scope_befehl(backend, befehl)
+            self._command_spawner(
+                befehl, str(self._backend_workdir(backend)))
+            return
         if backend.unit and await self._unit_installiert():
             rc, out, err = await self._runner(
                 ["systemctl", "--user", "start", "--no-block", backend.unit])
@@ -475,10 +671,54 @@ class ServerControl:
                     "systemctl start", rc, out, err)
                 raise ServerControlError(self._error)
             return
-        self._spawner(["bash", str(self._skript(backend.start_script))])
+        if not backend.start_script:
+            self._transition = None
+            self._error = (f"Fuer Backend {name!r} ist kein Startbefehl "
+                           "hinterlegt (start_cmd, Unit oder start_script).")
+            raise ServerControlError(self._error)
+        befehl = ["bash", str(self._skript(backend.start_script))]
+        if backend.scope_unit:
+            befehl = self._scope_befehl(backend, befehl)
+        self._spawner(befehl)
+
+    def _backend_workdir(self, backend: Backend) -> Path:
+        """``workdir`` des Providers, relativ zur Repo-Wurzel aufgeloest."""
+        return self._skript(backend.workdir or ".")
+
+    def _scope_befehl(self, backend: Backend, befehl: list[str]) -> list[str]:
+        """Legt den Start in einen eigenen systemd-Scope (eigener cgroup).
+
+        Mit ``MemoryMax`` trifft ein RAM-OOM nur das Backend, nicht das
+        Gateway samt Ollama-, Embed- und Audio-Sidecars. ``EDGE0_FOREGROUND``
+        haelt die Engine im Vordergrund; daemonisiert sie sich (setsid), kann
+        sie den Scope verlassen und die Isolation waere wirkungslos.
+        """
+        args = [
+            "systemd-run", "--user", "--scope", "--collect",
+            "--unit", backend.scope_unit,
+            "--setenv", "EDGE0_FOREGROUND=1",
+        ]
+        if backend.memory_max:
+            args += ["--property", f"MemoryMax={backend.memory_max}"]
+        return args + befehl
 
     async def _stop_backend(self, name: str) -> None:
         backend = self._backends[name]
+        # Registry-Befehl gewinnt: blockierend mit Timeout, damit PID-Files
+        # und Engine-Reste zuverlaessig aufgeraeumt sind, bevor der naechste
+        # Start laeuft. Ein Scope wird vorher beendet (wie beim Skript-Pfad).
+        if backend.stop_cmd:
+            if backend.scope_unit:
+                await self._runner(
+                    ["systemctl", "--user", "stop", backend.scope_unit])
+            rc, out, err = await self._command_runner(
+                list(backend.stop_cmd), str(self._backend_workdir(backend)))
+            if rc != 0:
+                self._transition = None
+                self._error = self._fehlertext(
+                    "Stop-Kommando", rc, out, err)
+                raise ServerControlError(self._error)
+            return
         if backend.unit:
             unit_installiert = await self._unit_installiert()
             if unit_installiert and await self._unit_aktiv(unit_installiert):
@@ -491,6 +731,17 @@ class ServerControl:
                         "systemctl stop", rc, out, err)
                     raise ServerControlError(self._error)
                 return
+        # Scope zuerst beenden: systemd schickt SIGTERM an den ganzen cgroup
+        # und die Engine faehrt sauber herunter. Das Stop-Skript raeumt
+        # danach PID-File und Reste auf.
+        if backend.scope_unit:
+            await self._runner(
+                ["systemctl", "--user", "stop", backend.scope_unit])
+        if not backend.stop_script:
+            self._transition = None
+            self._error = (f"Fuer Backend {name!r} ist kein Stopbefehl "
+                           "hinterlegt (stop_cmd, Unit oder stop_script).")
+            raise ServerControlError(self._error)
         self._spawner(["bash", str(self._skript(backend.stop_script))])
 
     # --- Zustandsquellen ----------------------------------------------------
@@ -508,7 +759,8 @@ class ServerControl:
         return rc == 0
 
     async def _prozess_laeuft(self) -> bool:
-        muster = self._backends["qwen"].process_pattern
+        qwen = self._backends.get("qwen")
+        muster = qwen.process_pattern if qwen is not None else None
         if not muster:
             return False
         rc, _out, _err = await self._runner(["pgrep", "-f", muster])
@@ -603,8 +855,49 @@ class ServerControl:
             start_new_session=True,
         )
 
+    def _spawn_command(self, args: Sequence[str], cwd: str) -> None:
+        """Startet ein ``start_cmd`` aus der Registry detached im workdir.
+
+        Wie ``_spawn_subprocess``: eigener Prozess-Session, keine Ausgabe -
+        die Startskripte/Engines loggen selbst.
+        """
+        subprocess.Popen(
+            list(args),
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    async def _run_command(
+            self, args: Sequence[str], cwd: str) -> tuple[int, str, str]:
+        """Fuehrt ein ``stop_cmd`` blockierend im workdir aus (mit Timeout)."""
+        try:
+            prozess = await asyncio.create_subprocess_exec(
+                *args,
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except (FileNotFoundError, PermissionError,
+                NotADirectoryError) as exc:
+            return 127, "", str(exc)
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                prozess.communicate(), timeout=self._stop_timeout_s)
+        except TimeoutError:
+            prozess.kill()
+            await prozess.wait()
+            return 124, "", f"Timeout nach {int(self._stop_timeout_s)} s"
+        return (
+            prozess.returncode or 0,
+            stdout.decode(errors="replace"),
+            stderr.decode(errors="replace"),
+        )
+
     def _skript(self, name: str) -> Path:
-        pfad = Path(name)
+        pfad = Path(name).expanduser()
         return pfad if pfad.is_absolute() else self._repo_root / pfad
 
     @staticmethod
@@ -705,7 +998,22 @@ async def _mit_client(action: str, *, timeout_s: float,
             await asyncio.sleep(intervall_s)
 
 
+def _backend_auswahl() -> tuple[str, ...]:
+    """Backend-Namen fuer ``server.sh``: Registry, sonst die eingebauten."""
+    try:
+        providers = load_registry()
+    except (RegistryError, OSError) as exc:
+        logger.warning("Provider-Registry nicht lesbar: %s", exc)
+        return BACKEND_NAMES
+    return tuple(_backends_from_providers(providers)) or BACKEND_NAMES
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    args_list = list(sys.argv[1:] if argv is None else argv)
+    if args_list and args_list[0] == "provider":
+        from .provider_cli import main as provider_main
+        return provider_main(args_list[1:])
+    backend_auswahl = _backend_auswahl()
     parser = argparse.ArgumentParser(
         prog="server.sh",
         description="Modellserver (Qwen/SGLang oder Ollama: Flint, GPT-OSS, "
@@ -715,15 +1023,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "action",
         choices=("start", "stop", "status", "restart", "switch"))
     parser.add_argument(
-        "backend", nargs="?", choices=BACKEND_NAMES,
-        help=f"{', '.join(BACKEND_NAMES)} "
+        "backend", nargs="?", choices=backend_auswahl,
+        help=f"{', '.join(backend_auswahl)} "
              f"(Default: laufendes Backend bzw. {DEFAULT_BACKEND})")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(args_list)
     logging.basicConfig(level=logging.WARNING)
 
     if args.action == "switch" and args.backend is None:
         parser.error("switch braucht ein Backend: "
-                     f"{', '.join(BACKEND_NAMES)}")
+                     f"{', '.join(backend_auswahl)}")
 
     if args.action == "restart":
         rc = asyncio.run(_mit_client("stop", timeout_s=90.0,

@@ -467,11 +467,12 @@ def create_app(config: Config, *,
                     status_code=400,
                     content={"error": "JSON-Objekt erwartet"})
             backend = daten.get("backend")
-            if backend is not None and backend not in BACKEND_NAMES:
+            erlaubt = getattr(server_control, "backend_names", BACKEND_NAMES)
+            if backend is not None and backend not in erlaubt:
                 return JSONResponse(
                     status_code=400,
                     content={"error": "backend muss "
-                                      f"{' oder '.join(BACKEND_NAMES)} sein"})
+                                      f"{' oder '.join(erlaubt)} sein"})
         try:
             antwort = await server_control.start(backend)
         except ServerConflictError as exc:
