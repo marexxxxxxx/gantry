@@ -159,6 +159,29 @@ class TestDashboardRoute(DashboardCase):
         self.assertIn("/dashboard.css?v=", antwort.text)
         self.assertIn("/dashboard.js?v=", antwort.text)
 
+    def test_dashboard_assets_werden_ohne_cache_ausgeliefert(self) -> None:
+        """``dashboard.js``/``dashboard.css`` tragen ``Cache-Control: no-cache``.
+
+        Der ``?v=``-Bust allein reicht nicht: wird er beim Deployment vergessen,
+        serviert der Browser die alte, tab-lose Variante weiter. Der Header
+        erzwingt bei jedem Laden einen Revalidate gegen den Server.
+        """
+        with TestClient(self.app()) as client:
+            js = client.get("/dashboard.js")
+            css = client.get("/dashboard.css")
+        self.assertEqual(js.status_code, 200)
+        self.assertEqual(css.status_code, 200)
+        self.assertEqual(js.headers["cache-control"], "no-cache")
+        self.assertEqual(css.headers["cache-control"], "no-cache")
+
+    def test_dashboard_asset_query_nennt_aktuellen_commit(self) -> None:
+        """Der Cache-Busting-Token wurde mit den neuen Tabs mitgezogen."""
+        with TestClient(self.app()) as client:
+            antwort = client.get("/")
+        self.assertEqual(antwort.status_code, 200)
+        self.assertIn("/dashboard.css?v=3c1b8fe", antwort.text)
+        self.assertIn("/dashboard.js?v=3c1b8fe", antwort.text)
+
     def test_dashboard_js_referenziert_steuer_und_queue_endpunkte(self) -> None:
         with TestClient(self.app()) as client:
             js = client.get("/dashboard.js")

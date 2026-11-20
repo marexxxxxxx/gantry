@@ -26,6 +26,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers
 from starlette.responses import Response, StreamingResponse
+from starlette.types import Scope
 
 from .autoload import ProviderRouter
 from .cancel import abort_request
@@ -58,6 +59,23 @@ from .thinking_auto import ThinkingEscalator
 from .webapi import SystemProbe, handle_v1_routed, register_provider_routes
 
 logger = logging.getLogger(__name__)
+
+
+class _NoCacheStaticFiles(StaticFiles):
+    """Static-Mount, der Dashboard-Assets ohne Browser-Cache ausliefert.
+
+    Das Dashboard wird haeufig erweitert (Tabs, Styling). Der ``?v=``-Bust in
+    ``index.html`` wird beim Deployment leicht vergessen; ``Cache-Control:
+    no-cache`` stellt sicher, dass der Browser stets die frische
+    ``dashboard.js``/``dashboard.css`` anfordert, statt die tab-lose
+    Alt-Variante weiterzuverwenden.
+    """
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
 
 #: Maximales Statistik-Fenster (30 Tage, in Millisekunden).
 MAX_FENSTER_MS = 30 * 86400 * 1000
@@ -752,8 +770,8 @@ def create_app(config: Config, *,
                        else static_verzeichnis)
     if web_verzeichnis.is_dir():
         # Zuletzt: der Mount faengt alles ab, was keine Route matcht.
-        app.mount("/", StaticFiles(directory=str(web_verzeichnis),
-                                   html=True), name="static")
+        app.mount("/", _NoCacheStaticFiles(directory=str(web_verzeichnis),
+                                           html=True), name="static")
     else:
         @app.get("/")
         async def index() -> HTMLResponse:
