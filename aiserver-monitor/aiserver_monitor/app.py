@@ -354,6 +354,17 @@ def create_app(config: Config, *,
     async def monitor_jobs() -> dict:
         return {"jobs": registry.snapshot()}
 
+    @app.post("/monitor/jobs/clear")
+    async def monitor_jobs_clear() -> dict:
+        """Entfernt nur terminale Jobs (done/aborted/error).
+
+        Aktive Jobs (waiting/running) bleiben unangetastet; die
+        ``clear_terminal``-Methode der Registry garantiert das auf
+        Datenebene. Liefert die Anzahl der entfernten Jobs.
+        """
+        entfernt = registry.clear_terminal()
+        return {"removed": entfernt}
+
     @app.get("/monitor/events")
     async def monitor_events() -> StreamingResponse:
         def snapshot_frames() -> list[str]:

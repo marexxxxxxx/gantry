@@ -205,6 +205,19 @@ class JobRegistry:
         )
         return [job_to_dict(job) for job in sortiert]
 
+    def clear_terminal(self) -> int:
+        """Entfernt alle terminalen Jobs; aktive bleiben unangetastet.
+
+        Terminal ist jeder Status ausserhalb von ``ACTIVE_STATUSES``
+        (done/aborted/error). Laufende und wartende Jobs werden nie
+        geloescht. Liefert die Anzahl der entfernten Jobs.
+        """
+        beendete = [job for job in self._jobs.values()
+                    if job.status not in ACTIVE_STATUSES]
+        for job in beendete:
+            del self._jobs[job.rid]
+        return len(beendete)
+
 
 def job_to_dict(job: Job) -> dict:
     """Serialisiert einen Job fuer Snapshot/SSE/History (Feldnamen sind stabil).

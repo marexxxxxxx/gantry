@@ -1259,6 +1259,9 @@
       ? `Zuletzt ${formatClock(new Date(data.updatedAt))}`
       : "–");
 
+    const clearBtn = $("queue-clear");
+    if (clearBtn) clearBtn.disabled = !data.loaded || terminalCount() === 0;
+
     const loading = $("queue-loading");
     if (loading) loading.hidden = !(data.loading && !data.loaded);
 
@@ -1389,6 +1392,38 @@
     } finally {
       data.canceling.delete(rid);
       renderQueue();
+    }
+  }
+
+  function terminalCount() {
+    return state.queue.jobs.filter((job) => !QUEUE_ACTIVE.has(String(job.status))).length;
+  }
+
+  async function clearQueueJobs() {
+    const count = terminalCount();
+    const confirmed = await confirmDialog({
+      title: "Terminale Jobs aufräumen?",
+      message: count > 0
+        ? `${formatInt(count)} ${count === 1 ? "abgeschlossener Job wird" : "abgeschlossene Jobs werden"} entfernt. Laufende und wartende Jobs bleiben erhalten.`
+        : "Es gibt keine abgeschlossenen Jobs. Laufende und wartende Jobs werden nie entfernt.",
+      confirmLabel: "Aufräumen",
+      danger: true,
+    });
+    if (!confirmed) return;
+
+    try {
+      const result = await api("/monitor/jobs/clear", { method: "POST", timeout: 15000 });
+      const removed = Number(result && result.removed);
+      toast(
+        "Aufgeräumt",
+        "success",
+        Number.isFinite(removed) && removed > 0
+          ? `${formatInt(removed)} ${removed === 1 ? "Job" : "Jobs"} entfernt.`
+          : "Keine Jobs zu entfernen.",
+      );
+      await loadQueue({ silent: true });
+    } catch (err) {
+      toast("Aufräumen fehlgeschlagen", "error", errorText(err));
     }
   }
 
@@ -2047,6 +2082,7 @@
 
     $("queue-refresh")?.addEventListener("click", () => loadQueue({ silent: true }));
     $("queue-retry")?.addEventListener("click", () => loadQueue({ silent: true }));
+    $("queue-clear")?.addEventListener("click", () => clearQueueJobs());
 
     $("editor-overlay")?.addEventListener("click", (event) => {
       if (event.target === $("editor-overlay")) requestCloseEditor();
