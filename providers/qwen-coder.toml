@@ -11,7 +11,7 @@ pidfile = ""
 logfile = "/tmp/qwen_serve.log"
 workdir = "/home/user/edge0/edge0-strata"
 start_cmd = ["/home/user/edge0/edge0-strata/.venv/bin/python", "serve/server.py", "--engine", "strata", "--config", "strata-coder-iq1_m.json", "--port", "8080"]
-stop_cmd = ['pkill', '-INT', '-f', '^\\.venv/bin/python serve/server.py']
+stop_cmd = ['pkill', '-INT', '-f', '^\.venv/bin/python serve/server.py']
 
 [settings]
 context = 131072
