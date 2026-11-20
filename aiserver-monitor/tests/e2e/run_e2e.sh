@@ -18,7 +18,7 @@
 # der Lauf benutzt ausschliesslich die Testports 39000/39001.
 #
 # Umgebung (alles mit Default):
-#   E2E_PORT=39000 E2E_FAKE_PORT=39001 PYTHON=/home/user/small_qwen/.venv/bin/python
+#   E2E_PORT=39000 E2E_FAKE_PORT=39001 PYTHON=/home/user/gantry/.venv/bin/python
 #   EXE=/home/user/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome
 #   UV=uv NPM=npm E2E_SKIP_BUILD=0 E2E_KEEP_TMP=0
 set -euo pipefail
@@ -30,7 +30,7 @@ E2E_PORT="${E2E_PORT:-39000}"
 E2E_FAKE_PORT="${E2E_FAKE_PORT:-39001}"
 BASE="http://127.0.0.1:${E2E_PORT}"
 FAKE_BASE="http://127.0.0.1:${E2E_FAKE_PORT}"
-PYTHON="${PYTHON:-/home/user/small_qwen/.venv/bin/python}"
+PYTHON="${PYTHON:-/home/user/gantry/.venv/bin/python}"
 UV="${UV:-uv}"
 NPM="${NPM:-npm}"
 EXE="${EXE:-/home/user/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome}"

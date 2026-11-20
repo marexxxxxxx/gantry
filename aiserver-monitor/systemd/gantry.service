@@ -1,0 +1,31 @@
+[Unit]
+Description=Gantry gateway (OpenAI passthrough + dashboard)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/home/user/gantry/aiserver-monitor
+Environment=AISERVER_MONITOR_LISTEN_PORT=30000
+Environment=AISERVER_MONITOR_UPSTREAM_BASE=http://127.0.0.1:30001
+Environment=AISERVER_MONITOR_EMBED_BASE=http://127.0.0.1:30002
+Environment=AISERVER_MONITOR_AUDIO_BASE=http://127.0.0.1:30003
+Environment=AISERVER_MONITOR_CHATTERBOX_BASE=http://127.0.0.1:30004
+# CPU embedding sidecar belongs to the gateway. The leading '-' ignores
+# failures so an embedding problem never blocks chat.
+ExecStartPre=-/home/user/gantry/runtime/embed/start-embed.sh
+# Audio sidecar (Whisper/Piper) as well; audio must never block chat.
+ExecStartPre=-/home/user/gantry/runtime/audio/start-audio.sh
+ExecStartPre=-/home/user/gantry/runtime/chatterbox/start-chatterbox.sh
+ExecStopPost=-/home/user/gantry/runtime/embed/stop-embed.sh
+ExecStopPost=-/home/user/gantry/runtime/audio/stop-audio.sh
+ExecStopPost=-/home/user/gantry/runtime/chatterbox/stop-chatterbox.sh
+ExecStart=/home/user/gantry/.venv/bin/python -m aiserver_monitor
+Restart=always
+RestartSec=3
+# Open client connections (SSE/streams) can delay the uvicorn shutdown; after
+# 15 s SIGKILL applies, and SIGKILL counts as a clean exit.
+TimeoutStopSec=15
+SuccessExitStatus=SIGKILL
+
+[Install]
+WantedBy=default.target

@@ -8,7 +8,7 @@
 # `stop` mit TERM, ${STOP_GRACE}s Grace, dann KILL.
 #
 # Konfiguration kommt aus der Umgebung, alles mit Default:
-#   PYTHON=/home/user/small_qwen/.venv/bin/python
+#   PYTHON=/home/user/gantry/.venv/bin/python
 #   AISERVER_MONITOR_LISTEN_PORT=30000   PIDFILE=/tmp/aiserver-monitor.pid
 #   AISERVER_MONITOR_RUN_LOG=/tmp/aiserver-monitor-run.log
 #   AISERVER_MONITOR_PATTERN='[a]iserver_monitor'
@@ -38,7 +38,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # Skripte der Sidecars liegen im Repo unter runtime/, nicht im Gateway-Paket.
 RUNTIME="$(cd "$ROOT/.." && pwd)/runtime"
 
-PYTHON="${PYTHON:-/home/user/small_qwen/.venv/bin/python}"
+PYTHON="${PYTHON:-/home/user/gantry/.venv/bin/python}"
 PORT="${AISERVER_MONITOR_LISTEN_PORT:-30000}"
 PIDFILE="${PIDFILE:-/tmp/aiserver-monitor.pid}"
 LOG="${AISERVER_MONITOR_RUN_LOG:-/tmp/aiserver-monitor-run.log}"
