@@ -72,6 +72,30 @@ class TestDashboardRoute(DashboardCase):
         # Das alte Vite-Bundle wird nicht mehr referenziert.
         self.assertNotIn("/assets/index-", antwort.text)
 
+    def test_tab_leiste_hat_drei_ansichten(self) -> None:
+        with TestClient(self.app()) as client:
+            antwort = client.get("/")
+        self.assertEqual(antwort.status_code, 200)
+        self.assertIn("role=\"tablist\"", antwort.text)
+        for ansicht in ("Runtime", "Priorität", "Queue"):
+            self.assertIn(ansicht, antwort.text)
+        for panel in ("view-runtime", "view-priority", "view-queue"):
+            self.assertIn(f'id="{panel}"', antwort.text)
+        # Die Deep-Link-Panels sind im Markup vorhanden und an die Tabs gebunden.
+        self.assertEqual(antwort.text.count('role="tab"'), 3)
+
+    def test_dashboard_js_referenziert_steuer_und_queue_endpunkte(self) -> None:
+        with TestClient(self.app()) as client:
+            js = client.get("/dashboard.js")
+        self.assertEqual(js.status_code, 200)
+        self.assertIn("/monitor/priority", js.text)
+        self.assertIn("/monitor/hindsight", js.text)
+        self.assertIn("/monitor/jobs", js.text)
+        # Der Deep-Link wird ueber location.hash aufgeloest.
+        self.assertIn("hashchange", js.text)
+        # full_prompt wird bewusst nie in die UI uebernommen.
+        self.assertNotIn("full_prompt", js.text)
+
     def test_dashboard_assets_werden_ausgeliefert(self) -> None:
         with TestClient(self.app()) as client:
             css = client.get("/dashboard.css")

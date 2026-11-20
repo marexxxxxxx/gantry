@@ -131,6 +131,26 @@
           <span>Provider hinzufügen</span>
         </button>
       </div>
+
+      <nav class="tabbar" aria-label="Dashboard-Ansichten">
+        <div class="tablist" id="tablist" role="tablist" aria-label="Ansicht wählen">
+          <button class="tab is-active" id="tab-runtime" type="button" role="tab"
+                  aria-selected="true" aria-controls="view-runtime" data-view="runtime" tabindex="0">
+            <svg class="icon" aria-hidden="true"><use href="#i-server"></use></svg>
+            <span>Runtime</span>
+          </button>
+          <button class="tab" id="tab-priority" type="button" role="tab"
+                  aria-selected="false" aria-controls="view-priority" data-view="priority" tabindex="-1">
+            <svg class="icon" aria-hidden="true"><use href="#i-bolt"></use></svg>
+            <span>Priorität</span>
+          </button>
+          <button class="tab" id="tab-queue" type="button" role="tab"
+                  aria-selected="false" aria-controls="view-queue" data-view="queue" tabindex="-1">
+            <svg class="icon" aria-hidden="true"><use href="#i-logs"></use></svg>
+            <span>Queue</span>
+          </button>
+        </div>
+      </nav>
     </header>
 
     <main class="main">
@@ -146,7 +166,8 @@
         </button>
       </div>
 
-      <section class="status-strip" aria-label="Übersicht">
+      <section class="view" id="view-runtime" role="tabpanel" aria-labelledby="tab-runtime" tabindex="0">
+        <section class="status-strip" aria-label="Übersicht">
         <div class="status-item">
           <span class="status-kicker"><svg class="icon"><use href="#i-server"></use></svg> Provider</span>
           <strong id="summary-providers">–</strong>
@@ -272,6 +293,166 @@
               Änderungen greifen sofort – laufende Modellprozesse werden dabei nicht neu gestartet.
             </p>
           </article>
+        </div>
+      </section>
+      </section>
+
+      <section class="view" id="view-priority" role="tabpanel" aria-labelledby="tab-priority" tabindex="0" hidden>
+        <div class="section-head">
+          <div class="section-title">
+            <span class="eyebrow">Steuerung</span>
+            <h2>Priorität</h2>
+            <p>Hermes bevorzugen und Hindsight-Requests blockieren – wirksam ohne Gateway-Neustart.</p>
+          </div>
+        </div>
+
+        <div class="priority-grid">
+          <article class="card priority-card" aria-labelledby="priority-title">
+            <div class="priority-head">
+              <span class="system-icon amber"><svg class="icon" aria-hidden="true"><use href="#i-bolt"></use></svg></span>
+              <div class="priority-title">
+                <h3 id="priority-title">Hermes-Priorität</h3>
+                <p>Requests mit diesen Markern werden bevorzugt.</p>
+              </div>
+            </div>
+            <div class="priority-body">
+              <label class="toggle priority-toggle" for="priority-enabled">
+                <input id="priority-enabled" type="checkbox" checked disabled>
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-text">Aktiv<small id="priority-enabled-hint">Priorität wird angewendet.</small></span>
+              </label>
+              <div class="marker-block">
+                <span class="field-label">System-Prompt-Marker</span>
+                <div class="marker-chips" id="priority-chips"></div>
+                <p class="marker-empty" id="priority-empty">Keine Marker – es wird kein Request bevorzugt.</p>
+                <form class="marker-add" id="priority-add-form" novalidate>
+                  <input id="priority-marker-input" type="text" autocomplete="off" spellcheck="false"
+                         maxlength="500" placeholder="Marker hinzufügen" aria-label="Neuer Hermes-Marker" disabled>
+                  <button class="btn btn-ghost btn-sm" id="priority-add" type="submit" disabled>
+                    <svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg>
+                    Hinzufügen
+                  </button>
+                </form>
+                <p class="field-error" id="priority-local-error" role="alert"></p>
+              </div>
+            </div>
+            <div class="priority-foot">
+              <button class="btn btn-primary btn-sm" id="priority-save" type="button" disabled>
+                <svg class="icon" aria-hidden="true"><use href="#i-check"></use></svg>
+                Speichern
+              </button>
+              <button class="btn btn-ghost btn-sm" id="priority-retry" type="button" hidden>
+                <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+                Erneut laden
+              </button>
+              <span class="priority-status" id="priority-status" role="status" aria-live="polite">Lädt…</span>
+            </div>
+          </article>
+
+          <article class="card priority-card" aria-labelledby="hindsight-title">
+            <div class="priority-head">
+              <span class="system-icon violet"><svg class="icon" aria-hidden="true"><use href="#i-memory"></use></svg></span>
+              <div class="priority-title">
+                <h3 id="hindsight-title">Hindsight-Blocker</h3>
+                <p>Blockiert Memory-Consolidation-Requests und bricht laufende Hindsight-Jobs ab.</p>
+              </div>
+            </div>
+            <div class="priority-body">
+              <label class="toggle priority-toggle" for="hindsight-enabled">
+                <input id="hindsight-enabled" type="checkbox" disabled>
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-text">Blockiert<small id="hindsight-enabled-hint">Hindsight-Requests laufen normal.</small></span>
+              </label>
+              <div class="marker-block">
+                <span class="field-label">System-Prompt-Marker</span>
+                <div class="marker-chips" id="hindsight-chips"></div>
+                <p class="marker-empty" id="hindsight-empty">Keine Marker – es wird kein Request blockiert.</p>
+                <form class="marker-add" id="hindsight-add-form" novalidate>
+                  <input id="hindsight-marker-input" type="text" autocomplete="off" spellcheck="false"
+                         maxlength="500" placeholder="Marker hinzufügen" aria-label="Neuer Hindsight-Marker" disabled>
+                  <button class="btn btn-ghost btn-sm" id="hindsight-add" type="submit" disabled>
+                    <svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg>
+                    Hinzufügen
+                  </button>
+                </form>
+                <p class="field-error" id="hindsight-local-error" role="alert"></p>
+              </div>
+            </div>
+            <div class="priority-foot">
+              <button class="btn btn-primary btn-sm" id="hindsight-save" type="button" disabled>
+                <svg class="icon" aria-hidden="true"><use href="#i-check"></use></svg>
+                Speichern
+              </button>
+              <button class="btn btn-ghost btn-sm" id="hindsight-retry" type="button" hidden>
+                <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+                Erneut laden
+              </button>
+              <span class="priority-status" id="hindsight-status" role="status" aria-live="polite">Lädt…</span>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" id="view-queue" role="tabpanel" aria-labelledby="tab-queue" tabindex="0" hidden>
+        <div class="section-head">
+          <div class="section-title">
+            <span class="eyebrow">Live</span>
+            <h2>Queue <span class="count-pill" id="queue-count">–</span></h2>
+            <p>Aktive und abgeschlossene Jobs. Auto-Refresh alle 3 s, solange diese Ansicht sichtbar ist.</p>
+          </div>
+          <div class="section-tools">
+            <span class="updated" id="queue-updated">–</span>
+            <button class="btn btn-ghost btn-sm" id="queue-refresh" type="button">
+              <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+              Aktualisieren
+            </button>
+          </div>
+        </div>
+
+        <div id="queue-note" class="inline-note" role="alert" hidden></div>
+
+        <div class="card queue-card">
+          <div id="queue-loading" class="queue-loading" role="status">
+            <svg class="icon spin" aria-hidden="true"><use href="#i-refresh"></use></svg>
+            <span>Lade Jobs …</span>
+          </div>
+
+          <div id="queue-error" class="error-state queue-state" hidden>
+            <span class="error-icon"><svg class="icon" aria-hidden="true"><use href="#i-alert"></use></svg></span>
+            <h3>Queue konnte nicht geladen werden</h3>
+            <p id="queue-error-text">Das Gateway antwortet nicht.</p>
+            <button class="btn btn-primary btn-sm" id="queue-retry" type="button">
+              <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+              Erneut versuchen
+            </button>
+          </div>
+
+          <div id="queue-empty" class="empty-state queue-state" hidden>
+            <span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-logs"></use></svg></span>
+            <h3>Keine Jobs</h3>
+            <p>Die Queue ist leer. Sobald ein Request eintrifft, erscheint er hier automatisch.</p>
+          </div>
+
+          <div class="queue-table-wrap" id="queue-table-wrap" hidden>
+            <table class="queue-table">
+              <thead>
+                <tr>
+                  <th scope="col">Status</th>
+                  <th scope="col">Modell</th>
+                  <th scope="col">Source</th>
+                  <th scope="col" class="col-num">Alter</th>
+                  <th scope="col" class="col-num">Dauer</th>
+                  <th scope="col" class="col-num">Prompt</th>
+                  <th scope="col" class="col-num">Completion</th>
+                  <th scope="col" class="col-num">TTFT</th>
+                  <th scope="col" class="col-num">tok/s</th>
+                  <th scope="col" class="col-error">Fehler</th>
+                  <th scope="col" class="col-action">Aktion</th>
+                </tr>
+              </thead>
+              <tbody id="queue-body"></tbody>
+            </table>
+          </div>
         </div>
       </section>
     </main>

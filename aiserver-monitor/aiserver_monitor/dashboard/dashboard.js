@@ -5,9 +5,12 @@
   const REFRESH_PROVIDERS_MS = 5000;
   const REFRESH_SYSTEM_MS = 4000;
   const REFRESH_INFO_MS = 15000;
+  const REFRESH_QUEUE_MS = 3000;
+  const QUEUE_AGE_MS = 1000;
   const LOG_POLL_MS = 2000;
   const FETCH_TIMEOUT_MS = 9000;
   const ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+  const VIEWS = ["runtime", "priority", "queue"];
 
   const $ = (id) => document.getElementById(id);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
@@ -39,6 +42,33 @@
     start_cmd: [],
     stop_cmd: [],
     settings: { ...DEFAULT_SETTINGS },
+  };
+
+  //: Die zwei Marker-Blocker teilen sich UI und API-Form (enabled + markers).
+  const BLOCKERS = {
+    priority: {
+      endpoint: "/monitor/priority",
+      label: "Hermes-Priorität",
+      hintOn: "Hermes erhält Priorität 100, alle anderen 0.",
+      hintOff: "Aus – Priority wird aus allen Chat-Requests entfernt.",
+    },
+    hindsight: {
+      endpoint: "/monitor/hindsight",
+      label: "Hindsight-Blocker",
+      hintOn: "Neue Hindsight-Requests werden mit 503 abgewiesen.",
+      hintOff: "Hindsight-Requests laufen normal.",
+    },
+  };
+
+  const QUEUE_ACTIVE = new Set(["waiting", "queued", "pending", "running"]);
+  const QUEUE_STATUS = {
+    waiting: { label: "wartend", cls: "waiting" },
+    queued: { label: "wartend", cls: "waiting" },
+    pending: { label: "ausstehend", cls: "waiting" },
+    running: { label: "läuft", cls: "running" },
+    done: { label: "fertig", cls: "done" },
+    aborted: { label: "abgebrochen", cls: "aborted" },
+    error: { label: "Fehler", cls: "error" },
   };
 
   const state = {
@@ -73,6 +103,40 @@
       timer: null,
       text: "",
       lastFocus: null,
+    },
+    view: "runtime",
+    blockers: {
+      priority: {
+        enabled: true,
+        markers: [],
+        loaded: false,
+        loading: false,
+        saving: false,
+        error: null,
+        localError: "",
+        status: "Lädt…",
+        tone: "",
+      },
+      hindsight: {
+        enabled: false,
+        markers: [],
+        loaded: false,
+        loading: false,
+        saving: false,
+        error: null,
+        localError: "",
+        status: "Lädt…",
+        tone: "",
+      },
+    },
+    queue: {
+      jobs: [],
+      loaded: false,
+      loading: false,
+      error: null,
+      updatedAt: 0,
+      expanded: new Set(),
+      canceling: new Set(),
     },
     confirm: { resolve: null, lastFocus: null },
   };
@@ -254,6 +318,94 @@
       return node && !node.hidden;
     });
     document.body.classList.toggle("modal-open", anyOpen);
+  }
+
+  function el(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  }
+
+  function iconNode(name) {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("class", "icon");
+    svg.setAttribute("aria-hidden", "true");
+    const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+    use.setAttribute("href", `#${name}`);
+    svg.append(use);
+    return svg;
+  }
+
+  // ------------------------------------------------------------------- views
+
+  function viewFromHash() {
+    const name = String(window.location.hash || "").replace(/^#\/?/, "").toLowerCase();
+    return VIEWS.includes(name) ? name : "runtime";
+  }
+
+  function applyView(view) {
+    const next = VIEWS.includes(view) ? view : "runtime";
+    const changed = state.view !== next;
+    state.view = next;
+    for (const name of VIEWS) {
+      const tab = $(`tab-${name}`);
+      const panel = $(`view-${name}`);
+      const active = name === next;
+      if (tab) {
+        tab.classList.toggle("is-active", active);
+        tab.setAttribute("aria-selected", active ? "true" : "false");
+        tab.tabIndex = active ? 0 : -1;
+      }
+      if (panel) panel.hidden = !active;
+    }
+    if (changed) window.scrollTo({ top: 0, behavior: "auto" });
+    if (next === "priority") ensureBlockersLoaded();
+    if (next === "queue") loadQueue({ silent: true });
+  }
+
+  function navigateView(view) {
+    const next = VIEWS.includes(view) ? view : "runtime";
+    applyView(next);
+    const target = `#${next}`;
+    if (window.location.hash !== target) {
+      // Hash ist der Deep-Link; der Listener unten greift nur bei externen
+      // Aenderungen (Adresszeile, Zurueck/Vorwaerts), nicht bei uns selbst.
+      window.location.hash = target;
+    }
+  }
+
+  function bindViewEvents() {
+    $("tablist")?.addEventListener("click", (event) => {
+      const tab = event.target.closest("[role='tab']");
+      if (!tab) return;
+      navigateView(tab.dataset.view);
+    });
+    $("tablist")?.addEventListener("keydown", (event) => {
+      const tab = event.target.closest("[role='tab']");
+      if (!tab) return;
+      const current = VIEWS.indexOf(tab.dataset.view);
+      let index = current;
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+        index = (current + 1) % VIEWS.length;
+      } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+        index = (current - 1 + VIEWS.length) % VIEWS.length;
+      } else if (event.key === "Home") {
+        index = 0;
+      } else if (event.key === "End") {
+        index = VIEWS.length - 1;
+      } else {
+        return;
+      }
+      event.preventDefault();
+      const next = VIEWS[index];
+      navigateView(next);
+      $(`tab-${next}`)?.focus();
+    });
+    window.addEventListener("hashchange", () => {
+      const wanted = viewFromHash();
+      if (wanted !== state.view) applyView(wanted);
+    });
   }
 
   // ------------------------------------------------------------------ toasts
@@ -727,6 +879,530 @@
     const curl = `curl ${origin}/v1/chat/completions \\\n  -H 'Content-Type: application/json' \\\n  -d '${escapeShellSingle(pretty)}'`;
     const pre = $("curl-example");
     if (pre) pre.textContent = curl;
+  }
+
+  // ------------------------------------------------------------- priority
+
+  function blockerNode(kind, suffix) {
+    return $(`${kind}-${suffix}`);
+  }
+
+  function renderBlocker(kind) {
+    const config = BLOCKERS[kind];
+    const data = state.blockers[kind];
+    const toggle = blockerNode(kind, "enabled");
+    const locked = !data.loaded || data.loading || data.saving;
+
+    if (toggle) {
+      toggle.checked = Boolean(data.enabled);
+      toggle.disabled = locked;
+    }
+    setText(`${kind}-enabled-hint`, data.enabled ? config.hintOn : config.hintOff);
+
+    const chips = blockerNode(kind, "chips");
+    if (chips) {
+      chips.replaceChildren();
+      data.markers.forEach((marker) => {
+        const chip = el("span", "marker-chip");
+        const text = el("span", "marker-chip-text", marker);
+        text.title = marker;
+        const remove = el("button", "chip-remove");
+        remove.type = "button";
+        remove.title = "Marker entfernen";
+        remove.setAttribute("aria-label", `Marker „${marker}“ entfernen`);
+        remove.append(iconNode("i-x"));
+        remove.disabled = locked;
+        remove.addEventListener("click", () => removeBlockerMarker(kind, marker));
+        chip.append(text, remove);
+        chips.append(chip);
+      });
+    }
+    const empty = blockerNode(kind, "empty");
+    if (empty) empty.hidden = data.markers.length > 0;
+
+    const input = blockerNode(kind, "marker-input");
+    const add = blockerNode(kind, "add");
+    const save = blockerNode(kind, "save");
+    const retry = blockerNode(kind, "retry");
+    if (input) input.disabled = locked;
+    if (add) add.disabled = locked;
+    if (save) save.disabled = locked;
+    if (retry) retry.hidden = !(data.error && !data.loading);
+
+    const status = blockerNode(kind, "status");
+    if (status) {
+      status.textContent = data.error || data.status || "";
+      status.classList.toggle("is-error", Boolean(data.error));
+      status.classList.toggle("is-success", !data.error && data.tone === "success");
+      status.classList.toggle("is-dirty", !data.error && data.tone === "dirty");
+    }
+    const localError = blockerNode(kind, "local-error");
+    if (localError) localError.textContent = data.localError || "";
+  }
+
+  function ensureBlockersLoaded(force = false) {
+    for (const kind of Object.keys(BLOCKERS)) {
+      if (force || !state.blockers[kind].loaded) loadBlocker(kind);
+    }
+  }
+
+  async function loadBlocker(kind) {
+    const data = state.blockers[kind];
+    if (data.loading) return;
+    data.loading = true;
+    data.error = null;
+    data.localError = "";
+    if (!data.loaded) data.status = "Lädt…";
+    data.tone = "";
+    renderBlocker(kind);
+    try {
+      const response = await api(BLOCKERS[kind].endpoint);
+      if (!response || typeof response !== "object"
+          || typeof response.enabled !== "boolean" || !Array.isArray(response.markers)) {
+        throw new ApiError("Ungültige Antwort");
+      }
+      data.enabled = response.enabled;
+      data.markers = response.markers.filter((marker) => typeof marker === "string");
+      data.loaded = true;
+      data.status = `Geladen · ${formatClock()}`;
+      data.tone = "";
+    } catch (err) {
+      data.error = `Laden fehlgeschlagen: ${errorText(err)}`;
+    } finally {
+      data.loading = false;
+      renderBlocker(kind);
+    }
+  }
+
+  function addBlockerMarker(kind) {
+    const data = state.blockers[kind];
+    const input = blockerNode(kind, "marker-input");
+    const value = input ? input.value.trim() : "";
+    data.localError = "";
+    data.error = null;
+    if (!value) {
+      data.localError = "Marker darf nicht leer sein.";
+    } else if (value.length > 500) {
+      data.localError = "Ein Marker darf höchstens 500 Zeichen haben.";
+    } else if (data.markers.length >= 50) {
+      data.localError = "Höchstens 50 Marker erlaubt.";
+    } else if (data.markers.some((marker) => marker.toLowerCase() === value.toLowerCase())) {
+      data.localError = "Dieser Marker ist bereits vorhanden.";
+    } else {
+      data.markers = [...data.markers, value];
+      data.status = "Noch nicht gespeichert.";
+      data.tone = "dirty";
+      if (input) input.value = "";
+    }
+    renderBlocker(kind);
+    if (input) input.focus();
+  }
+
+  function removeBlockerMarker(kind, marker) {
+    const data = state.blockers[kind];
+    data.markers = data.markers.filter((entry) => entry !== marker);
+    data.error = null;
+    data.localError = "";
+    data.status = "Noch nicht gespeichert.";
+    data.tone = "dirty";
+    renderBlocker(kind);
+  }
+
+  function toggleBlocker(kind, enabled) {
+    const data = state.blockers[kind];
+    data.enabled = Boolean(enabled);
+    data.error = null;
+    data.localError = "";
+    data.status = "Noch nicht gespeichert.";
+    data.tone = "dirty";
+    renderBlocker(kind);
+  }
+
+  function cleanBlockers(markers) {
+    const cleaned = [];
+    const seen = new Set();
+    for (const raw of markers) {
+      const text = String(raw).trim();
+      if (!text) continue;
+      if (text.length > 500) {
+        return { error: "Ein Marker darf höchstens 500 Zeichen haben." };
+      }
+      const key = text.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      cleaned.push(text);
+    }
+    if (cleaned.length > 50) return { error: "Höchstens 50 Marker erlaubt." };
+    return { markers: cleaned };
+  }
+
+  async function saveBlocker(kind) {
+    const data = state.blockers[kind];
+    if (!data.loaded || data.loading || data.saving) return;
+    const cleaned = cleanBlockers(data.markers);
+    if (cleaned.error) {
+      data.localError = cleaned.error;
+      renderBlocker(kind);
+      return;
+    }
+    data.markers = cleaned.markers;
+    data.saving = true;
+    data.error = null;
+    data.localError = "";
+    data.status = "Speichert…";
+    data.tone = "";
+    renderBlocker(kind);
+    try {
+      const response = await api(BLOCKERS[kind].endpoint, {
+        method: "PUT",
+        body: { enabled: Boolean(data.enabled), markers: data.markers },
+        timeout: 15000,
+      });
+      if (!response || typeof response !== "object"
+          || typeof response.enabled !== "boolean" || !Array.isArray(response.markers)) {
+        throw new ApiError("Ungültige Antwort");
+      }
+      data.enabled = response.enabled;
+      data.markers = response.markers.filter((marker) => typeof marker === "string");
+      data.loaded = true;
+      let detail = "";
+      const aborted = Number(response.aborted);
+      if (kind === "hindsight" && Number.isFinite(aborted) && aborted > 0) {
+        detail = `${formatInt(aborted)} ${aborted === 1 ? "Job" : "Jobs"} abgebrochen.`;
+      }
+      data.status = detail ? `Gespeichert · ${detail}` : `Gespeichert · ${formatClock()}`;
+      data.tone = "success";
+      toast(`${BLOCKERS[kind].label} gespeichert`, "success", detail);
+      if (kind === "hindsight" && detail && state.queue.loaded) {
+        loadQueue({ silent: true });
+      }
+    } catch (err) {
+      data.error = `Speichern fehlgeschlagen: ${errorText(err)}`;
+      data.tone = "";
+      toast("Speichern fehlgeschlagen", "error", errorText(err));
+    } finally {
+      data.saving = false;
+      renderBlocker(kind);
+    }
+  }
+
+  // ---------------------------------------------------------------- queue
+
+  function formatAge(ms) {
+    const seconds = Math.max(0, Math.floor(Number(ms) / 1000));
+    if (!Number.isFinite(seconds)) return "–";
+    if (seconds < 60) return `${seconds} s`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes} Min`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours} Std ${minutes % 60} Min`;
+    return `${Math.floor(hours / 24)} T ${hours % 24} Std`;
+  }
+
+  function formatDurationMs(ms) {
+    const number = Number(ms);
+    if (ms === null || ms === undefined || !Number.isFinite(number) || number < 0) return "–";
+    if (number < 1000) return `${Math.round(number)} ms`;
+    return formatAge(number);
+  }
+
+  function formatMsValue(ms) {
+    if (ms === null || ms === undefined) return "–";
+    const number = Number(ms);
+    return Number.isFinite(number) ? `${formatInt(Math.round(number))} ms` : "–";
+  }
+
+  function formatRate(value) {
+    if (value === null || value === undefined) return "–";
+    const number = Number(value);
+    return Number.isFinite(number)
+      ? number.toLocaleString("de-DE", { maximumFractionDigits: 1 })
+      : "–";
+  }
+
+  function tokenValue(value) {
+    if (value === null || value === undefined) return "–";
+    const number = Number(value);
+    return Number.isFinite(number) ? formatInt(number) : "–";
+  }
+
+  function truncateText(text, max = 60) {
+    const value = String(text ?? "");
+    return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+  }
+
+  function queueStatusMeta(status) {
+    return QUEUE_STATUS[status] || { label: status || "unbekannt", cls: "unknown" };
+  }
+
+  function queueDetailBlock(label, value) {
+    const block = el("div", "queue-detail-block");
+    block.append(el("span", "queue-detail-label", label));
+    const text = typeof value === "string" && value.trim() ? value : "–";
+    block.append(el("pre", "queue-detail-text", text));
+    return block;
+  }
+
+  function queueRows(job) {
+    const status = queueStatusMeta(job.status);
+    const expanded = state.queue.expanded.has(job.rid);
+    const created = Number(job.created_at_ms);
+    const active = QUEUE_ACTIVE.has(String(job.status));
+    const row = el("tr", `queue-row status-${status.cls}${expanded ? " is-expanded" : ""}`);
+    row.dataset.rid = job.rid;
+    row.tabIndex = 0;
+    row.setAttribute("aria-expanded", expanded ? "true" : "false");
+    row.addEventListener("click", (event) => {
+      if (event.target.closest("button")) return;
+      toggleQueueRow(job.rid);
+    });
+    row.addEventListener("keydown", (event) => {
+      if (event.target !== row) return;
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        toggleQueueRow(job.rid);
+      }
+    });
+
+    const statusCell = el("td", "queue-status-cell");
+    statusCell.append(el("span", `status-badge ${status.cls}`, status.label));
+    const expand = el("button", "queue-expand");
+    expand.type = "button";
+    expand.title = "Details";
+    expand.setAttribute("aria-expanded", expanded ? "true" : "false");
+    expand.setAttribute("aria-label", expanded ? "Details ausblenden" : "Details anzeigen");
+    expand.append(iconNode("i-chevron"));
+    expand.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleQueueRow(job.rid);
+    });
+    statusCell.append(expand);
+
+    const modelCell = el("td");
+    const model = el("span", "queue-model", job.model || "–");
+    if (job.model) model.title = job.model;
+    modelCell.append(model);
+
+    const sourceCell = el("td");
+    const source = el("span", "queue-source", job.source || "–");
+    if (job.source) source.title = job.source;
+    sourceCell.append(source);
+
+    const ageCell = el("td", "queue-num");
+    const age = el("span", null, Number.isFinite(created) ? formatAge(Date.now() - created) : "–");
+    if (Number.isFinite(created)) age.dataset.queueCreated = String(created);
+    ageCell.append(age);
+
+    const durationCell = el("td", "queue-num");
+    const duration = el("span", null,
+      job.duration_ms !== null && job.duration_ms !== undefined
+        ? formatDurationMs(job.duration_ms)
+        : active && Number.isFinite(created) ? formatAge(Date.now() - created) : "–");
+    if (active && (job.duration_ms === null || job.duration_ms === undefined) && Number.isFinite(created)) {
+      duration.dataset.queueLiveDuration = String(created);
+    }
+    durationCell.append(duration);
+
+    const promptCell = el("td", "queue-num", tokenValue(job.prompt_tokens));
+    const completionCell = el("td", "queue-num", tokenValue(job.completion_tokens));
+    const ttftCell = el("td", "queue-num", formatMsValue(job.ttft_ms));
+    const rateCell = el("td", "queue-num", formatRate(job.tok_per_s));
+
+    const errorCell = el("td", "queue-error-cell");
+    if (job.error) {
+      const errorText = el("span", "queue-error-text", truncateText(job.error, 60));
+      errorText.title = job.error;
+      errorCell.append(errorText);
+    } else {
+      errorCell.append(el("span", "queue-dash", "–"));
+    }
+
+    const actionCell = el("td", "queue-action-cell");
+    if (QUEUE_ACTIVE.has(String(job.status))) {
+      const cancel = el("button", "btn btn-ghost btn-sm queue-cancel");
+      cancel.type = "button";
+      cancel.title = "Job abbrechen";
+      cancel.append(iconNode("i-stop"), el("span", null, "Abbrechen"));
+      cancel.disabled = state.queue.canceling.has(job.rid);
+      cancel.addEventListener("click", (event) => {
+        event.stopPropagation();
+        cancelQueueJob(job.rid);
+      });
+      actionCell.append(cancel);
+    } else {
+      actionCell.append(el("span", "queue-dash", "–"));
+    }
+
+    row.append(statusCell, modelCell, sourceCell, ageCell, durationCell,
+      promptCell, completionCell, ttftCell, rateCell, errorCell, actionCell);
+
+    const detailRow = el("tr", "queue-detail-row");
+    detailRow.hidden = !expanded;
+    const detailCell = el("td");
+    detailCell.colSpan = 11;
+    const detail = el("div", "queue-detail");
+    detail.append(
+      queueDetailBlock("Prompt-Start", job.prompt_start),
+      queueDetailBlock("Content-Preview", job.content_preview),
+      queueDetailBlock("Reasoning-Preview", job.reasoning_preview),
+    );
+    detailCell.append(detail);
+    detailRow.append(detailCell);
+
+    return [row, detailRow];
+  }
+
+  function renderQueue() {
+    const data = state.queue;
+    setText("queue-count", data.loaded ? formatInt(data.jobs.length) : "–");
+    setText("queue-updated", data.updatedAt
+      ? `Zuletzt ${formatClock(new Date(data.updatedAt))}`
+      : "–");
+
+    const loading = $("queue-loading");
+    if (loading) loading.hidden = !(data.loading && !data.loaded);
+
+    const errorBox = $("queue-error");
+    if (errorBox) errorBox.hidden = !(data.error && !data.loaded);
+    if (data.error && !data.loaded) setText("queue-error-text", data.error);
+
+    const showTable = data.loaded && data.jobs.length > 0;
+    const empty = $("queue-empty");
+    if (empty) empty.hidden = !(data.loaded && data.jobs.length === 0);
+    const wrap = $("queue-table-wrap");
+    if (wrap) wrap.hidden = !showTable;
+
+    const note = $("queue-note");
+    if (note) {
+      if (data.error && data.loaded) {
+        note.hidden = false;
+        note.textContent = `Aktualisierung fehlgeschlagen: ${data.error}`;
+      } else {
+        note.hidden = true;
+        note.textContent = "";
+      }
+    }
+
+    const body = $("queue-body");
+    if (!body) return;
+    if (!showTable) {
+      body.replaceChildren();
+      return;
+    }
+    const active = document.activeElement;
+    const focusedRow = active && typeof active.closest === "function"
+      ? active.closest("tr.queue-row") : null;
+    const focusedRid = focusedRow ? focusedRow.dataset.rid : null;
+    let focusedPart = "";
+    if (active && active.classList) {
+      if (active.classList.contains("queue-expand")) focusedPart = "queue-expand";
+      else if (active.classList.contains("queue-cancel")) focusedPart = "queue-cancel";
+      else if (active === focusedRow) focusedPart = "row";
+    }
+    const fragment = document.createDocumentFragment();
+    data.jobs.forEach((job) => {
+      fragment.append(...queueRows(job));
+    });
+    body.replaceChildren(fragment);
+    if (focusedRid && focusedPart) {
+      for (const row of body.querySelectorAll("tr.queue-row")) {
+        if (row.dataset.rid !== focusedRid) continue;
+        if (focusedPart === "row") {
+          row.focus();
+        } else {
+          row.querySelector(`.${focusedPart}`)?.focus();
+        }
+        break;
+      }
+    }
+  }
+
+  function toggleQueueRow(rid) {
+    const data = state.queue;
+    const expanded = !data.expanded.has(rid);
+    if (expanded) data.expanded.add(rid);
+    else data.expanded.delete(rid);
+    const body = $("queue-body");
+    if (!body) return;
+    for (const row of body.querySelectorAll("tr.queue-row")) {
+      if (row.dataset.rid !== rid) continue;
+      row.classList.toggle("is-expanded", expanded);
+      row.setAttribute("aria-expanded", expanded ? "true" : "false");
+      const button = row.querySelector(".queue-expand");
+      if (button) {
+        button.setAttribute("aria-expanded", expanded ? "true" : "false");
+        button.setAttribute("aria-label", expanded ? "Details ausblenden" : "Details anzeigen");
+      }
+      const detail = row.nextElementSibling;
+      if (detail && detail.classList.contains("queue-detail-row")) detail.hidden = !expanded;
+      break;
+    }
+  }
+
+  async function loadQueue({ silent = false } = {}) {
+    const data = state.queue;
+    if (data.loading) return;
+    data.loading = true;
+    if (!data.loaded) data.error = null;
+    if (!data.loaded) renderQueue();
+    try {
+      const response = await api("/monitor/jobs");
+      if (!response || !Array.isArray(response.jobs)) {
+        throw new ApiError("Ungültige Queue-Antwort");
+      }
+      data.jobs = response.jobs.filter((job) =>
+        job && typeof job === "object" && typeof job.rid === "string");
+      data.loaded = true;
+      data.error = null;
+      data.updatedAt = Date.now();
+      const rids = new Set(data.jobs.map((job) => job.rid));
+      for (const rid of Array.from(data.expanded)) {
+        if (!rids.has(rid)) data.expanded.delete(rid);
+      }
+    } catch (err) {
+      data.error = errorText(err);
+      if (!silent) toast("Queue nicht erreichbar", "error", data.error);
+    } finally {
+      data.loading = false;
+      renderQueue();
+    }
+  }
+
+  async function cancelQueueJob(rid) {
+    const data = state.queue;
+    if (!rid || data.canceling.has(rid)) return;
+    data.canceling.add(rid);
+    renderQueue();
+    try {
+      const response = await api(`/monitor/jobs/${encodeURIComponent(rid)}/cancel`, {
+        method: "POST",
+        timeout: 15000,
+      });
+      if (response && response.ok === false) {
+        toast("Abbruch nicht möglich", "info", "Der Server konnte den Job nicht abbrechen.");
+      } else {
+        toast("Job abgebrochen", "success", rid);
+      }
+      await loadQueue({ silent: true });
+    } catch (err) {
+      toast("Abbruch fehlgeschlagen", "error", errorText(err));
+    } finally {
+      data.canceling.delete(rid);
+      renderQueue();
+    }
+  }
+
+  function updateQueueLive() {
+    if (state.view !== "queue" || document.hidden) return;
+    const now = Date.now();
+    $$("#queue-body [data-queue-created]").forEach((node) => {
+      const created = Number(node.dataset.queueCreated);
+      if (Number.isFinite(created)) node.textContent = formatAge(now - created);
+    });
+    $$("#queue-body [data-queue-live-duration]").forEach((node) => {
+      const created = Number(node.dataset.queueLiveDuration);
+      if (Number.isFinite(created)) node.textContent = formatAge(now - created);
+    });
   }
 
   // ---------------------------------------------------------------- actions
@@ -1348,6 +2024,30 @@
     $("copy-endpoint")?.addEventListener("click", () => copyText($("api-endpoint")?.textContent || ""));
     $("copy-curl")?.addEventListener("click", () => copyText($("curl-example")?.textContent || ""));
 
+    bindViewEvents();
+
+    for (const kind of Object.keys(BLOCKERS)) {
+      blockerNode(kind, "enabled")?.addEventListener("change", (event) => {
+        toggleBlocker(kind, event.target.checked);
+      });
+      blockerNode(kind, "add-form")?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        addBlockerMarker(kind);
+      });
+      blockerNode(kind, "save")?.addEventListener("click", () => saveBlocker(kind));
+      blockerNode(kind, "retry")?.addEventListener("click", () => loadBlocker(kind));
+      blockerNode(kind, "marker-input")?.addEventListener("input", () => {
+        const data = state.blockers[kind];
+        if (data.localError) {
+          data.localError = "";
+          renderBlocker(kind);
+        }
+      });
+    }
+
+    $("queue-refresh")?.addEventListener("click", () => loadQueue({ silent: true }));
+    $("queue-retry")?.addEventListener("click", () => loadQueue({ silent: true }));
+
     $("editor-overlay")?.addEventListener("click", (event) => {
       if (event.target === $("editor-overlay")) requestCloseEditor();
     });
@@ -1390,6 +2090,8 @@
         loadProviders();
         loadSystem();
         loadInfo();
+        if (state.view === "queue") loadQueue({ silent: true });
+        if (state.view === "priority") ensureBlockersLoaded();
       }
     });
   }
@@ -1427,6 +2129,7 @@
     bindEvents();
     setLive(null);
     updateApiHelp();
+    applyView(viewFromHash());
     loadProviders();
     loadSystem();
     loadInfo();
@@ -1439,6 +2142,10 @@
     setInterval(() => {
       if (!document.hidden) loadInfo();
     }, REFRESH_INFO_MS);
+    setInterval(() => {
+      if (state.view === "queue" && !document.hidden) loadQueue({ silent: true });
+    }, REFRESH_QUEUE_MS);
+    setInterval(updateQueueLive, QUEUE_AGE_MS);
     setInterval(renderUptime, 1000);
   }
 
