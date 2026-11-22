@@ -154,6 +154,18 @@ class Config:
     gptoss_max_tokens: int = 10240
     abl_model: str = (
         "hf.co/bartowski/huihui-ai_Qwen3-14B-abliterated-GGUF:Q4_K_M")
+    # GPU-Arbiter: exklusive Lease/Pause fuer externe VRAM-Jobs (3D-Render,
+    # A/V-Gen). arbiter_enabled schaltet den Arbiter ganz ab (dann kein
+    # HOLD-Hook, Requests laufen wie bisher direkt durch). drain_timeout_s
+    # ist die Obergrenze, nach der beim Warten auf laufende Generierungen
+    # nur eine Warnung geloggt wird (nie ein Force-Abort). lease_timeout_s
+    # ist die Deadline eines Leases, nach der der Watchdog den Job als
+    # abgestuerzt wertet und auto-completed. watchdog_interval_s taktet den
+    # Watchdog.
+    arbiter_enabled: bool = True
+    arbiter_drain_timeout_s: float = 300.0
+    arbiter_lease_timeout_s: float = 600.0
+    arbiter_watchdog_interval_s: float = 1.0
 
     def __post_init__(self) -> None:
         """Weist nicht-positive Intervalle ab (sie waeren Busy-Loops).
@@ -221,6 +233,11 @@ class Config:
                      "audio8_pidfile", "audio8_health_path"):
             if not str(getattr(self, feld)).strip():
                 raise ValueError(f"{feld} darf nicht leer sein")
+        for feld in ("arbiter_drain_timeout_s", "arbiter_lease_timeout_s",
+                     "arbiter_watchdog_interval_s"):
+            if getattr(self, feld) <= 0:
+                raise ValueError(
+                    f"{feld} muss positiv sein: {getattr(self, feld)}")
 
 
 def _coerce(feld: str, typ: Any, wert: Any) -> Any:
