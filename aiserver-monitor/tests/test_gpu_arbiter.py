@@ -17,7 +17,7 @@ class _FakeServerControl:
         self.stopped: list[str] = []
         self.started: list[str] = []
 
-    def snapshot(self):
+    async def snapshot(self):
         return {"backend": self.backend}
 
     async def stop_and_wait(self, backend, *, timeout_s=None):

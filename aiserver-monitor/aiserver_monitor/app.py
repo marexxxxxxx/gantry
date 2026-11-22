@@ -33,6 +33,7 @@ from .cancel import abort_request
 from .collector import Collector
 from .config import Config
 from .events import EventHub, format_sse, sse_stream
+from .gpu_arbiter import GpuArbiter
 from .hindsight import HindsightBlocker
 from .history import History
 from .jobs import ACTIVE_STATUSES, JobRegistry, JobStatus, job_to_dict
@@ -56,7 +57,8 @@ from .serverctl import (
     standard_repo_root,
 )
 from .thinking_auto import ThinkingEscalator
-from .webapi import SystemProbe, handle_v1_routed, register_provider_routes
+from .webapi import (SystemProbe, handle_v1_routed, register_arbiter_routes,
+                     register_provider_routes)
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +265,7 @@ def create_app(config: Config, *,
                model_lifecycle: ModelLifecycle | None = None,
                provider_router: ProviderRouter | None = None,
                system_probe: SystemProbe | None = None,
+               arbiter: GpuArbiter | None = None,
                enable_background: bool = True) -> FastAPI:
     """Baut die Gateway-App aus Config, optionalem Transport und GPU-Reader.
 
@@ -329,6 +332,10 @@ def create_app(config: Config, *,
     )
     collector = Collector(deps, gpu_reader=gpu_reader, client=collector_client)
 
+    if arbiter is None and config.arbiter_enabled:
+        arbiter = GpuArbiter(config, server_control,
+                             inflight=registry.active_count)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         jetzt = time.time()
@@ -340,15 +347,26 @@ def create_app(config: Config, *,
         logger.info("Start-Recovery: %s aktive Jobs als error markiert", stale)
         task = None
         idle_task = None
+        watchdog_task = None
         if enable_background:
             task = asyncio.create_task(collector.run(), name="collector")
             idle_task = asyncio.create_task(
                 provider_router.run_idle_loop(), name="provider-idle")
+            if arbiter is not None:
+                watchdog_task = asyncio.create_task(
+                    arbiter.run_watchdog_loop(), name="arbiter-watchdog")
         app.state.collector_task = task
         app.state.idle_task = idle_task
+        app.state.watchdog_task = watchdog_task
         try:
             yield
         finally:
+            if watchdog_task is not None:
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except asyncio.CancelledError:
+                    pass
             if idle_task is not None:
                 idle_task.cancel()
                 try:
@@ -372,11 +390,13 @@ def create_app(config: Config, *,
     app.state.deps = deps
     app.state.collector_task = None
     app.state.idle_task = None
+    app.state.watchdog_task = None
     app.state.collector_client = collector_client
     app.state.steuer_client = steuer_client
     app.state.server_control = server_control
     app.state.provider_router = provider_router
     app.state.lifecycle = model_lifecycle
+    app.state.arbiter = arbiter
 
     async def _abbrechen(*, rid: str | None, abort_all: bool) -> bool:
         """``abort_request`` ueber den Steuer-Client: Netzfehler -> False.
@@ -756,11 +776,14 @@ def create_app(config: Config, *,
     @app.api_route("/v1/{pfad:path}", methods=["GET", "POST"])
     async def v1_passthrough(pfad: str, request: Request) -> Response:
         """Reicht die Anfrage weiter; ``pfad`` dient nur dem Routing."""
-        return await handle_v1_routed(request, deps, provider_router)
+        return await handle_v1_routed(request, deps, provider_router, arbiter)
 
     register_provider_routes(
         app, config=config, server_control=server_control,
         router=provider_router, system_probe=system_probe)
+
+    if arbiter is not None:
+        register_arbiter_routes(app, arbiter)
 
     # Neues, build-freies Dashboard. Der alte ``static``-Build bleibt als
     # Fallback erhalten, falls das Verzeichnis (z. B. in einem Deploy) fehlt.

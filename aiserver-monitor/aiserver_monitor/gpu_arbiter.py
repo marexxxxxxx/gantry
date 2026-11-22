@@ -225,7 +225,7 @@ class GpuArbiter:
     # -- intern ------------------------------------------------------------
 
     async def _drain_and_stop(self) -> None:
-        previous = self._server_control.snapshot().get("backend")
+        previous = (await self._server_control.snapshot()).get("backend")
         self._previous_backend = previous
         await self._wait_drained()
         if previous:

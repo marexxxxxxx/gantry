@@ -25,7 +25,7 @@ import json
 import logging
 import shutil
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +38,7 @@ from starlette.responses import StreamingResponse
 from . import __version__
 from .autoload import ProviderRouter, ProviderUnavailable
 from .config import Config
+from .gpu_arbiter import GpuArbiter
 from .priority import find_marker
 from .proxy import Deps, handle_v1
 from .registry import (
@@ -309,8 +310,15 @@ def _modelle_aus_registry(registry_dir: Path | None = None) -> JSONResponse:
 
 
 async def handle_v1_routed(request: Request, deps: Deps,
-                           router: ProviderRouter) -> Response:
-    """``handle_v1`` mit provider-eigenem Upstream und Auto-Load."""
+                           router: ProviderRouter,
+                           arbiter: GpuArbiter | None = None) -> Response:
+    """``handle_v1`` mit provider-eigenem Upstream und Auto-Load.
+
+    Ist ein GPU-Arbiter aktiv und die GPU gerade an einen externen Job
+    verleast, haelt dieser Hook die Chat-Anfrage an (``wait_serving``),
+    statt sie mit 503 abzuweisen. CPU-Pfade (``model is None``: embeddings,
+    audio, /v1/models) laufen unveraendert durch.
+    """
     model = await _request_modell(request)
     hindsight_model = await _hindsight_modell(request, deps)
     if hindsight_model is not None:
@@ -327,6 +335,8 @@ async def handle_v1_routed(request: Request, deps: Deps,
                                "liefere Registry-Liste aus.")
                 return _modelle_aus_registry(router.registry_dir)
         return await handle_v1(request, deps)
+    if arbiter is not None:
+        await arbiter.wait_serving()
     try:
         route = await router.prepare(model)
     except ProviderUnavailable as exc:
@@ -828,3 +838,58 @@ def register_provider_routes(
     @app.get("/api/system")
     async def api_system() -> Response:
         return JSONResponse(content=await probe.snapshot())
+
+
+async def _json_body(request: Request) -> dict[str, Any]:
+    """JSON-Koerper als dict; bei Fehlern oder Nicht-Objekten leer."""
+    try:
+        daten = await request.json()
+    except Exception:
+        return {}
+    return daten if isinstance(daten, dict) else {}
+
+
+def register_arbiter_routes(app: FastAPI, arbiter: GpuArbiter) -> None:
+    """Haengt die GPU-Arbiter-API unter ``/api/arbiter`` an ``app``."""
+
+    @app.post("/api/arbiter/lease")
+    async def arbiter_lease(request: Request) -> Response:
+        body = await _json_body(request)
+        lease = await arbiter.request_lease(
+            vram_budget_mib=body.get("vram_budget_mib"),
+            timeout_s=body.get("timeout_s"),
+            completion=body.get("completion", "exit_code"),
+        )
+        return JSONResponse(content=asdict(lease))
+
+    @app.post("/api/arbiter/run")
+    async def arbiter_run(request: Request) -> Response:
+        body = await _json_body(request)
+        command = body.get("command")
+        if not isinstance(command, list) or not command:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "command (Liste) ist erforderlich"})
+        ergebnis = await arbiter.run_job(
+            command,
+            cwd=body.get("cwd"),
+            env=body.get("env"),
+            vram_budget_mib=body.get("vram_budget_mib"),
+            timeout_s=body.get("timeout_s"),
+        )
+        return JSONResponse(content=asdict(ergebnis))
+
+    @app.post("/api/arbiter/lease/{lease_id}/complete")
+    async def arbiter_complete(lease_id: str, request: Request) -> Response:
+        body = await _json_body(request)
+        await arbiter.complete(lease_id, exit_code=body.get("exit_code"))
+        return JSONResponse(content={"lease_id": lease_id, "state": "completed"})
+
+    @app.post("/api/arbiter/lease/{lease_id}/release")
+    async def arbiter_release(lease_id: str) -> Response:
+        await arbiter.release(lease_id)
+        return JSONResponse(content={"lease_id": lease_id, "state": "released"})
+
+    @app.get("/api/arbiter/state")
+    async def arbiter_state() -> Response:
+        return JSONResponse(content=arbiter.snapshot())
