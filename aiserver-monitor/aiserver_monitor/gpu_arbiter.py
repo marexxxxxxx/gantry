@@ -15,11 +15,18 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Awaitable, Callable
+
+logger = logging.getLogger(__name__)
+
+#: Poll-Takt der Drain-Schleife (Sekunden). Drain wartet auf ``inflight()==0``;
+#: ein kleiner Takt haelt die Pause kurz, ein zu kleiner dreht die Schleife heiss.
+_DRAIN_POLL_S = 0.1
 
 
 class ArbiterState(StrEnum):
@@ -110,44 +117,94 @@ class GpuArbiter:
             timeout_s if timeout_s is not None
             else self._config.arbiter_lease_timeout_s
         )
+        lease = _Lease(
+            lease_id=f"lease-{next(self._lease_ids)}",
+            timeout_s=timeout,
+            deadline=self._clock() + timeout if timeout else None,
+            completion=completion,
+        )
         async with self._lock:
-            lease = _Lease(
-                lease_id=f"lease-{next(self._lease_ids)}",
-                timeout_s=timeout,
-                deadline=self._clock() + timeout if timeout else None,
-                completion=completion,
-            )
-            if self._state is ArbiterState.IDLE:
-                self._activate(lease)
-                return LeaseInfo(lease.lease_id, "granted", 0)
-            position = (1 if self._active is not None else 0) + len(self._queue)
-            self._queue.append(lease)
-            return LeaseInfo(lease.lease_id, "queued", position)
+            if self._state is ArbiterState.IDLE and self._active is None:
+                self._active = lease
+                self._set_state(ArbiterState.PAUSING)
+            else:
+                position = (
+                    (1 if self._active is not None else 0) + len(self._queue)
+                )
+                self._queue.append(lease)
+                return LeaseInfo(lease.lease_id, "queued", position)
+        await self._drain_and_stop()
+        return LeaseInfo(lease.lease_id, "granted", 0)
 
     async def release(self, lease_id: str) -> None:
-        async with self._lock:
-            self._finish(lease_id)
+        await self._finish(lease_id)
 
     async def complete(self, lease_id: str, *, exit_code=None) -> None:
-        async with self._lock:
-            self._finish(lease_id)
+        await self._finish(lease_id)
 
     # -- intern ------------------------------------------------------------
 
-    def _activate(self, lease: _Lease) -> None:
-        self._active = lease
+    async def _drain_and_stop(self) -> None:
+        previous = self._server_control.snapshot().get("backend")
+        self._previous_backend = previous
+        await self._wait_drained()
+        if previous:
+            await self._server_control.stop_and_wait(previous)
         self._set_state(ArbiterState.PAUSED)
 
-    def _finish(self, lease_id: str) -> None:
-        if self._active is not None and self._active.lease_id == lease_id:
-            self._active = None
-            self._set_state(ArbiterState.IDLE)
+    async def _wait_drained(self) -> None:
+        deadline = self._clock() + self._config.arbiter_drain_timeout_s
+        warned = False
+        while self._inflight() > 0:
+            if not warned and self._clock() >= deadline:
+                logger.warning(
+                    "GPU-Arbiter: Drain wartet laenger als %.0fs auf "
+                    "laufende Generierungen (kein Force-Abort).",
+                    self._config.arbiter_drain_timeout_s,
+                )
+                warned = True
+            await self._sleeper(_DRAIN_POLL_S)
+
+    async def _finish(self, lease_id: str) -> None:
+        async with self._lock:
+            if self._active is not None and self._active.lease_id == lease_id:
+                if self._queue:
+                    self._active = self._queue.popleft()
+                    return  # Ketten-Lease: bleibt PAUSED, kein Reload
+                self._active = None
+                self._set_state(ArbiterState.RESUMING)
+            else:
+                for i, lease in enumerate(self._queue):
+                    if lease.lease_id == lease_id:
+                        del self._queue[i]
+                        return
+                return  # unbekannte lease_id: idempotent ignorieren
+        await self._resume()
+
+    async def _resume(self) -> None:
+        try:
+            if self._previous_backend:
+                await self._server_control.start_and_wait(
+                    self._previous_backend)
+        except Exception:
+            logger.exception("GPU-Arbiter: Resume fehlgeschlagen")
+            self._set_state(ArbiterState.ERROR)
             return
-        for i, lease in enumerate(self._queue):
-            if lease.lease_id == lease_id:
-                del self._queue[i]
-                return
-        # Unbekannte lease_id: idempotent ignorieren.
+        self._set_state(ArbiterState.IDLE)
+        await self._grant_next_queued()
+
+    async def _grant_next_queued(self) -> None:
+        """Vergibt einen waehrend des Resumes eingereihten Lease."""
+        while True:
+            async with self._lock:
+                if (self._queue and self._active is None
+                        and self._state is ArbiterState.IDLE):
+                    lease = self._queue.popleft()
+                    self._active = lease
+                    self._set_state(ArbiterState.PAUSING)
+                else:
+                    return
+            await self._drain_and_stop()
 
     def _set_state(self, state: ArbiterState) -> None:
         self._state = state
