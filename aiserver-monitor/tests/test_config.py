@@ -194,6 +194,26 @@ class TestLoadConfig(unittest.TestCase):
                     Config(**{feld: 0})
         self.assertEqual(Config(audio8_model="").audio8_model, "")
 
+    def test_arbiter_defaults_und_validierung(self):
+        cfg = load_config(env={})
+        self.assertIs(cfg.arbiter_enabled, True)
+        self.assertAlmostEqual(cfg.arbiter_drain_timeout_s, 300.0)
+        self.assertAlmostEqual(cfg.arbiter_lease_timeout_s, 600.0)
+        self.assertAlmostEqual(cfg.arbiter_watchdog_interval_s, 1.0)
+
+        cfg = load_config(env={
+            "AISERVER_MONITOR_ARBITER_DRAIN_TIMEOUT_S": "120",
+            "AISERVER_MONITOR_ARBITER_ENABLED": "false",
+        })
+        self.assertIs(cfg.arbiter_enabled, False)
+        self.assertAlmostEqual(cfg.arbiter_drain_timeout_s, 120.0)
+
+        for feld in ("arbiter_drain_timeout_s", "arbiter_lease_timeout_s",
+                     "arbiter_watchdog_interval_s"):
+            with self.subTest(feld=feld):
+                with self.assertRaisesRegex(ValueError, feld):
+                    Config(**{feld: 0.0})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -378,6 +378,34 @@ class TestHindsightBlock(ProxyTestBasis):
         self.assertEqual(fake.anfragen, [])          # kein SGLang-Kontakt
         self.assertEqual(self.registry.snapshot(), [])  # kein Job
 
+    async def test_blockierte_requests_zaehlen_nicht_in_die_eskalation(self):
+        # Hindsight wiederholt abgewiesene Anfragen im Sekundentakt. Zaehlte
+        # das Gateway sie mit, stuende der erste echte Lauf schon auf medium.
+        fake = fakes.FakeSglang()
+        probe = _FakeProbe("edge0-120b")
+        deps = self.deps(httpx.ASGITransport(app=fake.app),
+                         hindsight=self.blockiert(), backend=probe)
+        deps.config.model_alias = "escha-qwen38-27b-w2"
+        deps.config.edge0_model = "edge0-120b"
+        deps.config.edge0_thinking = "auto"
+        deps.thinking_auto = ThinkingEscalator()
+
+        for _ in range(3):
+            antwort = await handle_v1(
+                _request("POST", "/v1/chat/completions", {
+                    "model": "escha-qwen38-27b-w2",
+                    "messages": [
+                        {"role": "system", "content": (
+                            "Extract SIGNIFICANT facts from text.")},
+                        {"role": "user", "content": "Text"},
+                    ],
+                }), deps)
+            await _body(antwort)
+            self.assertEqual(antwort.status_code, 503)
+
+        self.assertEqual(len(deps.thinking_auto), 0)
+        self.assertEqual(fake.anfragen, [])
+
     async def test_nonstream_hindsight_wird_ohne_upstream_abgewiesen(self):
         fake = fakes.FakeSglang(_chat_skript(["Hallo"]))
         deps = self.deps(httpx.ASGITransport(app=fake.app),

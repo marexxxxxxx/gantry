@@ -1,0 +1,13 @@
+FROM qwen3:4b-instruct-2507-q4_K_M
+
+# CPU-only fact extraction. This model must never take GPU memory from the
+# coding/campaign providers, so num_gpu is pinned to 0.
+PARAMETER num_gpu 0
+PARAMETER num_thread 12
+# Hindsight consolidation prompts were 10k-24k with batch size 8. The bank is
+# now pinned to batch size 2, so prompts should stay well below 8k. Keeping the
+# context small saves ~4 GB of KV cache and avoids swapping on this 60 GB box.
+PARAMETER num_ctx 8192
+PARAMETER temperature 0.1
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.05

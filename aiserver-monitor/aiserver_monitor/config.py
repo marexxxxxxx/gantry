@@ -99,6 +99,12 @@ class Config:
     edge0_stop_script: str = "runtime/edge0/stop-edge0.sh"
     edge0_pidfile: str = "runtime/edge0/edge0.pid"
     edge0_health_path: str = "/health"
+    # Eigener systemd-Scope fuer Edge0 (cgroup-Isolation). Ohne ihn teilt die
+    # Engine den cgroup mit dem Gateway, und ein RAM-OOM reisst das Gateway
+    # samt Sidecars mit. Leerer Name schaltet die Isolation ab; leerer
+    # memory_max laesst den Scope unbeschraenkt.
+    edge0_scope_unit: str = "edge0-backend.scope"
+    edge0_memory_max: str = "44G"
     # Modellname, den Edge0 meldet (--alias in start-edge0.sh).
     edge0_model: str = "edge0-120b"
     # Edge0 denkt von sich aus bis zu 48k Tokens; max_tokens kappt den
@@ -125,6 +131,17 @@ class Config:
     # Gateway ihn auf das jeweilige Modell um; laeuft Qwen, bleibt er
     # unveraendert (dort ist er der echte Modellname).
     model_alias: str = "escha-qwen38-27b-w2"
+    # Hindsight-Fallback: Ist hier ein Modellname gesetzt, werden Requests mit
+    # Hindsight-Markern statt mit 503 auf diesen Provider umgeleitet. Der
+    # Modellname muss zu einem Eintrag in providers/*.toml passen (z. B.
+    # fact-extract-cpu:latest fuer die CPU-Extraktion). Leer = bisheriges
+    # Blockieren.
+    hindsight_model: str = ""
+    # Marker, die auf das Fallbackmodell umgeleitet werden (Komma-getrennt).
+    # Standard ist nur die Fakten-Extraktion: Consolidation-Prompts sind mit
+    # 9k-23k Tokens zu gross und liefern beim 4B-CPU-Modell ungueltiges JSON;
+    # sie bleiben deshalb beim Blocker. Leer = kein Routing.
+    hindsight_model_markers: str = "Extract SIGNIFICANT facts from text"
     flint_model: str = "hf.co/AtomicChat/Flint-GGUF:IQ4_XS"
     gptoss_model: str = "gpt-oss:20b"
     # Obergrenze fuer max_tokens bei Requests an GPT-OSS. Hindsight schickt
@@ -137,6 +154,19 @@ class Config:
     gptoss_max_tokens: int = 10240
     abl_model: str = (
         "hf.co/bartowski/huihui-ai_Qwen3-14B-abliterated-GGUF:Q4_K_M")
+    # GPU-Arbiter: exklusive Lease/Pause fuer externe VRAM-Jobs (3D-Render,
+    # A/V-Gen). arbiter_enabled schaltet den Arbiter ganz ab (dann kein
+    # HOLD-Hook, Requests laufen wie bisher direkt durch). drain_timeout_s
+    # ist die Obergrenze, nach der beim Warten auf laufende Generierungen
+    # nur eine Warnung geloggt wird (nie ein Force-Abort). lease_timeout_s
+    # ist die Deadline eines Leases, nach der der Watchdog den Job als
+    # abgestuerzt wertet und auto-completed. watchdog_interval_s taktet den
+    # Watchdog.
+    arbiter_enabled: bool = True
+    arbiter_drain_timeout_s: float = 300.0
+    arbiter_lease_timeout_s: float = 600.0
+    arbiter_watchdog_interval_s: float = 1.0
+    arbiter_token: str = ""
 
     def __post_init__(self) -> None:
         """Weist nicht-positive Intervalle ab (sie waeren Busy-Loops).
@@ -204,6 +234,11 @@ class Config:
                      "audio8_pidfile", "audio8_health_path"):
             if not str(getattr(self, feld)).strip():
                 raise ValueError(f"{feld} darf nicht leer sein")
+        for feld in ("arbiter_drain_timeout_s", "arbiter_lease_timeout_s",
+                     "arbiter_watchdog_interval_s"):
+            if getattr(self, feld) <= 0:
+                raise ValueError(
+                    f"{feld} muss positiv sein: {getattr(self, feld)}")
 
 
 def _coerce(feld: str, typ: Any, wert: Any) -> Any:

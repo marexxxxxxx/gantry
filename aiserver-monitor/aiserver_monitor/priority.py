@@ -55,6 +55,14 @@ class PrioritySettings:
 DEFAULT_SETTINGS = PrioritySettings(enabled=True, markers=(DEFAULT_MARKER,))
 
 
+def _ohne_system_praefix(text: str) -> str:
+    """Entfernt ein aus Logs kopiertes Rollenlabel ``system:``."""
+    text = text.strip()
+    if text.casefold().startswith("system:"):
+        text = text[len("system:"):].strip()
+    return text
+
+
 def normalize_markers(markers: object) -> tuple[str, ...]:
     """Bereinigt die Markerliste: trimmen, leere entfernen, deduplizieren.
 
@@ -72,7 +80,10 @@ def normalize_markers(markers: object) -> tuple[str, ...]:
     for eintrag in markers:
         if not isinstance(eintrag, str):
             raise ValueError("jeder Marker muss ein String sein")
-        text = eintrag.strip()
+        # Marker werden oft aus Logs kopiert, wo das Rollenlabel vor dem
+        # Prompt steht ("system: ..."). Der Matcher vergleicht nur den
+        # Nachrichteninhalt, deshalb das Label hier entfernen.
+        text = _ohne_system_praefix(eintrag)
         if not text:
             continue
         if len(text) > MAX_MARKER:
@@ -119,6 +130,7 @@ def find_marker(koerper: dict, markers: tuple[str, ...] | list[str]) -> str | No
         return None
     text = _normalisiere(system_text(koerper))
     for marker in markers:
+        marker = _ohne_system_praefix(marker)
         if marker and _normalisiere(marker) in text:
             return marker
     return None

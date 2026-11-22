@@ -17,10 +17,11 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .audio8 import Audio8Client, Audio8Voice
 from .catalog import (AUDIO8_MODEL, CHATTERBOX_MODEL, QWEN_TTS_MODEL,
-                      audio8_installed, chatterbox_installed, models_payload,
-                      qwen_tts_installed, resolve_audio8_voice,
-                      resolve_qwen_voice, resolve_voice, resolve_whisper,
-                      voice_installed, whisper_installed)
+                      ZONOS_MODEL, audio8_installed, chatterbox_installed,
+                      models_payload, qwen_tts_installed,
+                      resolve_audio8_voice, resolve_qwen_voice, resolve_voice,
+                      resolve_whisper, resolve_zonos_voice, voice_installed,
+                      whisper_installed, zonos_installed)
 from .chatterbox import ChatterboxClient
 from .config import AudioSettings, load_settings
 from .errors import AudioError, audio_error_body
@@ -29,6 +30,7 @@ from .queue import Admission, QueueFull
 from .qwen_tts import QwenTTSClient, QwenVoice
 from .stt import (FasterWhisperEngine, Transcription,
                   normalize_language)
+from .zonos import ZonosClient, ZonosVoice
 from .tts import (PiperEngine, content_type, split_sentences,
                   start_encoder, stream_audio)
 
@@ -50,6 +52,7 @@ _QWEN_TTS_MODELS = frozenset({"qwen3-tts", "qwen3-tts-1.7b",
                               "qwen3-tts-12hz-1.7b-customvoice"})
 _AUDIO8_MODELS = frozenset({"audio8", "audio8-realistic-air",
                             "audio8-tts-realistic-air", "audio8-tts"})
+_ZONOS_MODELS = frozenset({"zonos3-mini", "zonos3", "zonos", "zonos-tts"})
 _TTS_FORMATE = frozenset({"pcm", "wav", "mp3", "opus"})
 
 
@@ -194,7 +197,7 @@ async def stream_speech(tts, text: str, *, info, fmt: str, speed: float,
 def create_audio_app(settings: AudioSettings | None = None, *,
                      stt_engine=None, tts_engine=None,
                      chatterbox_engine=None, qwen_tts_engine=None,
-                     audio8_engine=None,
+                     audio8_engine=None, zonos_engine=None,
                      duration_probe=probe_duration,
                      encoder_factory=start_encoder) -> FastAPI:
     """Baut die Audio-App; Engines und Zeitmessung sind austauschbar."""
@@ -207,6 +210,16 @@ def create_audio_app(settings: AudioSettings | None = None, *,
                 else QwenTTSClient(settings))
     audio8 = (audio8_engine if audio8_engine is not None
               else Audio8Client(settings))
+    if zonos_engine is None:
+        fallback_info = resolve_voice("kerstin")
+        fallback = (tts if voice_installed(settings.models_dir, fallback_info)
+                    else None)
+        zonos = ZonosClient(
+            settings,
+            fallback_engine=fallback,
+            fallback_info=fallback_info if fallback is not None else None)
+    else:
+        zonos = zonos_engine
     admission = Admission(1, settings.max_queue)
     tts_admission = Admission(2, settings.max_queue)
 
@@ -228,6 +241,7 @@ def create_audio_app(settings: AudioSettings | None = None, *,
     app.state.chatterbox = chatterbox
     app.state.qwen_tts = qwen_tts
     app.state.audio8 = audio8
+    app.state.zonos = zonos
     app.state.stt_admission = admission
     app.state.tts_admission = tts_admission
 
@@ -273,8 +287,10 @@ def create_audio_app(settings: AudioSettings | None = None, *,
 
     @app.get("/v1/audio/models")
     async def modelle():
-        return models_payload(settings.models_dir,
-                              audio8_model_dir=settings.audio8_model_dir)
+        return models_payload(
+            settings.models_dir,
+            audio8_model_dir=settings.audio8_model_dir,
+            zonos_model_dir=settings.zonos_model_dir)
 
     @app.post("/v1/audio/transcriptions")
     async def transkription(
@@ -371,7 +387,24 @@ def create_audio_app(settings: AudioSettings | None = None, *,
     async def sprache(anfrage: SpeechRequest):
         modell = anfrage.model.strip().casefold()
         timeout_s = settings.tts_timeout_s
-        if modell in _QWEN_TTS_MODELS:
+        if modell in _ZONOS_MODELS:
+            if not zonos_installed(settings.zonos_model_dir):
+                raise AudioError(
+                    503, "model_not_installed",
+                    "ZONOS3-Mini ist nicht installiert. Bitte die "
+                    "GGUF-Dateien nach /mnt/models/zonos3/gguf legen.")
+            zonos_lang = (anfrage.language or "de").strip().casefold()
+            if zonos_lang in ("german", "deutsch", "de-de"):
+                zonos_lang = "de"
+            zonos_lang = zonos_lang.split("-")[0] or "de"
+            info = ZonosVoice(
+                ZONOS_MODEL.id,
+                resolve_zonos_voice(anfrage.voice),
+                zonos_lang,
+            )
+            engine = app.state.zonos
+            timeout_s = settings.zonos_timeout_s
+        elif modell in _QWEN_TTS_MODELS:
             if not qwen_tts_installed(settings.models_dir):
                 raise AudioError(
                     503, "model_not_installed",

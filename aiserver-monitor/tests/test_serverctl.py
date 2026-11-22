@@ -101,7 +101,9 @@ class FakeClock:
 def _control(*, runner=None, health=None, spawner=None, clock=None,
              unit=UNIT, start_timeout_s=600.0, stop_timeout_s=60.0,
              start_grace_s=10.0, flint_pidfile=None, gptoss_pidfile=None,
-             abl_pidfile=None, sleeper=None):
+             abl_pidfile=None, sleeper=None,
+             edge0_scope_unit="edge0-backend.scope",
+             edge0_memory_max="44G", edge0_pidfile=None):
     runner = FakeRunner() if runner is None else runner
     health = FakeHealth() if health is None else health
     spawner = FakeSpawner() if spawner is None else spawner
@@ -123,6 +125,9 @@ def _control(*, runner=None, health=None, spawner=None, clock=None,
         abl_start_script="runtime/abl/start-abl.sh",
         abl_stop_script="runtime/abl/stop-abl.sh",
         abl_pidfile=abl_pidfile or "runtime/abl/abl.pid",
+        edge0_scope_unit=edge0_scope_unit,
+        edge0_memory_max=edge0_memory_max,
+        edge0_pidfile=edge0_pidfile or "runtime/edge0/edge0.pid",
         runner=runner,
         spawner=spawner,
         health_reader=health,
@@ -482,6 +487,47 @@ class TestBackends(unittest.IsolatedAsyncioTestCase):
         snap = await control.snapshot()
         self.assertEqual(snap["state"], "running")
         self.assertEqual(snap["backend"], "abl")
+
+    async def test_start_edge0_nutzt_systemd_scope(self):
+        runner = FakeRunner(unit_installiert=True, unit_aktiv=False,
+                            prozess_laeuft=False)
+        health = FakeHealthProPfad(**{"/health": False})
+        control, _, _, spawner, _ = _control(runner=runner, health=health)
+        snap = await control.start("edge0")
+        self.assertEqual(snap["state"], "starting")
+        self.assertEqual(snap["backend"], "edge0")
+        self.assertEqual(
+            spawner.aufrufe,
+            [["systemd-run", "--user", "--scope", "--collect",
+              "--unit", "edge0-backend.scope",
+              "--setenv", "EDGE0_FOREGROUND=1",
+              "--property", "MemoryMax=44G",
+              "bash", str(REPO / "runtime/edge0/start-edge0.sh")]])
+
+    async def test_start_edge0_ohne_scope_nutzt_start_skript(self):
+        runner = FakeRunner(unit_installiert=True, unit_aktiv=False,
+                            prozess_laeuft=False)
+        health = FakeHealthProPfad(**{"/health": False})
+        control, _, _, spawner, _ = _control(
+            runner=runner, health=health, edge0_scope_unit="")
+        await control.start("edge0")
+        self.assertEqual(
+            spawner.aufrufe,
+            [["bash", str(REPO / "runtime/edge0/start-edge0.sh")]])
+
+    async def test_stop_edge0_stoppt_scope_und_skript(self):
+        edge0 = Path(self.tmp.name) / "edge0.pid"
+        edge0.write_text(str(os.getpid()))
+        health = FakeHealthProPfad(**{"/health": True})
+        control, runner, _, spawner, _ = _control(
+            health=health, edge0_pidfile=str(edge0))
+        await control.stop()
+        self.assertIn(
+            ["systemctl", "--user", "stop", "edge0-backend.scope"],
+            runner.kommandos())
+        self.assertEqual(
+            spawner.aufrufe,
+            [["bash", str(REPO / "runtime/edge0/stop-edge0.sh")]])
 
     async def test_wechsel_flint_zu_gptoss(self):
         gptoss = Path(self.tmp.name) / "gptoss.pid"

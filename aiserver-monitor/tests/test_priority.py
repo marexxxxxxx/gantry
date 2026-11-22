@@ -44,6 +44,13 @@ class TestNormalizeMarkers(unittest.TestCase):
     def test_leere_liste_ist_erlaubt(self):
         self.assertEqual(normalize_markers([]), ())
 
+    def test_system_praefix_wird_entfernt(self):
+        # Marker aus Logs tragen das Rollenlabel "system: " und wuerden
+        # sonst nie gegen den reinen Nachrichteninhalt matchen.
+        self.assertEqual(
+            normalize_markers(["system: Du bist Max", "SYSTEM: Noch einer"]),
+            ("Du bist Max", "Noch einer"))
+
     def test_nicht_liste_wird_abgelehnt(self):
         with self.assertRaises(ValueError):
             normalize_markers("You are Max")
@@ -73,6 +80,14 @@ class TestMatchesMarkers(unittest.TestCase):
 
     def test_ohne_marker_kein_treffer(self):
         self.assertFalse(matches_markers(body(system(DEFAULT_MARKER)), []))
+
+    def test_marker_mit_system_praefix_matcht_den_systemtext(self):
+        # Im Dashboard werden Marker oft aus Logs kopiert; dort steht
+        # "system: " vor dem eigentlichen Prompt. Der Matcher vergleicht
+        # aber nur den Nachrichteninhalt, nicht das Rollenlabel.
+        koerper = body(system("CRITICAL: You MUST ONLY use facts."))
+        marker = "system: CRITICAL: You MUST ONLY use facts."
+        self.assertTrue(matches_markers(koerper, [marker]))
 
 
 class TestPriorityManager(unittest.TestCase):

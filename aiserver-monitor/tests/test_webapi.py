@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 
 from aiserver_monitor.app import create_app
 from aiserver_monitor.autoload import ProviderRouter
-from aiserver_monitor.config import Config
+from aiserver_monitor.config import Config, load_config
 from aiserver_monitor.registry import Provider, load_registry, save_provider
 from aiserver_monitor.serverctl import ServerControlError
 from aiserver_monitor.webapi import SystemProbe
@@ -492,6 +492,122 @@ class TestRoutingApi(ApiCase):
         self.assertEqual(control.start_calls, [])
         self.assertTrue(seen[0][0].startswith(
             "http://127.0.0.1:30001/"), seen[0][0])
+
+    def _app_mit_hindsight(self, control, seen, config):
+        """App mit SSE-Antwort und optionalem Hindsight-Zielmodell."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append((str(request.url), request.content))
+            return httpx.Response(
+                200,
+                content=(b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+                         b"data: [DONE]\n\n"),
+                headers={"content-type": "text/event-stream"})
+
+        router = ProviderRouter(
+            config, control, registry_dir=self.dir, registry_ttl_s=0.0)
+        return create_app(
+            config, transport=httpx.MockTransport(handler),
+            server_control=control, provider_router=router,
+            enable_background=False)
+
+    def test_hindsight_wird_auf_das_cpu_modell_umgeleitet(self) -> None:
+        self.provider(
+            "qwen", name="Qwen", model="alias-modell",
+            host="127.0.0.1", port=30001,
+            settings={"auto_load": False})
+        self.provider(
+            "fact-extract", name="Fact Extract CPU",
+            model="fact-extract-cpu:latest",
+            host="127.0.0.1", port=11434,
+            settings={"auto_load": False})
+        control = FakeControl({"qwen": "running", "fact-extract": "running"})
+        seen: list[tuple[str, bytes]] = []
+        config = load_config(env={
+            "AISERVER_MONITOR_DB_PATH": str(self.db),
+            "AISERVER_MONITOR_HINDSIGHT_MODEL": "fact-extract-cpu:latest",
+        })
+        with TestClient(self._app_mit_hindsight(control, seen, config)) as client:
+            aktiviert = client.put("/monitor/hindsight", json={
+                "enabled": True,
+                "markers": ["Extract SIGNIFICANT facts from text"],
+            })
+            self.assertEqual(aktiviert.status_code, 200)
+            antwort = client.post("/v1/chat/completions", json={
+                "model": "alias-modell",
+                "messages": [{"role": "system", "content": (
+                    "Extract SIGNIFICANT facts from text")}],
+                "stream": True,
+            })
+        self.assertEqual(antwort.status_code, 200, antwort.text)
+        self.assertEqual(len(seen), 1)
+        url, body = seen[0]
+        self.assertTrue(url.startswith("http://127.0.0.1:11434/"), url)
+        self.assertEqual(json.loads(body)["model"], "fact-extract-cpu:latest")
+        self.assertEqual(control.start_calls, [])
+
+    def test_konsolidierung_bleibt_blockiert(self) -> None:
+        """Nur die Fakten-Extraktion geht auf CPU, nicht die Consolidation."""
+        self.provider(
+            "qwen", name="Qwen", model="alias-modell",
+            host="127.0.0.1", port=30001,
+            settings={"auto_load": False})
+        self.provider(
+            "fact-extract", name="Fact Extract CPU",
+            model="fact-extract-cpu:latest",
+            host="127.0.0.1", port=11434,
+            settings={"auto_load": False})
+        control = FakeControl({"qwen": "running", "fact-extract": "running"})
+        seen: list[tuple[str, bytes]] = []
+        config = load_config(env={
+            "AISERVER_MONITOR_DB_PATH": str(self.db),
+            "AISERVER_MONITOR_HINDSIGHT_MODEL": "fact-extract-cpu:latest",
+        })
+        with TestClient(self._app_mit_hindsight(control, seen, config)) as client:
+            aktiviert = client.put("/monitor/hindsight", json={
+                "enabled": True,
+                "markers": [
+                    "Extract SIGNIFICANT facts from text",
+                    "You are a memory consolidation system",
+                ],
+            })
+            self.assertEqual(aktiviert.status_code, 200)
+            antwort = client.post("/v1/chat/completions", json={
+                "model": "alias-modell",
+                "messages": [{"role": "system", "content": (
+                    "You are a memory consolidation system")}],
+                "stream": True,
+            })
+        self.assertEqual(antwort.status_code, 503, antwort.text)
+        self.assertEqual(antwort.json()["error"]["type"], "hindsight_blocked")
+        self.assertEqual(seen, [])
+
+    def test_normaler_request_bleibt_beim_alias_provider(self) -> None:
+        self.provider(
+            "qwen", name="Qwen", model="alias-modell",
+            host="127.0.0.1", port=30001,
+            settings={"auto_load": False})
+        self.provider(
+            "fact-extract", name="Fact Extract CPU",
+            model="fact-extract-cpu:latest",
+            host="127.0.0.1", port=11434,
+            settings={"auto_load": False})
+        control = FakeControl({"qwen": "running", "fact-extract": "running"})
+        seen: list[tuple[str, bytes]] = []
+        config = load_config(env={
+            "AISERVER_MONITOR_DB_PATH": str(self.db),
+            "AISERVER_MONITOR_HINDSIGHT_MODEL": "fact-extract-cpu:latest",
+        })
+        with TestClient(self._app_mit_hindsight(control, seen, config)) as client:
+            antwort = client.post("/v1/chat/completions", json={
+                "model": "alias-modell",
+                "messages": [{"role": "system", "content": "Du bist Max."}],
+                "stream": True,
+            })
+        self.assertEqual(antwort.status_code, 200, antwort.text)
+        self.assertEqual(len(seen), 1)
+        url, body = seen[0]
+        self.assertTrue(url.startswith("http://127.0.0.1:30001/"), url)
+        self.assertEqual(json.loads(body)["model"], "alias-modell")
 
     def test_autoload_fehler_ist_503_mit_log_tail(self) -> None:
         self.provider("coder", name="Coder", model="coder-modell",

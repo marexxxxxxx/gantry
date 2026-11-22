@@ -139,9 +139,19 @@ for wert in "${STRATA_ARGS[@]}"; do
   args+=(--strata-arg "$wert")
 done
 
+cd "$ROOT"
+
+# Unter einem systemd-Scope (Gateway setzt EDGE0_FOREGROUND=1) laeuft die
+# Engine im Vordergrund. Nur so bleibt der ganze Prozessbaum im cgroup des
+# Scopes und dessen MemoryMax greift: ein RAM-OOM trifft dann ausschliesslich
+# Edge0, nicht das Gateway samt Ollama-, Embed- und Audio-Sidecars.
+if [ "${EDGE0_FOREGROUND:-0}" = "1" ]; then
+  echo $$ > "$PIDFILE"
+  exec "$BIN" "${args[@]}" >>"$LOG" 2>&1
+fi
+
 # setsid: eigener Prozessgruppe, damit stop-edge0.sh auch die von edge0-infer
 # gestartete strata-Engine mit beendet (sonst bleiben ~15 GB VRAM belegt).
-cd "$ROOT"
 setsid nohup "$BIN" "${args[@]}" >>"$LOG" 2>&1 &
 echo $! > "$PIDFILE"
 

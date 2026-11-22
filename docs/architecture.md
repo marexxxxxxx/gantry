@@ -396,7 +396,14 @@ running. The gateway resolves that in three places:
    (`BackendProbe._pidfile_modell`), with `/api/ps` as fallback for Ollama.
    The dashboard switch is therefore authoritative — not the client.
 2. **`/v1/models`** (`_modelle_mit_alias`): the upstream list is extended with
-   `edge0-120b` and the alias so clients can discover the name too.
+   `edge0-120b` and the alias so clients can discover the name too. The alias
+   also carries the **context window of the currently loaded backend**
+   (`context_length` and `max_model_len`): Edge0 reports 131072, Qwen 86016,
+   Flint/GPT-OSS 32768, Abliterated 40960. Edge0 and SGLang supply the value
+   in their own model list; for Ollama the gateway reads the loaded model's
+   `context_length` from `/api/ps`. If nothing is known, the field is omitted
+   rather than guessed. Clients such as Hermes therefore size their
+   compression to the backend that will actually serve the request.
 3. **Embeddings** (`_embedding_modell_anpassen`): chat alias, Flint/GPT-OSS/
    Abl/Edge0 name and `embed_model` all map onto the single embedding model.
 
@@ -682,5 +689,5 @@ small_qwen/
 - **No multi-model operation.** Two chat models do not fit into 16 GB; the
   system is deliberately built around strict switching.
 - **`/v1/models` is a snapshot.** The list names the active upstream name plus
-  the stable gateway names; it does not say which weights are loaded. That is
-  what `/v1/status` is for.
+  the stable gateway names and reports the active backend's context window; it
+  does not say which weights are loaded. That is what `/v1/status` is for.

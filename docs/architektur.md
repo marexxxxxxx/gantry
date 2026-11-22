@@ -402,6 +402,13 @@ Backend läuft. Das Gateway löst das an drei Stellen auf:
    Der Dashboard-Schalter ist damit autoritativ – nicht der Client.
 2. **`/v1/models`** (`_modelle_mit_alias`): Die Upstream-Liste wird um
    `edge0-120b` und den Alias ergänzt, damit Clients den Namen auch entdecken.
+   Der Alias trägt außerdem das **Kontextfenster des gerade geladenen
+   Backends** (`context_length` und `max_model_len`): Edge0 meldet 131072,
+   Qwen 86016, Flint/GPT-OSS 32768, Abliterated 40960. Edge0 und SGLang
+   liefern den Wert in ihrer eigenen Modellliste; bei Ollama liest das Gateway
+   `context_length` des geladenen Modells aus `/api/ps`. Ist nichts bekannt,
+   fehlt das Feld, statt einen Wert zu raten. Clients wie Hermes richten ihre
+   Kompression damit am tatsächlich bedienenden Backend aus.
 3. **Embeddings** (`_embedding_modell_anpassen`): Chat-Alias, Flint-/GPT-OSS-/
    Abl-/Edge0-Name und `embed_model` werden auf das eine Embedding-Modell
    abgebildet.
@@ -689,5 +696,6 @@ small_qwen/
 - **Kein Multi-Modell-Betrieb.** Zwei Chat-Modelle gleichzeitig passen nicht in
   die 16 GB; das System ist bewusst auf strikten Wechsel ausgelegt.
 - **`/v1/models` ist eine Momentaufnahme.** Die Liste nennt den aktiven
-  Upstream-Namen plus die stabilen Gateway-Namen; sie sagt nicht, welche
-  Gewichte geladen sind. Dafür ist `/v1/status` zuständig.
+  Upstream-Namen plus die stabilen Gateway-Namen und meldet das Kontextfenster
+  des aktiven Backends; sie sagt nicht, welche Gewichte geladen sind. Dafür
+  ist `/v1/status` zuständig.

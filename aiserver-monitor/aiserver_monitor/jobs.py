@@ -205,6 +205,12 @@ class JobRegistry:
         )
         return [job_to_dict(job) for job in sortiert]
 
+    def active_count(self) -> int:
+        """Anzahl aktiver Jobs (waiting/running) — das Drain-Signal des
+        GPU-Arbiters."""
+        return sum(1 for job in self._jobs.values()
+                   if job.status in ACTIVE_STATUSES)
+
     def clear_terminal(self) -> int:
         """Entfernt alle terminalen Jobs; aktive bleiben unangetastet.
 

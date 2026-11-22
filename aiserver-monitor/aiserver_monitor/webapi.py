@@ -25,7 +25,7 @@ import json
 import logging
 import shutil
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +38,8 @@ from starlette.responses import StreamingResponse
 from . import __version__
 from .autoload import ProviderRouter, ProviderUnavailable
 from .config import Config
+from .gpu_arbiter import ClientDisconnected, GpuArbiter
+from .priority import find_marker
 from .proxy import Deps, handle_v1
 from .registry import (
     PROVIDER_ID_RE,
@@ -197,6 +199,39 @@ async def _ersetze_modell(request: Request, model: str) -> None:
         del request._json
 
 
+async def _hindsight_modell(request: Request, deps: Deps) -> str | None:
+    """Schreibt Hindsight-Chats auf das konfigurierte Fallbackmodell um.
+
+    Nur ``/v1/chat/completions`` und nur bei einem Marker aus
+    ``hindsight_model_markers`` im System-Prompt: normale Agenten- und
+    Tool-Requests bleiben unberuehrt. Standardmaessig wird nur die
+    Fakten-Extraktion umgeleitet; Consolidation und Reflect bleiben beim
+    Blocker. Ist ``hindsight_model`` oder die Markerliste leer, passiert
+    nichts (bisheriges Blockieren). Rueckgabe: der Zielmodellname oder
+    ``None``.
+    """
+    ziel = deps.config.hindsight_model.strip()
+    if not ziel or deps.hindsight is None:
+        return None
+    marker = tuple(
+        teil.strip()
+        for teil in deps.config.hindsight_model_markers.split(",")
+        if teil.strip())
+    if not marker:
+        return None
+    if not request.url.path.endswith("/chat/completions"):
+        return None
+    roh = await request.body()
+    try:
+        daten = json.loads(roh)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(daten, dict) or find_marker(daten, marker) is None:
+        return None
+    await _ersetze_modell(request, ziel)
+    return ziel
+
+
 def _provider_fehler(exc: ProviderUnavailable) -> JSONResponse:
     """503/Fehlerkoerper fuer einen nicht bedienbaren Provider."""
     inhalt: dict[str, Any] = {
@@ -275,9 +310,19 @@ def _modelle_aus_registry(registry_dir: Path | None = None) -> JSONResponse:
 
 
 async def handle_v1_routed(request: Request, deps: Deps,
-                           router: ProviderRouter) -> Response:
-    """``handle_v1`` mit provider-eigenem Upstream und Auto-Load."""
+                           router: ProviderRouter,
+                           arbiter: GpuArbiter | None = None) -> Response:
+    """``handle_v1`` mit provider-eigenem Upstream und Auto-Load.
+
+    Ist ein GPU-Arbiter aktiv und die GPU gerade an einen externen Job
+    verleast, haelt dieser Hook die Chat-Anfrage an (``wait_serving``),
+    statt sie mit 503 abzuweisen. CPU-Pfade (``model is None``: embeddings,
+    audio, /v1/models) laufen unveraendert durch.
+    """
     model = await _request_modell(request)
+    hindsight_model = await _hindsight_modell(request, deps)
+    if hindsight_model is not None:
+        model = hindsight_model
     if model is None:
         if _ist_modellliste_get(request):
             # /v1/models darf nie mit 500 enden: ist kein Backend erreichbar,
@@ -290,28 +335,42 @@ async def handle_v1_routed(request: Request, deps: Deps,
                                "liefere Registry-Liste aus.")
                 return _modelle_aus_registry(router.registry_dir)
         return await handle_v1(request, deps)
+    if arbiter is not None:
+        try:
+            await arbiter.wait_serving(request)
+        except ClientDisconnected:
+            return Response(status_code=499)
+        except ProviderUnavailable as exc:
+            return _provider_fehler(exc)
     try:
-        route = await router.prepare(model)
-    except ProviderUnavailable as exc:
-        return _provider_fehler(exc)
-    if route is None:
-        return await handle_v1(request, deps)
+        try:
+            route = await router.prepare(model)
+        except ProviderUnavailable as exc:
+            return _provider_fehler(exc)
+        if route is None:
+            return await handle_v1(request, deps)
 
-    provider = route.provider
-    if provider.model and model != provider.model:
-        # Der Client hat ID oder Anzeigename geschickt; der Upstream erwartet
-        # den echten Modellnamen.
-        await _ersetze_modell(request, provider.model)
-    route_deps = replace(
-        deps, config=replace(deps.config, upstream_base=route.base_url))
-    router.acquire(provider.id)
-    try:
-        antwort = await handle_v1(request, route_deps)
-    except Exception:
-        router.release(provider.id)
-        raise
-    _freigabe_nach_antwort(antwort, router, provider.id)
-    return antwort
+        provider = route.provider
+        if provider.model and model != provider.model:
+            # Der Client hat ID oder Anzeigename geschickt; der Upstream erwartet
+            # den echten Modellnamen.
+            await _ersetze_modell(request, provider.model)
+        route_deps = replace(
+            deps,
+            config=replace(deps.config, upstream_base=route.base_url),
+            hindsight_bypass=hindsight_model is not None,
+        )
+        router.acquire(provider.id)
+        try:
+            antwort = await handle_v1(request, route_deps)
+        except Exception:
+            router.release(provider.id)
+            raise
+        _freigabe_nach_antwort(antwort, router, provider.id)
+        return antwort
+    finally:
+        if arbiter is not None:
+            arbiter.leave_serving()
 
 
 # --- Systemwerte -----------------------------------------------------------
@@ -788,3 +847,85 @@ def register_provider_routes(
     @app.get("/api/system")
     async def api_system() -> Response:
         return JSONResponse(content=await probe.snapshot())
+
+
+async def _json_body(request: Request) -> dict[str, Any]:
+    """JSON-Koerper als dict; bei Fehlern oder Nicht-Objekten leer."""
+    try:
+        daten = await request.json()
+    except Exception:
+        return {}
+    return daten if isinstance(daten, dict) else {}
+
+
+def register_arbiter_routes(app: FastAPI, arbiter: GpuArbiter, *,
+                            token: str = "") -> None:
+    """Haengt die GPU-Arbiter-API unter ``/api/arbiter`` an ``app``.
+
+    Die Endpoints sind token-geschuetzt: ohne konfigurierten ``token``
+    (Default leer) antworten sie fail-closed mit 403; mit Token muss der
+    Header ``X-Arbiter-Token`` passen.
+    """
+
+    def _verboten(request: Request) -> Response | None:
+        if not token:
+            return JSONResponse(
+                status_code=403,
+                content={"error": "Arbiter ohne Token deaktiviert"})
+        if request.headers.get("X-Arbiter-Token") != token:
+            return JSONResponse(
+                status_code=403,
+                content={"error": "ungueltiger Arbiter-Token"})
+        return None
+
+    @app.post("/api/arbiter/lease")
+    async def arbiter_lease(request: Request) -> Response:
+        if (fehler := _verboten(request)) is not None:
+            return fehler
+        body = await _json_body(request)
+        lease = await arbiter.request_lease(
+            vram_budget_mib=body.get("vram_budget_mib"),
+            timeout_s=body.get("timeout_s"),
+            completion=body.get("completion", "exit_code"),
+        )
+        return JSONResponse(content=asdict(lease))
+
+    @app.post("/api/arbiter/run")
+    async def arbiter_run(request: Request) -> Response:
+        if (fehler := _verboten(request)) is not None:
+            return fehler
+        body = await _json_body(request)
+        command = body.get("command")
+        if not isinstance(command, list) or not command:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "command (Liste) ist erforderlich"})
+        ergebnis = await arbiter.run_job(
+            command,
+            cwd=body.get("cwd"),
+            env=body.get("env"),
+            vram_budget_mib=body.get("vram_budget_mib"),
+            timeout_s=body.get("timeout_s"),
+        )
+        return JSONResponse(content=asdict(ergebnis))
+
+    @app.post("/api/arbiter/lease/{lease_id}/complete")
+    async def arbiter_complete(lease_id: str, request: Request) -> Response:
+        if (fehler := _verboten(request)) is not None:
+            return fehler
+        body = await _json_body(request)
+        await arbiter.complete(lease_id, exit_code=body.get("exit_code"))
+        return JSONResponse(content={"lease_id": lease_id, "state": "completed"})
+
+    @app.post("/api/arbiter/lease/{lease_id}/release")
+    async def arbiter_release(lease_id: str, request: Request) -> Response:
+        if (fehler := _verboten(request)) is not None:
+            return fehler
+        await arbiter.release(lease_id)
+        return JSONResponse(content={"lease_id": lease_id, "state": "released"})
+
+    @app.get("/api/arbiter/state")
+    async def arbiter_state(request: Request) -> Response:
+        if (fehler := _verboten(request)) is not None:
+            return fehler
+        return JSONResponse(content=arbiter.snapshot())

@@ -152,3 +152,23 @@
 # Der Audio-Sidecar spricht den Worker auf 127.0.0.1:30004 an.
 # AUDIO_CHATTERBOX_BASE="http://127.0.0.1:30004"
 # AUDIO_CHATTERBOX_TIMEOUT=120
+
+# --- GPU-Arbiter (exklusive Lease/Pause fuer externe VRAM-Jobs) ---
+# Externe Jobs (3D-Render, A/V-Gen) koennen die GPU exklusiv leasen: das
+# Gateway haelt dann eingehende Chat-Requests (statt 503), laesst laufende
+# Generierungen auslaufen, entlaedt das Chat-Backend und laedt es nach
+# Job-Ende automatisch wieder. arbiter_enabled=false schaltet das komplett ab
+# (Requests laufen dann wie bisher direkt durch).
+# arbiter_enabled = true
+# Obergrenze, nach der das Warten auf laufende Generierungen nur noch eine
+# Warnung loggt (nie ein Force-Abort). Sekunden.
+# arbiter_drain_timeout_s = 300.0
+# Deadline eines Leases: laeuft sie ab, ohne dass der Job sich meldet, wertet
+# der Watchdog ihn als abgestuerzt und completed ihn automatisch. Sekunden.
+# arbiter_lease_timeout_s = 600.0
+# Takt des Watchdogs, der abgelaufene Leases automatisch completed.
+# arbiter_watchdog_interval_s = 1.0
+# Shared Secret fuer /api/arbiter/*. Leer = Endpoints deaktiviert (fail-closed
+# 403). Bei gesetztem Wert muss der Client den Header "X-Arbiter-Token"
+# mitschicken (CLI: Env AISERVER_MONITOR_ARBITER_TOKEN).
+# arbiter_token = ""

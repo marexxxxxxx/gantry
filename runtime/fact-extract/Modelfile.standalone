@@ -1,0 +1,14 @@
+FROM /mnt/models/.ollama/models/blobs/sha256-85e4a5b7b8ef0e48af0e8658f5aaab9c2324c76c1641493f4d1e25fce54b18b9
+
+# CPU-only fact extraction. This model must never take GPU memory from the
+# coding/campaign providers, so num_gpu is pinned to 0.
+PARAMETER num_gpu 0
+PARAMETER num_thread 12
+# Hindsight's consolidation prompts are 10k-24k tokens; 8k caused Ollama to
+# reject them with "exceeds the available context size". 32k covers the
+# observed maximum; the server for this model enables q8_0 KV cache so the
+# cache fits in ~2.4 GB instead of ~5 GB.
+PARAMETER num_ctx 32768
+PARAMETER temperature 0.1
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.05

@@ -118,5 +118,6 @@ class TestChatterboxApp(unittest.TestCase):
         ids = {m["id"]: m["installed"] for m in daten["tts"]["models"]}
         self.assertEqual(ids, {"piper": True, "chatterbox": False,
                                "Qwen3-TTS": False,
-                               "Audio8-Realistic-Air": False})
+                               "Audio8-Realistic-Air": False,
+                               "ZONOS3-Mini": False})
         self.assertTrue(chatterbox_installed(self.models_dir) is False)

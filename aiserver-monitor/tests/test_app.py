@@ -909,6 +909,75 @@ class TestV1Passthrough(AppTestCase):
         self.assertEqual(str(gesehen[0].url),
                          "http://127.0.0.1:30001/v1/models")
 
+    def test_v1_models_alias_meldet_edge0_kontext(self):
+        antwort_daten = {"object": "list", "data": [
+            {"id": "edge0-120b", "object": "model", "owned_by": "local",
+             "context_length": 131072}]}
+        gesehen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            gesehen.append(request)
+            return httpx.Response(200, json=antwort_daten)
+
+        app = self.app(transport=httpx.MockTransport(handler))
+        with TestClient(app) as c:
+            antwort = c.get("/v1/models")
+        self.assertEqual(antwort.status_code, 200)
+        eintraege = {e["id"]: e for e in antwort.json()["data"]}
+        alias = eintraege["escha-qwen38-27b-w2"]
+        self.assertEqual(alias["context_length"], 131072)
+        self.assertEqual(alias["max_model_len"], 131072)
+        # Es bleibt beim einen Upstream-Aufruf: Edge0 meldet den Kontext
+        # bereits selbst, /api/ps wird nicht gebraucht.
+        self.assertEqual([str(r.url) for r in gesehen],
+                         ["http://127.0.0.1:30001/v1/models"])
+
+    def test_v1_models_alias_meldet_qwen_kontext(self):
+        antwort_daten = {"object": "list", "data": [
+            {"id": "escha-qwen38-27b-w2", "object": "model",
+             "owned_by": "sglang", "max_model_len": 86016}]}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=antwort_daten)
+
+        app = self.app(transport=httpx.MockTransport(handler))
+        with TestClient(app) as c:
+            antwort = c.get("/v1/models")
+        eintraege = {e["id"]: e for e in antwort.json()["data"]}
+        alias = eintraege["escha-qwen38-27b-w2"]
+        self.assertEqual(alias["context_length"], 86016)
+        self.assertEqual(alias["max_model_len"], 86016)
+        # edge0-120b ist nicht geladen und darf kein Fenster versprechen.
+        edge0 = eintraege["edge0-120b"]
+        self.assertNotIn("context_length", edge0)
+        self.assertNotIn("max_model_len", edge0)
+
+    def test_v1_models_alias_meldet_ollama_kontext_aus_api_ps(self):
+        modelle = ["hf.co/AtomicChat/Flint-GGUF:IQ4_XS", "gpt-oss:20b"]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/v1/models":
+                return httpx.Response(200, json={
+                    "object": "list",
+                    "data": [{"id": name, "object": "model",
+                              "owned_by": "ollama"} for name in modelle],
+                })
+            if request.url.path == "/api/ps":
+                return httpx.Response(200, json={"models": [
+                    {"name": modelle[0], "context_length": 32768}]})
+            return httpx.Response(404)
+
+        app = self.app(transport=httpx.MockTransport(handler))
+        with TestClient(app) as c:
+            antwort = c.get("/v1/models")
+        eintraege = {e["id"]: e for e in antwort.json()["data"]}
+        alias = eintraege["escha-qwen38-27b-w2"]
+        self.assertEqual(alias["context_length"], 32768)
+        # Auch der tatsaechlich geladene Ollama-Name traegt den Live-Wert.
+        self.assertEqual(eintraege[modelle[0]]["context_length"], 32768)
+        self.assertNotIn("context_length", eintraege["edge0-120b"])
+        self.assertNotIn("context_length", eintraege[modelle[1]])
+
 
 class TestCollectorImHintergrund(AppTestCase):
     def test_collector_startet_und_schreibt_sample(self):
