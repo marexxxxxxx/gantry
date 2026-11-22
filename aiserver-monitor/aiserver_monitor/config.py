@@ -166,6 +166,7 @@ class Config:
     arbiter_drain_timeout_s: float = 300.0
     arbiter_lease_timeout_s: float = 600.0
     arbiter_watchdog_interval_s: float = 1.0
+    arbiter_token: str = ""
 
     def __post_init__(self) -> None:
         """Weist nicht-positive Intervalle ab (sie waeren Busy-Loops).

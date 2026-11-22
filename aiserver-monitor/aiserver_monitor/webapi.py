@@ -38,7 +38,7 @@ from starlette.responses import StreamingResponse
 from . import __version__
 from .autoload import ProviderRouter, ProviderUnavailable
 from .config import Config
-from .gpu_arbiter import GpuArbiter
+from .gpu_arbiter import ClientDisconnected, GpuArbiter
 from .priority import find_marker
 from .proxy import Deps, handle_v1
 from .registry import (
@@ -336,32 +336,41 @@ async def handle_v1_routed(request: Request, deps: Deps,
                 return _modelle_aus_registry(router.registry_dir)
         return await handle_v1(request, deps)
     if arbiter is not None:
-        await arbiter.wait_serving()
+        try:
+            await arbiter.wait_serving(request)
+        except ClientDisconnected:
+            return Response(status_code=499)
+        except ProviderUnavailable as exc:
+            return _provider_fehler(exc)
     try:
-        route = await router.prepare(model)
-    except ProviderUnavailable as exc:
-        return _provider_fehler(exc)
-    if route is None:
-        return await handle_v1(request, deps)
+        try:
+            route = await router.prepare(model)
+        except ProviderUnavailable as exc:
+            return _provider_fehler(exc)
+        if route is None:
+            return await handle_v1(request, deps)
 
-    provider = route.provider
-    if provider.model and model != provider.model:
-        # Der Client hat ID oder Anzeigename geschickt; der Upstream erwartet
-        # den echten Modellnamen.
-        await _ersetze_modell(request, provider.model)
-    route_deps = replace(
-        deps,
-        config=replace(deps.config, upstream_base=route.base_url),
-        hindsight_bypass=hindsight_model is not None,
-    )
-    router.acquire(provider.id)
-    try:
-        antwort = await handle_v1(request, route_deps)
-    except Exception:
-        router.release(provider.id)
-        raise
-    _freigabe_nach_antwort(antwort, router, provider.id)
-    return antwort
+        provider = route.provider
+        if provider.model and model != provider.model:
+            # Der Client hat ID oder Anzeigename geschickt; der Upstream erwartet
+            # den echten Modellnamen.
+            await _ersetze_modell(request, provider.model)
+        route_deps = replace(
+            deps,
+            config=replace(deps.config, upstream_base=route.base_url),
+            hindsight_bypass=hindsight_model is not None,
+        )
+        router.acquire(provider.id)
+        try:
+            antwort = await handle_v1(request, route_deps)
+        except Exception:
+            router.release(provider.id)
+            raise
+        _freigabe_nach_antwort(antwort, router, provider.id)
+        return antwort
+    finally:
+        if arbiter is not None:
+            arbiter.leave_serving()
 
 
 # --- Systemwerte -----------------------------------------------------------
@@ -849,11 +858,30 @@ async def _json_body(request: Request) -> dict[str, Any]:
     return daten if isinstance(daten, dict) else {}
 
 
-def register_arbiter_routes(app: FastAPI, arbiter: GpuArbiter) -> None:
-    """Haengt die GPU-Arbiter-API unter ``/api/arbiter`` an ``app``."""
+def register_arbiter_routes(app: FastAPI, arbiter: GpuArbiter, *,
+                            token: str = "") -> None:
+    """Haengt die GPU-Arbiter-API unter ``/api/arbiter`` an ``app``.
+
+    Die Endpoints sind token-geschuetzt: ohne konfigurierten ``token``
+    (Default leer) antworten sie fail-closed mit 403; mit Token muss der
+    Header ``X-Arbiter-Token`` passen.
+    """
+
+    def _verboten(request: Request) -> Response | None:
+        if not token:
+            return JSONResponse(
+                status_code=403,
+                content={"error": "Arbiter ohne Token deaktiviert"})
+        if request.headers.get("X-Arbiter-Token") != token:
+            return JSONResponse(
+                status_code=403,
+                content={"error": "ungueltiger Arbiter-Token"})
+        return None
 
     @app.post("/api/arbiter/lease")
     async def arbiter_lease(request: Request) -> Response:
+        if (fehler := _verboten(request)) is not None:
+            return fehler
         body = await _json_body(request)
         lease = await arbiter.request_lease(
             vram_budget_mib=body.get("vram_budget_mib"),
@@ -864,6 +892,8 @@ def register_arbiter_routes(app: FastAPI, arbiter: GpuArbiter) -> None:
 
     @app.post("/api/arbiter/run")
     async def arbiter_run(request: Request) -> Response:
+        if (fehler := _verboten(request)) is not None:
+            return fehler
         body = await _json_body(request)
         command = body.get("command")
         if not isinstance(command, list) or not command:
@@ -881,15 +911,21 @@ def register_arbiter_routes(app: FastAPI, arbiter: GpuArbiter) -> None:
 
     @app.post("/api/arbiter/lease/{lease_id}/complete")
     async def arbiter_complete(lease_id: str, request: Request) -> Response:
+        if (fehler := _verboten(request)) is not None:
+            return fehler
         body = await _json_body(request)
         await arbiter.complete(lease_id, exit_code=body.get("exit_code"))
         return JSONResponse(content={"lease_id": lease_id, "state": "completed"})
 
     @app.post("/api/arbiter/lease/{lease_id}/release")
-    async def arbiter_release(lease_id: str) -> Response:
+    async def arbiter_release(lease_id: str, request: Request) -> Response:
+        if (fehler := _verboten(request)) is not None:
+            return fehler
         await arbiter.release(lease_id)
         return JSONResponse(content={"lease_id": lease_id, "state": "released"})
 
     @app.get("/api/arbiter/state")
-    async def arbiter_state() -> Response:
+    async def arbiter_state(request: Request) -> Response:
+        if (fehler := _verboten(request)) is not None:
+            return fehler
         return JSONResponse(content=arbiter.snapshot())

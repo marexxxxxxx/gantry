@@ -168,3 +168,7 @@
 # arbiter_lease_timeout_s = 600.0
 # Takt des Watchdogs, der abgelaufene Leases automatisch completed.
 # arbiter_watchdog_interval_s = 1.0
+# Shared Secret fuer /api/arbiter/*. Leer = Endpoints deaktiviert (fail-closed
+# 403). Bei gesetztem Wert muss der Client den Header "X-Arbiter-Token"
+# mitschicken (CLI: Env AISERVER_MONITOR_ARBITER_TOKEN).
+# arbiter_token = ""

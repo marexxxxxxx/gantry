@@ -783,7 +783,7 @@ def create_app(config: Config, *,
         router=provider_router, system_probe=system_probe)
 
     if arbiter is not None:
-        register_arbiter_routes(app, arbiter)
+        register_arbiter_routes(app, arbiter, token=config.arbiter_token)
 
     # Neues, build-freies Dashboard. Der alte ``static``-Build bleibt als
     # Fallback erhalten, falls das Verzeichnis (z. B. in einem Deploy) fehlt.

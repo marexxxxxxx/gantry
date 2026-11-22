@@ -22,10 +22,15 @@ import httpx
 
 GATEWAY_URL_ENV = "AISERVER_MONITOR_ARBITER_URL"
 DEFAULT_GATEWAY_URL = "http://127.0.0.1:30000"
+TOKEN_ENV = "AISERVER_MONITOR_ARBITER_TOKEN"
 
 
 def _gateway_url() -> str:
     return os.environ.get(GATEWAY_URL_ENV, DEFAULT_GATEWAY_URL)
+
+
+def _token() -> str | None:
+    return os.environ.get(TOKEN_ENV) or None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -92,7 +97,10 @@ def _print_json(obj: object) -> None:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse(sys.argv[1:] if argv is None else argv)
-    with httpx.Client(base_url=args.url, timeout=None) as client:
+    headers = {}
+    if (token := _token()):
+        headers["X-Arbiter-Token"] = token
+    with httpx.Client(base_url=args.url, timeout=None, headers=headers) as client:
         if args.subcommand == "state":
             resp = client.get("/api/arbiter/state")
             resp.raise_for_status()

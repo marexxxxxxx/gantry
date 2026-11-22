@@ -107,10 +107,10 @@ class TestArbiterWebapi(unittest.IsolatedAsyncioTestCase):
             Config(db_path=str(self.db)), control,
             registry_dir=self.dir, registry_ttl_s=0.0)
 
-    def _app(self, control: FakeControl):
+    def _app(self, control: FakeControl, token: str = "test-token"):
         router = self._router(control)
         app = create_app(
-            Config(db_path=str(self.db)),
+            Config(db_path=str(self.db), arbiter_token=token),
             transport=httpx.MockTransport(_ok_handler),
             server_control=control,
             provider_router=router,
@@ -118,9 +118,10 @@ class TestArbiterWebapi(unittest.IsolatedAsyncioTestCase):
         )
         return app, router
 
-    async def _client(self, app) -> httpx.AsyncClient:
+    async def _client(self, app, token: str = "test-token") -> httpx.AsyncClient:
         return httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-                                 base_url="http://test")
+                                 base_url="http://test",
+                                 headers={"X-Arbiter-Token": token})
 
     async def test_hold_haelt_chat_request_waehrend_pause(self) -> None:
         control = FakeControl({"edge0": "running"})
@@ -167,6 +168,22 @@ class TestArbiterWebapi(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(daten["state"], "granted")
             self.assertEqual(daten["position"], 0)
 
+    async def test_arbiter_endpoint_ohne_token_403(self) -> None:
+        control = FakeControl({"edge0": "running"})
+        app, _router = self._app(control, token="")
+        async with app.router.lifespan_context(app):
+            async with await self._client(app, token="") as client:
+                antwort = await client.post("/api/arbiter/lease", json={})
+            self.assertEqual(antwort.status_code, 403)
+
+    async def test_arbiter_endpoint_falscher_token_403(self) -> None:
+        control = FakeControl({"edge0": "running"})
+        app, _router = self._app(control, token="richtig")
+        async with app.router.lifespan_context(app):
+            async with await self._client(app, token="falsch") as client:
+                antwort = await client.post("/api/arbiter/lease", json={})
+            self.assertEqual(antwort.status_code, 403)
+
     async def test_ende_zu_ende_lease_run_und_resume(self) -> None:
         control = FakeControl({"edge0": "running"})
         freigabe = asyncio.Event()
@@ -181,7 +198,7 @@ class TestArbiterWebapi(unittest.IsolatedAsyncioTestCase):
         async def factory(*args, **kwargs):
             return _BlockingProcess()
 
-        config = Config(db_path=str(self.db))
+        config = Config(db_path=str(self.db), arbiter_token="test-token")
         arbiter = GpuArbiter(
             config, control, inflight=lambda: 0, subprocess_factory=factory)
         router = self._router(control)

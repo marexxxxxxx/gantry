@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Awaitable, Callable
 
+from .autoload import ProviderUnavailable
+
 logger = logging.getLogger(__name__)
 
 #: Poll-Takt der Drain-Schleife (Sekunden). Drain wartet auf ``inflight()==0``;
@@ -54,6 +56,10 @@ class JobResult:
     exit_code: int | None
     stdout: str
     stderr: str
+
+
+class ClientDisconnected(Exception):
+    """Client hat die Verbindung waehrend des HOLDs getrennt."""
 
 
 @dataclass
@@ -96,6 +102,8 @@ class GpuArbiter:
         self._active: _Lease | None = None
         self._lease_ids = itertools.count(1)
         self._previous_backend: str | None = None
+        self._active_proc: asyncio.subprocess.Process | None = None
+        self._gateway_active = 0
 
     # -- Beobachtung ------------------------------------------------------
 
@@ -112,9 +120,36 @@ class GpuArbiter:
 
     # -- Request-HOLD ------------------------------------------------------
 
-    async def wait_serving(self) -> None:
-        """Haelt, bis der Arbiter wieder IDLE (serving) ist."""
-        await self._serving.wait()
+    async def wait_serving(self, request=None) -> None:
+        """Haelt, bis der Arbiter wieder IDLE (serving) ist.
+
+        Reserviert anschliessend einen Gateway-Slot (``_gateway_active``),
+        damit der Drain Requests erkennt, die den HOLD passiert haben, aber
+        noch keinen Job registriert haben. Der Aufrufer muss ``leave_serving()``
+        in einem ``finally`` aufrufen.
+
+        Wirft ``ProviderUnavailable`` (503), wenn der Arbiter im Fehlerzustand
+        haengt, und ``ClientDisconnected``, wenn der Client waehrend des HOLDs
+        die Verbindung trennt.
+        """
+        while True:
+            if self._state is ArbiterState.ERROR:
+                raise ProviderUnavailable(
+                    "GPU-Arbiter im Fehlerzustand (Resume fehlgeschlagen)",
+                    provider="gpu-arbiter",
+                    status_code=503,
+                )
+            if self._state is ArbiterState.IDLE:
+                break
+            if request is not None and await request.is_disconnected():
+                raise ClientDisconnected()
+            await self._serving.wait()
+        async with self._lock:
+            self._gateway_active += 1
+
+    def leave_serving(self) -> None:
+        """Gibt den in ``wait_serving`` reservierten Gateway-Slot frei."""
+        self._gateway_active -= 1
 
     # -- Lease-Verwaltung ---------------------------------------------------
 
@@ -190,8 +225,20 @@ class GpuArbiter:
             cwd=cwd,
             env=env,
         )
-        stdout, stderr = await proc.communicate()
-        exit_code = proc.returncode
+        self._active_proc = proc
+        try:
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=lease.timeout_s
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                stdout, stderr = await proc.communicate()
+                exit_code = None
+            else:
+                exit_code = proc.returncode
+        finally:
+            self._active_proc = None
         await self.complete(lease.lease_id, exit_code=exit_code)
         return JobResult(
             lease_id=lease.lease_id,
@@ -214,6 +261,9 @@ class GpuArbiter:
                 "erzwinge Completion.",
                 active.lease_id,
             )
+            proc = self._active_proc
+            if proc is not None and proc.returncode is None:
+                proc.kill()
             await self.complete(active.lease_id)
 
     async def run_watchdog_loop(self) -> None:
@@ -225,17 +275,22 @@ class GpuArbiter:
     # -- intern ------------------------------------------------------------
 
     async def _drain_and_stop(self) -> None:
-        previous = (await self._server_control.snapshot()).get("backend")
-        self._previous_backend = previous
-        await self._wait_drained()
-        if previous:
-            await self._server_control.stop_and_wait(previous)
+        try:
+            previous = (await self._server_control.snapshot()).get("backend")
+            self._previous_backend = previous
+            await self._wait_drained()
+            if previous:
+                await self._server_control.stop_and_wait(previous)
+        except Exception:
+            logger.exception("GPU-Arbiter: Unload/Drain fehlgeschlagen")
+            self._set_state(ArbiterState.ERROR)
+            raise
         self._set_state(ArbiterState.PAUSED)
 
     async def _wait_drained(self) -> None:
         deadline = self._clock() + self._config.arbiter_drain_timeout_s
         warned = False
-        while self._inflight() > 0:
+        while self._inflight() > 0 or self._gateway_active > 0:
             if not warned and self._clock() >= deadline:
                 logger.warning(
                     "GPU-Arbiter: Drain wartet laenger als %.0fs auf "
