@@ -1,8 +1,9 @@
 import asyncio
+import time
 import unittest
 
 from aiserver_monitor.config import Config
-from aiserver_monitor.gpu_arbiter import ArbiterState, GpuArbiter
+from aiserver_monitor.gpu_arbiter import ArbiterState, GpuArbiter, JobResult
 from aiserver_monitor.jobs import JobRegistry, JobStatus
 
 
@@ -31,14 +32,33 @@ class _FakeServerControl:
 
 
 def _make_arbiter(config=None, server=None, inflight=None,
-                  sleeper=asyncio.sleep):
+                  sleeper=asyncio.sleep, clock=time.monotonic,
+                  subprocess_factory=asyncio.create_subprocess_exec):
     cfg = config or Config()
     return GpuArbiter(
         cfg,
         server if server is not None else _FakeServerControl(),
         inflight=inflight if inflight is not None else (lambda: 0),
         sleeper=sleeper,
+        clock=clock,
+        subprocess_factory=subprocess_factory,
     )
+
+
+class _FakeProcess:
+    """Fake fuer den Subprozess: liefert festes stdout/stderr und returncode."""
+
+    def __init__(self, returncode=0):
+        self.returncode = returncode
+
+    async def communicate(self):
+        return (b"out", b"err")
+
+
+def _subprocess_factory_with(returncode=0):
+    async def factory(*args, **kwargs):
+        return _FakeProcess(returncode)
+    return factory
 
 
 class TestJobRegistryActiveCount(unittest.TestCase):
@@ -123,6 +143,53 @@ class TestGpuArbiter(unittest.IsolatedAsyncioTestCase):
         lease = await arb.request_lease()
         await arb.release(lease.lease_id)
         self.assertEqual(arb.state, ArbiterState.ERROR)
+
+    async def test_run_job_liefert_exit_code_und_output(self):
+        server = _FakeServerControl("edge0")
+        arb = _make_arbiter(
+            server=server,
+            subprocess_factory=_subprocess_factory_with(0),
+        )
+        result = await arb.run_job(["echo", "hi"])
+        self.assertIsInstance(result, JobResult)
+        self.assertTrue(result.lease_id)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.stdout, "out")
+        self.assertEqual(result.stderr, "err")
+        self.assertEqual(arb.state, ArbiterState.IDLE)
+        self.assertEqual(server.started, ["edge0"])
+
+    async def test_run_job_gibt_lease_bei_fehlschlag_frei(self):
+        server = _FakeServerControl("edge0")
+        arb = _make_arbiter(
+            server=server,
+            subprocess_factory=_subprocess_factory_with(2),
+        )
+        result = await arb.run_job(["false"])
+        self.assertEqual(result.exit_code, 2)
+        self.assertEqual(arb.state, ArbiterState.IDLE)
+        self.assertEqual(server.started, ["edge0"])
+
+    async def test_complete_ueber_webhook_resumet(self):
+        server = _FakeServerControl("edge0")
+        arb = _make_arbiter(server=server)
+        lease = await arb.request_lease(completion="webhook")
+        self.assertEqual(arb.state, ArbiterState.PAUSED)
+        await arb.complete(lease.lease_id, exit_code=0)
+        self.assertEqual(arb.state, ArbiterState.IDLE)
+        self.assertEqual(server.started, ["edge0"])
+
+    async def test_watchdog_forciert_completion_nach_timeout(self):
+        clock = [0.0]
+        server = _FakeServerControl("edge0")
+        arb = _make_arbiter(server=server, clock=lambda: clock[0])
+        lease = await arb.request_lease(timeout_s=1.0)
+        self.assertEqual(arb.state, ArbiterState.PAUSED)
+        self.assertEqual(server.stopped, ["edge0"])
+        clock[0] = 2.0  # Deadline (0.0 + 1.0) ueberschritten
+        await arb.watchdog_once()
+        self.assertEqual(arb.state, ArbiterState.IDLE)
+        self.assertEqual(server.started, ["edge0"])
 
 
 if __name__ == "__main__":
