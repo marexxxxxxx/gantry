@@ -18,6 +18,7 @@ import httpx
 from aiserver_monitor.app import create_app
 from aiserver_monitor.autoload import ProviderRouter
 from aiserver_monitor.config import Config
+from aiserver_monitor.gpu_arbiter import GpuArbiter
 
 
 class FakeControl:
@@ -165,3 +166,56 @@ class TestArbiterWebapi(unittest.IsolatedAsyncioTestCase):
             self.assertIn("lease_id", daten)
             self.assertEqual(daten["state"], "granted")
             self.assertEqual(daten["position"], 0)
+
+    async def test_ende_zu_ende_lease_run_und_resume(self) -> None:
+        control = FakeControl({"edge0": "running"})
+        freigabe = asyncio.Event()
+
+        class _BlockingProcess:
+            returncode = 0
+
+            async def communicate(self):
+                await freigabe.wait()
+                return (b"out", b"err")
+
+        async def factory(*args, **kwargs):
+            return _BlockingProcess()
+
+        config = Config(db_path=str(self.db))
+        arbiter = GpuArbiter(
+            config, control, inflight=lambda: 0, subprocess_factory=factory)
+        router = self._router(control)
+        app = create_app(
+            config,
+            transport=httpx.MockTransport(_ok_handler),
+            server_control=control,
+            provider_router=router,
+            arbiter=arbiter,
+            enable_background=False,
+        )
+        async with app.router.lifespan_context(app):
+            async with await self._client(app) as client:
+                run_task = asyncio.create_task(client.post(
+                    "/api/arbiter/run",
+                    json={"command": ["blender", "-b", "x.blend"]}))
+                for _ in range(200):
+                    if arbiter.state.name == "PAUSED":
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(arbiter.state.name, "PAUSED")
+                self.assertEqual(len(control.stop_calls), 1)
+
+                chat_task = asyncio.create_task(client.post(
+                    "/v1/completions",
+                    json={"model": "egal", "prompt": "hi"}))
+                await asyncio.sleep(0.1)
+                self.assertFalse(chat_task.done())
+                self.assertEqual(router.prepared, [])
+
+                freigabe.set()
+                run_antwort = await asyncio.wait_for(run_task, timeout=5)
+                self.assertEqual(run_antwort.status_code, 200)
+                antwort = await asyncio.wait_for(chat_task, timeout=5)
+                self.assertEqual(antwort.status_code, 200)
+                self.assertEqual(router.prepared, ["egal"])
+                self.assertEqual(len(control.start_calls), 1)

@@ -117,6 +117,39 @@ curl -X POST http://127.0.0.1:30000/v1/load/Qwen3-TTS
 `/v1/status` liefert `profiles` (alle ladbaren Namen) und `loaded`-Einträge mit
 `profile`, `backend` und `kind` (`chat`, `tts` oder `embedding`).
 
+### GPU-Arbiter (exklusiver GPU-Zugriff)
+
+Für externe VRAM-Jobs (3D-Render, Audio/Video-Generierung) kann ein Agent die
+GPU exklusiv leasen. Während eines Leases hält das Gateway eingehende
+Chat-Requests in einer Warteschlange (statt mit 503 zu antworten), lässt
+laufende Generierungen auslaufen, entlädt das Chat-Backend und lädt es nach
+Job-Ende automatisch wieder. Der einfachste Einstieg ist die CLI (blockiert
+bis zum Job-Ende, Exit-Code = Job-Exit-Code):
+
+```bash
+# Arbeitsverzeichnis /home/user/gantry/aiserver-monitor
+python3 -m aiserver_monitor.gpu_arbiter_cli lease run -- blender -b scene.blend
+python3 -m aiserver_monitor.gpu_arbiter_cli lease run --timeout 600 -- ffmpeg ...
+python3 -m aiserver_monitor.gpu_arbiter_cli state
+```
+
+Die Gateway-URL kommt aus `AISERVER_MONITOR_ARBITER_URL` (Default
+`http://127.0.0.1:30000`) oder per `--url`. Dahinter liegt eine HTTP-API:
+
+| Methode | Pfad | Zweck |
+|---|---|---|
+| `POST` | `/api/arbiter/lease` | Lease anfordern (wartet, bis gewährt) |
+| `POST` | `/api/arbiter/run` | Lease + Job ausführen + Lease freigeben (ein Aufruf) |
+| `POST` | `/api/arbiter/lease/<id>/complete` | Job als beendet melden |
+| `POST` | `/api/arbiter/lease/<id>/release` | Lease freigeben |
+| `GET` | `/api/arbiter/state` | Zustand (`idle`/`pausing`/`paused`/…) und Queue |
+
+**Agent-Regeln:** Ein Lease-Aufruf ist blockierend und selbst-terminierend —
+`lease run` gibt die GPU nach Job-Ende automatisch frei. Leases laufen nicht
+parallel: ein zweiter `lease run` reiht sich in die Queue ein und startet, sobald
+der erste fertig ist. Stürzt ein Job ab, ohne sich zu melden, completed der
+Watchdog den Lease nach `arbiter_lease_timeout_s` automatisch.
+
 ### Audio (CPU)
 
 Whisper-Spracherkennung und Piper-Sprachausgabe laufen in einem eigenen
