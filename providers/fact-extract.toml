@@ -1,0 +1,25 @@
+# Gantry provider. Edit with `gantry provider edit <id>` or the dashboard.
+id = "fact-extract"
+name = "Fact Extract CPU (Qwen3 4B)"
+kind = "ollama"
+enabled = true
+host = "127.0.0.1"
+port = 11434
+model = "fact-extract-cpu:latest"
+health_url = "http://127.0.0.1:11434/api/version"
+pidfile = ""
+logfile = ""
+workdir = "."
+start_cmd = []
+stop_cmd = []
+
+[settings]
+context = 32768
+max_tokens = 4096
+kv = ""
+keep_alive = -1
+parallel = 1
+auto_load = false
+idle_unload_min = 0
+exclusive_gpu = false
+vram_reserve_mib = 0

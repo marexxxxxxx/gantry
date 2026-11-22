@@ -1,4 +1,4 @@
-# Gantry provider. Edit with `./server.sh provider edit qwen-coder` or the dashboard.
+# Gantry provider. Edit with `gantry provider edit <id>` or the dashboard.
 id = "qwen-coder"
 name = "Qwen3.8 Flash Next Coder (abliterated)"
 kind = "strata"
@@ -10,8 +10,8 @@ health_url = "http://127.0.0.1:8080/health"
 pidfile = ""
 logfile = "/tmp/qwen_serve.log"
 workdir = "/home/user/edge0/edge0-strata"
-start_cmd = ["/home/user/edge0/edge0-strata/.venv/bin/python", "serve/server.py", "--engine", "strata", "--config", "strata-coder-iq1_m.json", "--port", "8080"]
-stop_cmd = ['pkill', '-INT', '-f', '^\.venv/bin/python serve/server.py']
+start_cmd = ["bash", "-lc", "exec /home/user/edge0/edge0-strata/.venv/bin/python serve/server.py --engine strata --config strata-coder-iq1_m.json --port 8080 >>/tmp/qwen_serve.log 2>&1"]
+stop_cmd = ["pkill", "-INT", "-f", "serve/server\\.py"]
 
 [settings]
 context = 131072
@@ -20,6 +20,6 @@ kv = "int8"
 keep_alive = -1
 parallel = 1
 auto_load = true
-idle_unload_min = 30
+idle_unload_min = 0
 exclusive_gpu = true
 vram_reserve_mib = 1152

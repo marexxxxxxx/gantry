@@ -129,6 +129,10 @@ class Deps:
     client: httpx.AsyncClient
     priority: PriorityManager | None = None
     hindsight: HindsightBlocker | None = None
+    # True, wenn dieser Request bereits auf ein Hindsight-Fallbackmodell
+    # umgeschrieben wurde. Dann markiert ``hindsight`` den Job weiterhin,
+    # blockiert ihn aber nicht erneut mit 503.
+    hindsight_bypass: bool = False
     thinking_auto: "ThinkingEscalator | None" = None
     backend: "BackendProbe | None" = None
 
@@ -216,7 +220,74 @@ def _ist_embedding_pfad(pfad: str) -> bool:
     return pfad.endswith("/embeddings")
 
 
-def _modelle_mit_alias(antwort: Response, deps: "Deps") -> Response:
+#: Felder, mit denen Upstreams ihre Kontextgroesse melden. Reihenfolge nach
+#: Verbreitung: OpenAI-kompatibel (SGLang/Edge0), vLLM, llama.cpp, Ollama.
+_KONTEXT_FELDER = (
+    "context_length", "max_model_len", "context_window",
+    "max_context_length", "max_input_tokens", "n_ctx",
+)
+
+
+def _kontext_aus_eintrag(eintrag: dict) -> int | None:
+    """Liest die Kontextgroesse aus einem Modell-Eintrag, falls vorhanden."""
+    for feld in _KONTEXT_FELDER:
+        wert = eintrag.get(feld)
+        if isinstance(wert, bool):
+            continue
+        if isinstance(wert, (int, float)) and int(wert) > 0:
+            return int(wert)
+    return None
+
+
+async def _aktiver_kontext(
+        deps: "Deps", eintraege: list[dict]) -> tuple[str | None, int | None]:
+    """Name und Kontextgroesse des gerade geladenen Backends, live ermittelt.
+
+    Edge0 und SGLang melden den Wert direkt in ``/v1/models``
+    (``context_length`` bzw. ``max_model_len``). Ollama listet dort alle
+    installierten Modelle ohne Laufzeitkontext; den liefert nur ``/api/ps``
+    fuer das tatsaechlich geladene Modell (Slots bereits eingerechnet).
+    Unbekannt bleibt unbekannt: dann wird kein Wert gemeldet, statt einen
+    geratenen zu setzen.
+    """
+    ollama_modelle = {name for name in (deps.config.flint_model,
+                                        deps.config.gptoss_model,
+                                        deps.config.abl_model) if name}
+    ids = {eintrag.get("id") for eintrag in eintraege}
+    if ollama_modelle & ids:
+        basis = deps.config.upstream_base.rstrip("/")
+        try:
+            antwort = await deps.client.get(
+                f"{basis}/api/ps", timeout=_PROBE_TIMEOUT_S)
+        except Exception as exc:
+            logger.debug("/api/ps fuer Kontextgroesse fehlgeschlagen: %s: %s",
+                         type(exc).__name__, exc)
+        else:
+            if antwort.status_code == 200:
+                try:
+                    daten = antwort.json()
+                except ValueError:
+                    daten = None
+                modelle = daten.get("models") if isinstance(daten, dict) else None
+                if isinstance(modelle, list):
+                    for eintrag in modelle:
+                        if not isinstance(eintrag, dict):
+                            continue
+                        name = eintrag.get("name") or eintrag.get("model")
+                        if not isinstance(name, str) or name not in ollama_modelle:
+                            continue
+                        kontext = _kontext_aus_eintrag(eintrag)
+                        if kontext is not None:
+                            return name, kontext
+    for eintrag in eintraege:
+        kontext = _kontext_aus_eintrag(eintrag)
+        if kontext is not None:
+            name = eintrag.get("id")
+            return (name if isinstance(name, str) else None), kontext
+    return None, None
+
+
+async def _modelle_mit_alias(antwort: Response, deps: "Deps") -> Response:
     """Ergaenzt die Upstream-Modellliste um die stabilen Gateway-Namen.
 
     Clients (z. B. Hermes) fragen den Alias ``escha-qwen38-27b-w2`` an,
@@ -224,6 +295,11 @@ def _modelle_mit_alias(antwort: Response, deps: "Deps") -> Response:
     (``edge0-120b``). Im Request wird der Name ohnehin auf das aktive
     Modell umgeschrieben; damit die Clients ihn auch in ``/v1/models``
     finden, steht er hier in der Liste.
+
+    Der Alias meldet ausserdem die Kontextgroesse des **aktuell geladenen**
+    Backends: ist Edge0 geladen, gilt dessen Fenster (131072), laeuft Qwen,
+    dessen kleineres (86016). So planen Clients wie Hermes ihre Kompression
+    nach dem, was der Gateway-Name gerade wirklich bedient.
     """
     if antwort.status_code != 200:
         return antwort
@@ -235,17 +311,36 @@ def _modelle_mit_alias(antwort: Response, deps: "Deps") -> Response:
         return antwort
     if not isinstance(daten, dict) or not isinstance(daten.get("data"), list):
         return antwort
-    vorhanden = {eintrag.get("id") for eintrag in daten["data"]
-                 if isinstance(eintrag, dict)}
-    ergaenzt = False
+    eintraege = [eintrag for eintrag in daten["data"]
+                 if isinstance(eintrag, dict)]
+    vorhanden = {eintrag.get("id") for eintrag in eintraege}
+    aktiv, kontext = await _aktiver_kontext(deps, eintraege)
+    geaendert = False
+    if kontext is not None:
+        # Nur das aktive Backend bekommt einen Wert: inaktive Namen in der
+        # Liste (z. B. edge0-120b bei laufendem Qwen) wuerden sonst ein
+        # Fenster versprechen, das sie gerade nicht bedienen.
+        mit_kontext = {name for name in (deps.config.model_alias, aktiv)
+                       if name}
+        for eintrag in eintraege:
+            if eintrag.get("id") not in mit_kontext:
+                continue
+            for feld in ("context_length", "max_model_len"):
+                if feld not in eintrag:
+                    eintrag[feld] = kontext
+                    geaendert = True
     for name in (deps.config.edge0_model, deps.config.model_alias):
         if not name or name in vorhanden:
             continue
-        daten["data"].append({"id": name, "object": "model",
-                              "owned_by": "aiserver-monitor"})
+        neuer = {"id": name, "object": "model",
+                 "owned_by": "aiserver-monitor"}
+        if kontext is not None and name == deps.config.model_alias:
+            neuer["context_length"] = kontext
+            neuer["max_model_len"] = kontext
+        daten["data"].append(neuer)
         vorhanden.add(name)
-        ergaenzt = True
-    if not ergaenzt:
+        geaendert = True
+    if not geaendert:
         return antwort
     return JSONResponse(daten)
 
@@ -1333,8 +1428,25 @@ async def handle_v1(request: Request, deps: Deps) -> Response:
         antwort = await _passthrough(request, deps, roh)
         if (request.method == "GET"
                 and request.url.path.rstrip("/").endswith("/v1/models")):
-            return _modelle_mit_alias(antwort, deps)
+            return await _modelle_mit_alias(antwort, deps)
         return antwort
+    ist_hindsight = False
+    if request.url.path.endswith(_CHAT_COMPLETIONS):
+        # Marker nur auf Chat-Bodies anwenden; andere JSON-POSTs
+        # (z. B. Embeddings) bleiben unveraendert. Bewusst VOR
+        # ``_modell_anpassen``: ein blockierter Request wird vom Client im
+        # Sekundentakt wiederholt und darf die Denk-Eskalation nicht
+        # hochzaehlen (sonst startet der erste echte Lauf mit medium).
+        if deps.priority is not None:
+            deps.priority.mark(koerper)
+        if deps.hindsight is not None:
+            ist_hindsight = deps.hindsight.matches(koerper)
+            if deps.hindsight.blocked(koerper) and not deps.hindsight_bypass:
+                # Blockiert: sofort 503, ohne SGLang-Kontakt und ohne Job.
+                logger.info(
+                    "Hindsight-Request blockiert: marker=%r modell=%r",
+                    deps.hindsight.treffer(koerper), koerper.get("model"))
+                return _hindsight_antwort()
     if _ist_completion_pfad(request.url.path):
         # Ollama kennt den Qwen-Alias nicht; bei aktivem Flint/GPT-OSS/Abliterated
         # umschreiben, bevor Prioritaet/Hindsight/rid den Body sehen.
@@ -1345,20 +1457,6 @@ async def handle_v1(request: Request, deps: Deps) -> Response:
             # Der Passthrough (z. B. /v1/completions ohne stream) schickt
             # sonst die alten Bytes weiter.
             roh = json.dumps(koerper, ensure_ascii=False).encode("utf-8")
-    ist_hindsight = False
-    if request.url.path.endswith(_CHAT_COMPLETIONS):
-        # Marker nur auf Chat-Bodies anwenden; andere JSON-POSTs
-        # (z. B. Embeddings) bleiben unveraendert.
-        if deps.priority is not None:
-            deps.priority.mark(koerper)
-        if deps.hindsight is not None:
-            ist_hindsight = deps.hindsight.matches(koerper)
-            if deps.hindsight.blocked(koerper):
-                # Blockiert: sofort 503, ohne SGLang-Kontakt und ohne Job.
-                logger.info(
-                    "Hindsight-Request blockiert: marker=%r modell=%r",
-                    deps.hindsight.treffer(koerper), koerper.get("model"))
-                return _hindsight_antwort()
     if koerper.get("stream") is not True:
         if request.url.path.endswith(_CHAT_COMPLETIONS):
             return await _nichtstream(request, deps, koerper,
@@ -1408,7 +1506,8 @@ async def handle_v1(request: Request, deps: Deps) -> Response:
                             headers=kopfzeilen)
 
         if (ist_hindsight and deps.hindsight is not None
-                and deps.hindsight.settings().enabled):
+                and deps.hindsight.settings().enabled
+                and not deps.hindsight_bypass):
             # Der Blocker wurde waehrend des Kopfzeilen-Aufrufs aktiviert:
             # Request bei SGLang abmelden, bevor ein Job entsteht.
             await antwort.aread()

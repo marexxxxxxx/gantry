@@ -38,6 +38,7 @@ from starlette.responses import StreamingResponse
 from . import __version__
 from .autoload import ProviderRouter, ProviderUnavailable
 from .config import Config
+from .priority import find_marker
 from .proxy import Deps, handle_v1
 from .registry import (
     PROVIDER_ID_RE,
@@ -197,6 +198,39 @@ async def _ersetze_modell(request: Request, model: str) -> None:
         del request._json
 
 
+async def _hindsight_modell(request: Request, deps: Deps) -> str | None:
+    """Schreibt Hindsight-Chats auf das konfigurierte Fallbackmodell um.
+
+    Nur ``/v1/chat/completions`` und nur bei einem Marker aus
+    ``hindsight_model_markers`` im System-Prompt: normale Agenten- und
+    Tool-Requests bleiben unberuehrt. Standardmaessig wird nur die
+    Fakten-Extraktion umgeleitet; Consolidation und Reflect bleiben beim
+    Blocker. Ist ``hindsight_model`` oder die Markerliste leer, passiert
+    nichts (bisheriges Blockieren). Rueckgabe: der Zielmodellname oder
+    ``None``.
+    """
+    ziel = deps.config.hindsight_model.strip()
+    if not ziel or deps.hindsight is None:
+        return None
+    marker = tuple(
+        teil.strip()
+        for teil in deps.config.hindsight_model_markers.split(",")
+        if teil.strip())
+    if not marker:
+        return None
+    if not request.url.path.endswith("/chat/completions"):
+        return None
+    roh = await request.body()
+    try:
+        daten = json.loads(roh)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(daten, dict) or find_marker(daten, marker) is None:
+        return None
+    await _ersetze_modell(request, ziel)
+    return ziel
+
+
 def _provider_fehler(exc: ProviderUnavailable) -> JSONResponse:
     """503/Fehlerkoerper fuer einen nicht bedienbaren Provider."""
     inhalt: dict[str, Any] = {
@@ -278,6 +312,9 @@ async def handle_v1_routed(request: Request, deps: Deps,
                            router: ProviderRouter) -> Response:
     """``handle_v1`` mit provider-eigenem Upstream und Auto-Load."""
     model = await _request_modell(request)
+    hindsight_model = await _hindsight_modell(request, deps)
+    if hindsight_model is not None:
+        model = hindsight_model
     if model is None:
         if _ist_modellliste_get(request):
             # /v1/models darf nie mit 500 enden: ist kein Backend erreichbar,
@@ -303,7 +340,10 @@ async def handle_v1_routed(request: Request, deps: Deps,
         # den echten Modellnamen.
         await _ersetze_modell(request, provider.model)
     route_deps = replace(
-        deps, config=replace(deps.config, upstream_base=route.base_url))
+        deps,
+        config=replace(deps.config, upstream_base=route.base_url),
+        hindsight_bypass=hindsight_model is not None,
+    )
     router.acquire(provider.id)
     try:
         antwort = await handle_v1(request, route_deps)

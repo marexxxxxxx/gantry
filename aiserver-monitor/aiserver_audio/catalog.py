@@ -63,6 +63,15 @@ class Audio8Info:
     voices: tuple[str, ...] = ("de_male",)
 
 
+@dataclass(frozen=True)
+class ZonosInfo:
+    id: str
+    aliases: tuple[str, ...]
+    size_mb: int
+    required_files: tuple[str, ...]
+    voices: tuple[str, ...] = ("liesel",)
+
+
 WHISPER_MODELS: tuple[WhisperInfo, ...] = (
     WhisperInfo("whisper-small", ("small", "whisper-1"),
                 "Systran/faster-whisper-small", 484, "small"),
@@ -110,6 +119,17 @@ AUDIO8_MODEL = Audio8Info(
      "configuration_arktts.py", "modeling_arktts.py",
      "modeling_arktts_codec.py", "processing_arktts.py"),
 )
+
+ZONOS_MODEL = ZonosInfo(
+    "ZONOS3-Mini",
+    ("zonos3-mini", "zonos3", "zonos", "zonos-tts"),
+    1160,
+    ("backbone-ptq.gguf", "zac-keep2.gguf", "spk-encoder.gguf",
+     "steer.gguf"),
+    ("liesel",),
+)
+
+DEFAULT_ZONOS_VOICE = "liesel"
 
 
 def _aufloesen(name: str | None, modelle, default: str, art: str):
@@ -193,6 +213,24 @@ def resolve_audio8_voice(name: str | None) -> str:
                      f"Unbekannte Audio8-Stimme: {name!r}")
 
 
+def zonos_installed(model_dir: Path) -> bool:
+    """ZONOS liegt im konfigurierten GGUF-Verzeichnis."""
+    ziel = Path(model_dir)
+    return all(_datei_ok(ziel / name)
+               for name in ZONOS_MODEL.required_files)
+
+
+def resolve_zonos_voice(name: str | None) -> str:
+    """Loest die ZONOS-Stimme auf; es gibt aktuell nur Liesel."""
+    gesucht = (name or "").strip().casefold()
+    if gesucht in ("", "default", "zonos", "zonos3", "liesel22",
+                   "liesel-22", "liesel_22", "happy22",
+                   *ZONOS_MODEL.voices):
+        return DEFAULT_ZONOS_VOICE
+    raise AudioError(400, "invalid_request",
+                     f"Unbekannte ZONOS3-Stimme: {name!r}")
+
+
 def _datei_ok(pfad: Path) -> bool:
     try:
         return pfad.is_file() and pfad.stat().st_size > 0
@@ -210,9 +248,12 @@ def voice_installed(models_dir: Path, info: PiperInfo) -> bool:
 
 
 def models_payload(models_dir: Path, *,
-                   audio8_model_dir: Path | None = None) -> dict:
+                   audio8_model_dir: Path | None = None,
+                   zonos_model_dir: Path | None = None) -> dict:
     audio8_ziel = (Path(audio8_model_dir) if audio8_model_dir is not None
                    else Path(models_dir) / AUDIO8_MODEL.dirname)
+    zonos_ziel = (Path(zonos_model_dir) if zonos_model_dir is not None
+                  else Path(models_dir) / "zonos3" / "gguf")
     return {
         "whisper": {
             "default": DEFAULT_WHISPER,
@@ -237,6 +278,9 @@ def models_payload(models_dir: Path, *,
                 {"id": AUDIO8_MODEL.id,
                  "installed": audio8_installed(audio8_ziel),
                  "size_mb": AUDIO8_MODEL.size_mb},
+                {"id": ZONOS_MODEL.id,
+                 "installed": zonos_installed(zonos_ziel),
+                 "size_mb": ZONOS_MODEL.size_mb},
             ],
             "voices": [
                 {"id": info.id,
@@ -254,6 +298,12 @@ def models_payload(models_dir: Path, *,
                 "voices": [
                     {"id": stimme, "installed": True, "size_mb": 0}
                     for stimme in AUDIO8_MODEL.voices
+                ],
+            },
+            "zonos3": {
+                "voices": [
+                    {"id": stimme, "installed": True, "size_mb": 0}
+                    for stimme in ZONOS_MODEL.voices
                 ],
             },
         },

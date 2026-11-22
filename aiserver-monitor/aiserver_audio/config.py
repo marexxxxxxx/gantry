@@ -25,6 +25,9 @@ class AudioSettings:
     audio8_base: str = "http://127.0.0.1:30006"
     audio8_timeout_s: int = 600
     audio8_model_dir: Path = Path("/mnt/models/audio/audio8")
+    zonos_base: str = "http://127.0.0.1:1919"
+    zonos_timeout_s: int = 600
+    zonos_model_dir: Path = Path("/mnt/models/zonos3/gguf")
 
 
 def _wert(env: Mapping[str, str], name: str, default: str) -> str:
@@ -63,11 +66,17 @@ def load_settings(env: Mapping[str, str] | None = None) -> AudioSettings:
             _wert(quelle, "AUDIO8_TIMEOUT", "600")),
         audio8_model_dir=Path(
             _wert(quelle, "AUDIO8_MODEL_DIR", "/mnt/models/audio/audio8")),
+        zonos_base=_wert(quelle, "ZONOS_BASE",
+                         "http://127.0.0.1:1919"),
+        zonos_timeout_s=int(
+            _wert(quelle, "ZONOS_TIMEOUT", "600")),
+        zonos_model_dir=Path(
+            _wert(quelle, "ZONOS_MODEL_DIR", "/mnt/models/zonos3/gguf")),
     )
     for feld in ("port", "threads", "model_cache", "max_queue",
                  "stt_timeout_s", "tts_timeout_s", "max_upload_mb",
                  "chatterbox_timeout_s", "qwen_tts_timeout_s",
-                 "audio8_timeout_s"):
+                 "audio8_timeout_s", "zonos_timeout_s"):
         if getattr(settings, feld) <= 0:
             raise ValueError(f"AUDIO_{feld.upper()} muss positiv sein: "
                              f"{getattr(settings, feld)}")
@@ -81,4 +90,8 @@ def load_settings(env: Mapping[str, str] | None = None) -> AudioSettings:
         raise ValueError("AUDIO_AUDIO8_BASE darf nicht leer sein")
     if not str(settings.audio8_model_dir).strip():
         raise ValueError("AUDIO_AUDIO8_MODEL_DIR darf nicht leer sein")
+    if not settings.zonos_base.strip():
+        raise ValueError("AUDIO_ZONOS_BASE darf nicht leer sein")
+    if not str(settings.zonos_model_dir).strip():
+        raise ValueError("AUDIO_ZONOS_MODEL_DIR darf nicht leer sein")
     return settings

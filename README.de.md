@@ -130,7 +130,8 @@ AT/CH-Piper-Stimmen. Direkte Steuerung: `runtime/audio/start-audio.sh`,
 `runtime/audio/stop-audio.sh`, `runtime/audio/selftest.sh`. Tuning:
 `AUDIO_MODELS_DIR`, `AUDIO_THREADS`, `AUDIO_PRELOAD`, `AUDIO_MODEL_CACHE`,
 `AUDIO_MAX_QUEUE`, `AUDIO_STT_TIMEOUT`, `AUDIO_TTS_TIMEOUT`,
-`AUDIO_MAX_UPLOAD_MB`, `AUDIO_HOST`, `AUDIO_PORT`. Für GPU-TTS ist
+`AUDIO_MAX_UPLOAD_MB`, `AUDIO_HOST`, `AUDIO_PORT`, `AUDIO_ZONOS_BASE`,
+`AUDIO_ZONOS_TIMEOUT`, `AUDIO_ZONOS_MODEL_DIR`. Für GPU-TTS ist
 `Audio8-Realistic-Air` (0,6B, 23 Sprachen, 44,1 kHz) weiter unten dokumentiert.
 
 ## Inhaltsverzeichnis
@@ -213,6 +214,43 @@ Modell-Aliase sind `chatterbox` und `chatterbox-v3`; die einzige Stimme ist
 wie bisher. Auf acht CPU-Threads ist Chatterbox etwa 2,6x langsamer als
 Echtzeit; die erste Anfrage lädt das Modell in etwa 8 Sekunden. Ein gestoppter
 Worker liefert `502`, ein Timeout `504`.
+
+### ZONOS3-Mini (CPU, Hermes-Stimme)
+
+[`Zyphra/ZONOS3-Mini`](https://huggingface.co/Zyphra/ZONOS3-Mini) läuft als
+eigener CPU-Dienst auf `127.0.0.1:1919` und liefert die Stimme **Liesel 22
+fröhlich** (44,1 kHz). Der Audio-Sidecar ruft den Dienst satzweise über
+`/v2/generate` auf; das Gateway bleibt auf `:30000`.
+
+```bash
+systemctl --user enable --now zonos3.service
+systemctl --user status zonos3.service
+
+curl http://127.0.0.1:30000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "zonos3-mini", "voice": "liesel", "input": "Guten Tag.", "language": "de", "response_format": "wav"}' \
+  -o antwort.wav
+```
+
+Modell-Aliase sind `zonos3-mini`, `zonos3`, `zonos` und `zonos-tts`; die
+Stimme ist `liesel` (Aliase `liesel22`, `liesel-22`, `happy22`). Die
+Steering-Controls (Pitch, Softness, Tempo, Gender, Age, Happy/Valence/Arousal)
+sind fest auf die getestete Variante eingestellt. Bei einem Ausfall des
+ZONOS-Dienstes fällt der Sidecar automatisch auf Piper `de_DE-kerstin-low`
+zurück; Hermes bleibt dadurch hörbar. Der Dienst braucht etwa 18 s Warmup und
+läuft mit `ZONOS3_THREADS=8`; Konfiguration über `AUDIO_ZONOS_BASE`,
+`AUDIO_ZONOS_TIMEOUT` und `AUDIO_ZONOS_MODEL_DIR`.
+
+Hermes nutzt die Stimme über den OpenAI-kompatiblen Pfad:
+
+```bash
+hermes config set tts.provider openai
+hermes config set tts.openai.base_url http://127.0.0.1:30000/v1
+hermes config set tts.openai.api_key no-key
+hermes config set tts.openai.model zonos3-mini
+hermes config set tts.openai.voice liesel
+hermes config set tts.openai.language de
+```
 
 ### Audio8 Realistic Air (optional, GPU)
 
